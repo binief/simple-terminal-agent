@@ -10,6 +10,7 @@ import { loadConfig, maskConfig, DEFAULT_CONFIG_PATH } from './lib/config.js';
 import { createTools, shellInfo } from './lib/tools.js';
 import { connectMcpServers } from './lib/mcp.js';
 import { createAgent } from './lib/agent.js';
+import { createInputReader } from './lib/input.js';
 import * as ui from './lib/ui.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -27,6 +28,12 @@ const HELP = `
     /reset             clear the conversation (same session, fresh context)
     /clear             clear the terminal screen
     /exit  /quit       exit
+
+  Multiline input
+    one line ending in \\     keeps composing (the backslash is dropped)
+    Shift+Enter / Alt+Enter  same, in terminals that report them as ESC+CR
+    pasting several lines    becomes one draft
+    plain Enter              sends the whole draft (Ctrl+C discards it)
 
   Anything else is sent to the model as a chat message.
   CLI flags: --config <path>  --dir <path>  --once "<prompt>"  --stream | --no-stream  --model <name>  --init
@@ -163,11 +170,47 @@ async function main() {
     terminal: isTty,
   });
 
-  let busy = false;
+  const queued = []; // finished messages waiting for their turn
+  let drainDone = Promise.resolve();
 
-  const handleLine = async (line) => {
-    const text = line.trim();
-    if (!text) return;
+  // Enter sends; a trailing "\", Shift+Enter (ESC+CR) or a multi-line paste keep
+  // composing one message. See lib/input.js.
+  const reader = createInputReader({
+    rl,
+    stdin: process.stdin,
+    isTty,
+    prompt: `${ui.s.bold(ui.s.cyan('❯'))} `,
+    continuationPrompt: `${ui.s.dim('│')} `,
+    onMessage(text) {
+      queued.push(text);
+      drain();
+    },
+    notify: (line) => ui.out(ui.s.dim(line)),
+  });
+
+  /** Run queued messages one after another — the session is single-threaded. */
+  function drain() {
+    if (reader.busy) return drainDone;
+    reader.setBusy(true);
+    drainDone = (async () => {
+      try {
+        while (queued.length) {
+          try {
+            await handleText(queued.shift());
+          } catch (e) {
+            ui.printError(e?.stack || e?.message || String(e));
+          }
+        }
+      } finally {
+        reader.setBusy(false); // back to the prompt (or the "│" draft prompt)
+      }
+    })();
+    return drainDone;
+  }
+
+  async function handleText(rawText) {
+    const text = String(rawText ?? '');
+    if (!text.trim()) return;
 
     if (text.startsWith('/')) {
       const cmd = text.split(/\s+/)[0].toLowerCase();
@@ -235,15 +278,9 @@ async function main() {
           });
           break;
         }
-        case '/compact': {
-          busy = true;
-          try {
-            await agent.compact({ manual: true });
-          } finally {
-            busy = false;
-          }
+        case '/compact':
+          await agent.compact({ manual: true });
           break;
-        }
         case '/reset':
           agent.reset();
           ui.printSystem('conversation cleared');
@@ -264,22 +301,21 @@ async function main() {
     }
 
     ui.printUser(text);
-    busy = true;
-    try {
-      await agent.turn(text);
-    } finally {
-      busy = false;
-    }
-  };
+    await agent.turn(text);
+  }
 
   rl.on('SIGINT', () => {
-    if (busy) {
+    if (reader.busy) {
       ui.printSystem('working… let the turn finish (the session is single-threaded)');
       return;
     }
-    if (rl.line) {
-      rl.write(null, { ctrl: true, name: 'u' }); // clear current input
-      rl.prompt();
+    if (reader.pending || rl.line) {
+      const hadDraft = reader.pending > 0;
+      rl.line = ''; // drop the half-typed line …
+      rl.cursor = 0;
+      if (isTty) process.stdout.write('\r\x1b[K'); // … and wipe it off the screen
+      if (hadDraft) ui.printSystem('multiline draft discarded');
+      reader.discard(); // resets the draft and re-draws the prompt
       return;
     }
     ui.out('');
@@ -288,12 +324,16 @@ async function main() {
     process.exit(0);
   });
 
-  rl.prompt();
-  for await (const line of rl) {
-    await handleLine(line);
-    rl.prompt();
-  }
-  // stdin closed (Ctrl+D / piped input exhausted)
+  const closed = new Promise((resolve) => {
+    rl.once('close', () => {
+      reader.flushDraft(); // a draft left over by piped input / Ctrl+D is still sent
+      resolve();
+    });
+  });
+
+  reader.setBusy(false); // draws the first prompt
+  await closed; // /exit, Ctrl+D or the end of piped input
+  await drainDone; // let queued turns finish (piped input arrives in one burst)
   shutdown();
   ui.out('');
 }

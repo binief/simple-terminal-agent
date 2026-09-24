@@ -33,6 +33,7 @@ Everything lives in one JSON file in the user's home directory: `~/.coding-harne
   "workspace": null,
   "shell": null,
   "lineEndings": "auto",
+  "searchIgnore": [],
   "instructions": null,
   "autoCompact": true,
   "commandTimeout": 60,
@@ -54,6 +55,7 @@ Everything lives in one JSON file in the user's home directory: `~/.coding-harne
 | `streaming` | `true` = stream tokens as they arrive; `false` = show the reply when complete. Also `--stream` / `--no-stream`. |
 | `workspace` | Root for file tools and commands. `null` = the directory you launch from. |
 | `shell` | Override the command shell. `null` = OS-aware default (`cmd.exe /d /s /c` on Windows, bash/sh `-c` elsewhere). A string like `"powershell"` or `"zsh"` is understood; or `{ "command": "...", "args": [...] }` for full control. |
+| `searchIgnore` | Extra globs `search_files` should skip (relative to the workspace): `["vendor-cache/", "*.snap"]`. `!pattern` re-includes something the built-ins or `.gitignore` exclude. Default `[]`. |
 | `lineEndings` | Newline style for files the tools write: `auto` (default — keep the file's own style, else the OS default), `lf`, `crlf`, `cr`, `native`. |
 | `instructions` | Extra rules appended to the system prompt: literal text, or the path to a text file (`~` expanded, relative paths resolve against the workspace). Re-read on every system-prompt rebuild, so edits apply mid-session. Env override: `HARNESS_INSTRUCTIONS`. |
 | `autoCompact` | `true` (default) = summarize the conversation automatically before the context fills up. `false` = only warn; use `/compact` yourself. |
@@ -71,7 +73,7 @@ Env var overrides: `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL`,
 | `write_file` | Create/overwrite a file (makes parent dirs) |
 | `edit_file` | Exact-text replacement, line-ending aware (see below) |
 | `list_dir` | List a directory (dirs first) |
-| `search_files` | Recursive regex content search (skips `node_modules`, `.git`, build output) |
+| `search_files` | Recursive regex content search (skips dependencies, build output, caches, `.gitignore` matches and binary files — see below) |
 | `run_command` | Run a shell command in the workspace, returns stdout/stderr/exit code |
 
 **Line endings are OS-aware.** Files are read and normalised to `\n`, so a CRLF (Windows) file matches
@@ -83,6 +85,31 @@ If a match still fails, `edit_file` retries line-by-line ignoring trailing white
 Commands run through an **OS-aware shell**: `cmd.exe /d /s /c` on Windows, `/bin/bash` (or `zsh`/`sh`) `-c` on Unix. The system prompt tells the model which OS/shell it is writing for.
 
 > The harness runs with your user's permissions — review commands the model wants to run if that matters to you.
+
+### What `search_files` skips
+
+A recursive grep in a real project spends most of its time in files nobody means. `search_files` prunes
+them by default:
+
+- **Directories** — dependencies (`node_modules`, `bower_components`, `.yarn`), build output (`dist`,
+  `build`, `out`, `target`, `coverage`), framework/dev-server caches (`.next`, `.nuxt`, `.angular`,
+  `.cache`, `.turbo`, `.parcel-cache`, …), Python and other toolchains (`__pycache__`, `.venv`, `.tox`,
+  `.dart_tool`, `Pods`, `.terraform`, …) and every version-control directory such as `.git` — at any depth.
+- **Files** — images, media, archives, executables, fonts, databases and other binaries are never read,
+  and generated noise (`.min.js`, `.min.css`, `*.map`, `*.log`) is skipped.
+- **Your `.gitignore`** — the project's own rules apply while walking, nested files included, with the
+  usual git semantics (`!` negation, `/` anchoring, `**` globs, `dir/` for directories only) plus
+  `.git/info/exclude`. Searching *inside* a skipped directory explicitly (`path: ".angular/cache"`)
+  still works.
+
+The model can search ignored paths anyway when it has a reason (grepping a dependency, a build log) by
+passing `include_ignored: true` to the tool — version-control directories stay excluded either way,
+grepping `.git` objects is never useful. Project-specific rules go in the config — globs are
+relative to the workspace, `!` re-includes:
+
+```json
+{ "searchIgnore": ["vendor-cache/", "*.snap", "!src/generated"] }
+```
 
 ## Work method (the system prompt)
 
@@ -165,6 +192,22 @@ Simple ANSI styling, no TUI framework: role headers, streaming output with light
   Done — `cli.js` now supports `--version`.
 ```
 
+## Multiline input
+
+**Enter sends** the message; everything below keeps composing instead:
+
+| What you do | What happens |
+| --- | --- |
+| end the line with `\` | the backslash is dropped and the prompt turns into `│` — keep typing |
+| **Shift+Enter** / **Alt+Enter** | same, in terminals that report those keys as `ESC+CR` (VS Code's terminal, and iTerm2 / WezTerm / kitty / most terminals once shift+enter is bound to send it — Alt+Enter works out of the box in most of them) |
+| paste several lines | the pasted lines become one draft |
+| plain **Enter** | sends the whole draft as a single message |
+| **Ctrl+C** | discards the draft and gives you a fresh prompt |
+
+The draft is delivered as one message with its newlines intact, so code snippets and multi-paragraph
+prompts survive. Blank lines are part of the message: put a `\` on an empty line to keep one. A draft
+that was never finished is still sent when the input ends (piped scripts, Ctrl+D).
+
 ## Session commands
 
 `/help` `/config` `/tools` `/set dir <path>` `/cwd` `/usage` `/compact` `/reset` (clear conversation) `/clear` (clear screen) `/exit`
@@ -239,4 +282,5 @@ node harness.js [--config <path>] [--dir <path>] [--init] [--once "<prompt>"] [-
 npm test
 ```
 
-Runs an end-to-end suite against a mock OpenAI server and a mock MCP server (streaming on/off, tool round-trips, MCP tools, built-in tool smoke tests).
+Runs an end-to-end suite against a mock OpenAI server and a mock MCP server (streaming on/off, tool
+round-trips, MCP tools, built-in tool smoke tests, search ignore rules and multiline input rules).

@@ -32,6 +32,14 @@ function plan(messages) {
     return { text: 'MOCK-DONE instructions-seen' };
   }
 
+  // reports how the input actually arrived: one user message, and whether it
+  // contains a newline (multi-line input tests)
+  if (userText.includes('MULTILINE-PROBE')) {
+    const users = messages.filter((m) => m.role === 'user');
+    const multiline = users.some((m) => String(m.content ?? '').includes('\n'));
+    return { text: `MOCK-DONE users=${users.length} multiline=${multiline}` };
+  }
+
   // a text reply that the token limit cut in half; the harness should send a
   // [continue] nudge and then the full answer arrives
   if (userText.includes('TRUNCATE-CUT')) {
