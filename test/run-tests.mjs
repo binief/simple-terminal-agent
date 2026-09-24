@@ -202,6 +202,11 @@ async function main() {
   check('shows tool result (cat output)', res.out.includes('harness-ok'), res.out);
   check('shows final assistant reply', res.out.includes('MOCK-DONE'), res.out);
   check('file actually written in workspace', fs.readFileSync(path.join(workB, 'hello-harness.txt'), 'utf8') === 'harness-ok');
+  check('shows a progress line while waiting', res.out.includes('thinking…'), res.out);
+  check('usage line reports prompt tokens', res.out.includes('111 in'), res.out);
+  check('usage line reports completion tokens', res.out.includes('22 out'), res.out);
+  check('usage line reports speed', res.out.includes('tok/s'), res.out);
+  check('usage line reports context fill', res.out.includes('context '), res.out);
 
   /* ---------------- 2. streaming tool round-trip ---------------- */
   console.log('\n[chat, streaming on]');
@@ -210,6 +215,7 @@ async function main() {
   check('stream run exits 0', res.code === 0, res.out);
   check('stream shows streamed reply', res.out.includes('MOCK-DONE'), res.out);
   check('stream shows tool calls', res.out.includes('write_file') && res.out.includes('run_command'), res.out);
+  check('streamed usage is collected', res.out.includes('222 in') && res.out.includes('33 out'), res.out);
 
   /* ---------------- 3. MCP tools ---------------- */
   console.log('\n[MCP]');
@@ -249,6 +255,68 @@ async function main() {
 
   res = await runWithInput([harness, '--config', cfg1, '--no-stream'], '/set model foo\n', { cwd: workB });
   check('/set with a bad key shows usage', res.out.includes('usage: /set dir'), res.out);
+
+  res = await runWithInput([harness, '--config', cfg1, '--no-stream'], '/usage\n', { cwd: workB });
+  check('/usage reports session totals', res.out.includes('session ') && res.out.includes('tokens'), res.out);
+  check('/usage reports context fill', res.out.includes('context '), res.out);
+
+  res = await runWithInput([harness, '--config', cfg1, '--no-stream'], '/usage\n/compact\n', { cwd: workB });
+  check('/compact on an empty session is a no-op', res.out.includes('nothing to compact'), res.out);
+
+  res = await runWithInput(
+    [harness, '--config', cfg1, '--no-stream'],
+    'please write the file\n/compact\nplease write the file\n',
+    { cwd: workB }
+  );
+  check('/compact summarizes the conversation', res.out.includes('compacted conversation:'), res.out);
+  check('/compact frees tokens', /compacted conversation: [\d.,kM]+ → [\d.,kM]+ tokens/.test(res.out), res.out);
+  check('session continues after /compact', (res.out.match(/MOCK-DONE/g) || []).length >= 2, res.out);
+  check('/compact usage is counted', /\/usage|session/.test(res.out), res.out);
+
+  /* ---------------- 3c. automatic compaction ---------------- */
+  console.log('\n[auto-compaction]');
+  const { createAgent } = await import(pathToFileURL(path.join(proj, 'lib', 'agent.js')).href);
+  const workE = path.join(tmp, 'workE');
+  fs.mkdirSync(workE, { recursive: true });
+  const smallConfig = { ...baseConfig(port), contextSize: 2000, maxTokens: 256, workspace: workE, streaming: false, autoCompact: true };
+  const agentE = createAgent({ config: smallConfig, builtins: createTools(smallConfig), mcp: null });
+  agentE.history.push({ role: 'user', content: 'filler filler '.repeat(1200) }); // pushes past the budget
+
+  let captured = '';
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => {
+    captured += String(chunk);
+    return true;
+  };
+  try {
+    await agentE.turn('continue please');
+  } finally {
+    process.stdout.write = origWrite;
+  }
+  check('auto-compaction triggers before the context fills', captured.includes('compacted conversation'), captured.slice(0, 600));
+  check('summary is kept in history', agentE.history.some((m) => String(m.content ?? '').includes('COMPACTED:')), JSON.stringify(agentE.history.map((m) => m.role)));
+  check('turn continues after auto-compaction', captured.includes('MOCK-DONE'), captured.slice(0, 600));
+  check('tools still work after auto-compaction', fs.existsSync(path.join(workE, 'hello-harness.txt')), captured.slice(0, 600));
+  check('auto-compaction is counted in stats', agentE.stats().compactions === 1, JSON.stringify(agentE.stats()));
+
+  // autoCompact: false -> warn instead of summarizing
+  const workF = path.join(tmp, 'workF');
+  fs.mkdirSync(workF, { recursive: true });
+  const offConfig = { ...smallConfig, workspace: workF, autoCompact: false };
+  const agentF = createAgent({ config: offConfig, builtins: createTools(offConfig), mcp: null });
+  agentF.history.push({ role: 'user', content: 'filler filler '.repeat(1200) });
+  captured = '';
+  process.stdout.write = (chunk, ...rest) => {
+    captured += String(chunk);
+    return true;
+  };
+  try {
+    await agentF.turn('continue please');
+  } finally {
+    process.stdout.write = origWrite;
+  }
+  check('autoCompact:false warns instead of compacting', captured.includes('run /compact'), captured.slice(0, 400));
+  check('autoCompact:false does not summarize', !captured.includes('compacted conversation'), captured.slice(0, 400));
 
   /* ---------------- 4. CLI plumbing ---------------- */
   console.log('\n[cli]');

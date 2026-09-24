@@ -32,6 +32,7 @@ Everything lives in one JSON file in the user's home directory: `~/.coding-harne
   "workspace": null,
   "shell": null,
   "lineEndings": "auto",
+  "autoCompact": true,
   "commandTimeout": 60,
   "mcp": {
     "servers": {}
@@ -51,6 +52,7 @@ Everything lives in one JSON file in the user's home directory: `~/.coding-harne
 | `workspace` | Root for file tools and commands. `null` = the directory you launch from. |
 | `shell` | Override the command shell. `null` = OS-aware default (`cmd.exe /d /s /c` on Windows, bash/sh `-c` elsewhere). A string like `"powershell"` or `"zsh"` is understood; or `{ "command": "...", "args": [...] }` for full control. |
 | `lineEndings` | Newline style for files the tools write: `auto` (default — keep the file's own style, else the OS default), `lf`, `crlf`, `cr`, `native`. |
+| `autoCompact` | `true` (default) = summarize the conversation automatically before the context fills up. `false` = only warn; use `/compact` yourself. |
 | `commandTimeout` | Default timeout (seconds) for `run_command`. |
 | `mcp.servers` | Named MCP servers (see below). |
 
@@ -121,9 +123,37 @@ Simple ANSI styling, no TUI framework: role headers, streaming output with light
 
 ## Session commands
 
-`/help` `/config` `/tools` `/set dir <path>` `/cwd` `/reset` (clear conversation) `/clear` (clear screen) `/exit`
+`/help` `/config` `/tools` `/set dir <path>` `/cwd` `/usage` `/compact` `/reset` (clear conversation) `/clear` (clear screen) `/exit`
 
 One conversation per run (single session). `/reset` starts fresh context inside the same session.
+
+## Progress, tokens and context
+
+While the model is working you get a live indicator — an animated spinner with elapsed seconds
+(`⠹ thinking… 4.2s`) from the moment a request goes out until the first streamed token, and the same
+for each tool (`⠹ running run_command… 1.8s`). When output is piped (not a TTY) it prints `· thinking…`
+lines instead, so logs still show progress.
+
+Every reply carries a usage footnote:
+
+```
+  ⓘ 12.4k in · 322 out · 58 tok/s · 5.6s · session 41.2k · context 34%
+```
+
+`in`/`out` are the token counts the server reports (`~` prefix means they were estimated because the
+server sent no usage), `tok/s` is generation speed after the first token, and `context` is how full the
+context window is. `/usage` prints the session totals and average speed.
+
+**Compaction.** When the history reaches ~80% of the usable context, the harness summarizes it into a
+single message (the last few messages are kept verbatim) and the turn simply continues — nothing is lost
+silently and you are told what happened:
+
+```
+  ● compacted conversation (context 81% full): 58.2k → 3.1k tokens
+```
+
+`/compact` does the same on demand. Turn it off with `"autoCompact": false` in the config — you then get
+a warning to run `/compact` before the oldest turns start getting dropped.
 
 `/set dir <path>` changes the working directory while the session is running — file tools and `run_command`
 switch to it immediately and the model is told about the new workspace. Paths may be absolute or relative

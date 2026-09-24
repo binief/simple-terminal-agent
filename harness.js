@@ -22,6 +22,8 @@ const HELP = `
     /tools             list available tools
     /set dir <path>    change the working directory (file tools + commands run there)
     /cwd               show the current working directory
+    /usage             token usage, speed and context fill for this session
+    /compact           summarize the conversation to free context (also automatic)
     /reset             clear the conversation (same session, fresh context)
     /clear             clear the terminal screen
     /exit  /quit       exit
@@ -219,6 +221,29 @@ async function main() {
         case '/pwd':
           ui.printSystem(`working directory: ${builtins.cwd}`);
           break;
+        case '/usage': {
+          const st = agent.stats();
+          ui.printStats({
+            calls: st.calls,
+            promptTokens: st.promptTokens,
+            completionTokens: st.completionTokens,
+            avgTokPerSec: st.avgTokPerSec,
+            compactions: st.compactions,
+            used: st.used,
+            contextSize: st.contextSize,
+            estimated: st.estimated,
+          });
+          break;
+        }
+        case '/compact': {
+          busy = true;
+          try {
+            await agent.compact({ manual: true });
+          } finally {
+            busy = false;
+          }
+          break;
+        }
         case '/reset':
           agent.reset();
           ui.printSystem('conversation cleared');
