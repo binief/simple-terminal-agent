@@ -36,6 +36,36 @@ function run(cmd, args, opts = {}) {
   });
 }
 
+/** Run the harness as an interactive session, feeding `input` on stdin. */
+function runWithInput(args, input, opts = {}) {
+  return new Promise((resolve) => {
+    const { cwd, env, ...rest } = opts;
+    const child = spawn(process.execPath, args, {
+      cwd,
+      env: { ...process.env, ...(env || {}) },
+      stdio: ['pipe', 'pipe', 'pipe'],
+      ...rest,
+    });
+    let out = '';
+    let done = false;
+    const timer = setTimeout(() => {
+      if (!done) child.kill();
+    }, 60000);
+    child.stdout.on('data', (d) => (out += d));
+    child.stderr.on('data', (d) => (out += d));
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      resolve({ code: 1, out: out + String(e) });
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      done = true;
+      resolve({ code: code ?? 1, out });
+    });
+    child.stdin.end(input);
+  });
+}
+
 function startMockOpenai() {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [mockOpenai], { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -103,6 +133,59 @@ async function main() {
   r = await tools.execute('run_command', { command: 'this-command-should-not-exist-xyz' });
   check('run_command surfaces failures', r.length > 0, r);
 
+  /* ---------------- 0b. line endings (Windows CRLF / old Mac CR) ---------------- */
+  console.log('\n[line endings]');
+  const eolDir = path.join(tmp, 'eol');
+  fs.mkdirSync(eolDir, { recursive: true });
+  const eolTools = createTools({ workspace: eolDir, commandTimeout: 15, shell: null });
+  const readRaw = (p) => fs.readFileSync(path.join(eolDir, p), 'utf8');
+
+  fs.writeFileSync(path.join(eolDir, 'win.txt'), 'alpha\r\nbeta\r\ngamma\r\n');
+  r = await eolTools.execute('read_file', { path: 'win.txt' });
+  check('read_file normalizes CRLF to LF', r.includes('alpha\nbeta\ngamma') && !r.includes('\r'), r);
+  check('read_file reports CRLF', r.includes('CRLF'), r);
+  r = await eolTools.execute('edit_file', { path: 'win.txt', old_text: 'beta', new_text: 'BETA' });
+  check('edit_file matches LF old_text in a CRLF file', r.startsWith('Replaced 1'), r);
+  check('edit_file writes CRLF back', readRaw('win.txt') === 'alpha\r\nBETA\r\ngamma\r\n', JSON.stringify(readRaw('win.txt')));
+  r = await eolTools.execute('edit_file', { path: 'win.txt', old_text: 'alpha\r\nBETA', new_text: 'one\ntwo' });
+  check('edit_file accepts CRLF old_text too', r.startsWith('Replaced 1'), r);
+  check('multiline replacement keeps CRLF', readRaw('win.txt') === 'one\r\ntwo\r\ngamma\r\n', JSON.stringify(readRaw('win.txt')));
+  r = await eolTools.execute('search_files', { pattern: 'two' });
+  check('search_files reads CRLF files', r.includes('win.txt:2:'), r);
+  r = await eolTools.execute('write_file', { path: 'win.txt', content: 'a\nb\n' });
+  check('write_file keeps the file CRLF style', readRaw('win.txt') === 'a\r\nb\r\n', JSON.stringify(readRaw('win.txt')));
+  r = await eolTools.execute('write_file', { path: 'fresh.txt', content: 'a\nb' });
+  check('write_file uses the OS newline for new files', readRaw('fresh.txt') === 'a' + os.EOL + 'b', JSON.stringify(readRaw('fresh.txt')));
+
+  fs.writeFileSync(path.join(eolDir, 'cr.txt'), 'a\rb\rc\r');
+  r = await eolTools.execute('read_file', { path: 'cr.txt' });
+  check('CR-only file is normalized', r.includes('a\nb\nc') && r.includes('CR line'), r);
+  r = await eolTools.execute('edit_file', { path: 'cr.txt', old_text: 'b', new_text: 'B' });
+  check('edit_file handles CR-only files', r.startsWith('Replaced 1') && readRaw('cr.txt') === 'a\rB\rc\r', JSON.stringify(readRaw('cr.txt')));
+
+  // multi-line old_text that only differs by invisible trailing whitespace / \r
+  fs.writeFileSync(path.join(eolDir, 'ws.txt'), 'alpha   \r\nbeta\r\ngamma\r\n');
+  r = await eolTools.execute('edit_file', { path: 'ws.txt', old_text: 'alpha\nbeta', new_text: 'done' });
+  check('edit_file falls back to whitespace-tolerant matching', r.startsWith('Replaced 1') && r.includes('trailing whitespace'), r);
+  check('whitespace-tolerant edit keeps CRLF', readRaw('ws.txt') === 'done\r\ngamma\r\n', JSON.stringify(readRaw('ws.txt')));
+
+  fs.writeFileSync(path.join(eolDir, 'dollar.txt'), 'value here\n');
+  r = await eolTools.execute('edit_file', { path: 'dollar.txt', old_text: 'value here', new_text: 'cost $& $1 100%' });
+  check('replacement keeps $ sequences literal', readRaw('dollar.txt') === 'cost $& $1 100%\n', JSON.stringify(readRaw('dollar.txt')));
+
+  const lfTools = createTools({ workspace: eolDir, commandTimeout: 15, shell: null, lineEndings: 'lf' });
+  fs.writeFileSync(path.join(eolDir, 'win.txt'), 'a\r\nb\r\n');
+  r = await lfTools.execute('write_file', { path: 'win.txt', content: 'a\nb\n' });
+  check('lineEndings: "lf" overrides the file style', readRaw('win.txt') === 'a\nb\n', JSON.stringify(readRaw('win.txt')));
+  const crlfTools = createTools({ workspace: eolDir, commandTimeout: 15, shell: null, lineEndings: 'crlf' });
+  r = await crlfTools.execute('edit_file', { path: 'dollar.txt', old_text: 'cost', new_text: 'price' });
+  check('lineEndings: "crlf" forces CRLF on edit', readRaw('dollar.txt') === 'price $& $1 100%\r\n', JSON.stringify(readRaw('dollar.txt')));
+
+  const { loadConfig } = await import(pathToFileURL(path.join(proj, 'lib', 'config.js')).href);
+  const cfgEolPath = writeConfig('cfg-eol.json', { ...baseConfig(1), lineEndings: 'banana' });
+  const { config: cfgEol } = loadConfig(cfgEolPath);
+  check('unknown lineEndings falls back to auto', cfgEol.lineEndings === 'auto', JSON.stringify(cfgEol.lineEndings));
+
   /* ---------------- start mock API ---------------- */
   const { child: mock, port } = await startMockOpenai();
   const workB = path.join(tmp, 'workB');
@@ -142,8 +225,39 @@ async function main() {
   check('mcp tool called by model', res.out.includes('mcp_fake_add') && res.out.includes('a'), res.out);
   check('mcp tool result used', res.out.includes('MOCK-DONE add=42'), res.out);
 
+  /* ---------------- 3b. session commands (/set dir, /cwd) ---------------- */
+  console.log('\n[session commands]');
+  const workC = path.join(tmp, 'work with space'); // exercises quoted paths
+  fs.mkdirSync(workC, { recursive: true });
+
+  res = await runWithInput([harness, '--config', cfg1, '--no-stream'], '/help\n', { cwd: workB });
+  check('/help lists /set dir', res.code === 0 && res.out.includes('/set dir'), res.out);
+  check('/help lists /cwd', res.out.includes('/cwd'), res.out);
+
+  res = await runWithInput([harness, '--config', cfg1, '--no-stream'], `/set dir "${workC}"\nplease write the file\n`, { cwd: workB });
+  check('/set dir accepts quoted paths', res.code === 0 && res.out.includes('working directory set to'), res.out);
+  check('/set dir announces the new path', res.out.includes(workC), res.out);
+  check('tools write into the new directory', fs.existsSync(path.join(workC, 'hello-harness.txt')), res.out);
+  check('old workspace untouched by the new dir', fs.readFileSync(path.join(workB, 'hello-harness.txt'), 'utf8') === 'harness-ok');
+
+  res = await runWithInput([harness, '--config', cfg1, '--no-stream'], '/set dir\n/cwd\n/help\n', { cwd: workB });
+  check('/set dir with no argument shows the dir', (res.out.match(/working directory:/g) || []).length >= 2, res.out);
+  check('/cwd shows the workspace', res.out.includes(workB), res.out);
+
+  res = await runWithInput([harness, '--config', cfg1, '--no-stream'], '/set dir does-not-exist-xyz\n', { cwd: workB });
+  check('/set dir rejects a missing directory', res.out.includes('no such directory'), res.out);
+
+  res = await runWithInput([harness, '--config', cfg1, '--no-stream'], '/set model foo\n', { cwd: workB });
+  check('/set with a bad key shows usage', res.out.includes('usage: /set dir'), res.out);
+
   /* ---------------- 4. CLI plumbing ---------------- */
   console.log('\n[cli]');
+  const workD = path.join(tmp, 'workD');
+  fs.mkdirSync(workD, { recursive: true });
+  res = await run(process.execPath, [harness, '--config', cfg1, '--dir', workD, '--once', 'please write the file'], { cwd: workB });
+  check('--dir starts in another directory', res.code === 0 && fs.existsSync(path.join(workD, 'hello-harness.txt')), res.out);
+  res = await run(process.execPath, [harness, '--config', cfg1, '--dir', path.join(tmp, 'nope-dir'), '--once', 'hi'], { cwd: workB });
+  check('--dir fails cleanly on a missing directory', res.code !== 0 && res.out.includes('no such directory'), res.out);
   res = await run(process.execPath, [harness, '--help']);
   check('--help works', res.code === 0 && res.out.includes('Commands'), res.out);
   const cfgInit = path.join(tmp, 'sub', 'cfg-init.json');

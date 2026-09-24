@@ -17,25 +17,31 @@ const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'ut
 
 const HELP = `
   Commands
-    /help            show this help
-    /config          show effective configuration (key masked)
-    /tools           list available tools
-    /reset           clear the conversation (same session, fresh context)
-    /clear           clear the terminal screen
-    /exit  /quit     exit
+    /help              show this help
+    /config            show effective configuration (key masked)
+    /tools             list available tools
+    /set dir <path>    change the working directory (file tools + commands run there)
+    /cwd               show the current working directory
+    /reset             clear the conversation (same session, fresh context)
+    /clear             clear the terminal screen
+    /exit  /quit       exit
 
   Anything else is sent to the model as a chat message.
-  CLI flags: --config <path>  --once "<prompt>"  --stream | --no-stream  --model <name>  --init
+  CLI flags: --config <path>  --dir <path>  --once "<prompt>"  --stream | --no-stream  --model <name>  --init
 `;
 
 function parseArgs(argv) {
-  const opts = { config: null, once: null, streaming: undefined, model: null, init: false, help: false };
+  const opts = { config: null, dir: null, once: null, streaming: undefined, model: null, init: false, help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     switch (a) {
       case '--config':
       case '-c':
         opts.config = argv[++i];
+        break;
+      case '--dir':
+      case '-d':
+        opts.dir = argv[++i];
         break;
       case '--once':
       case '-1':
@@ -96,6 +102,16 @@ async function main() {
   }
 
   const builtins = createTools(config);
+
+  // --dir <path>: start in a different working directory (same as "/set dir <path>")
+  if (opts.dir) {
+    try {
+      builtins.setCwd(opts.dir);
+    } catch (e) {
+      ui.printError(e.message);
+      process.exit(1);
+    }
+  }
 
   const mcp = await connectMcpServers(config.mcp, {
     onLog: (kind, msg) => (kind === 'error' ? ui.printError(msg) : ui.printSystem(msg)),
@@ -172,6 +188,37 @@ async function main() {
           for (const t of mcp.listTools()) line(ui.s.yellow, t.name, t.description);
           break;
         }
+        case '/set': {
+          const rest = text.slice(cmd.length).trim();
+          const m = /^(\S+)\s*([\s\S]*)$/.exec(rest);
+          const key = (m?.[1] || '').toLowerCase();
+          let value = (m?.[2] || '').trim();
+          if (key !== 'dir') {
+            ui.printError('usage: /set dir <path>   (e.g. /set dir ../other-project)');
+            break;
+          }
+          if (!value) {
+            ui.printSystem(`working directory: ${builtins.cwd}`);
+            break;
+          }
+          // allow quoted paths (spaces, or copy-pasted from Windows Explorer)
+          if (/^".*"$/.test(value) || /^'.*'$/.test(value)) value = value.slice(1, -1);
+          try {
+            const abs = builtins.setCwd(value);
+            config.workspace = abs;
+            agent.refreshSystem(
+              `[system] The working directory changed to ${abs}. Relative paths passed to file tools and run_command now resolve there.`
+            );
+            ui.printSystem(`working directory set to ${abs}`);
+          } catch (e) {
+            ui.printError(e.message);
+          }
+          break;
+        }
+        case '/cwd':
+        case '/pwd':
+          ui.printSystem(`working directory: ${builtins.cwd}`);
+          break;
         case '/reset':
           agent.reset();
           ui.printSystem('conversation cleared');
