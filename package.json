@@ -1,0 +1,25 @@
+{
+  "name": "coding-harness",
+  "version": "1.0.0",
+  "description": "Minimal single-session coding harness for OpenAI-compatible models with built-in coding tools and MCP support.",
+  "type": "module",
+  "main": "harness.js",
+  "bin": {
+    "coding-harness": "harness.js"
+  },
+  "scripts": {
+    "start": "node harness.js",
+    "test": "node test/run-tests.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "agent",
+    "openai",
+    "mcp",
+    "cli",
+    "coding-assistant"
+  ],
+  "license": "MIT"
+}
