@@ -186,6 +186,199 @@ async function main() {
   const { config: cfgEol } = loadConfig(cfgEolPath);
   check('unknown lineEndings falls back to auto', cfgEol.lineEndings === 'auto', JSON.stringify(cfgEol.lineEndings));
 
+  /* ---------------- 0d. search ignores (junk dirs, .gitignore) ---------------- */
+  console.log('\n[search ignores]');
+  const { isSkippedDirName, isSkippedFileName, globToRegExp, parseGitignore } = await import(
+    pathToFileURL(path.join(proj, 'lib', 'ignore.js')).href
+  );
+  check(
+    'junk/cache directories are skipped by name',
+    ['.angular', '.cache', 'node_modules', '.venv', '.next', 'dist', 'coverage', 'cmake-build-debug', 'pkg.egg-info'].every(isSkippedDirName),
+    'one of them is not skipped'
+  );
+  check(
+    'source directories are kept',
+    ['src', 'app', 'lib', 'bin', 'docs', 'test', '.github', 'vendor'].every((n) => !isSkippedDirName(n)),
+    'a source directory would be skipped'
+  );
+  check(
+    'binary/media files are skipped',
+    ['.png', '.jpg', '.mp4', '.zip', '.exe', '.woff2', '.sqlite3'].every((ext) => isSkippedFileName('file' + ext)),
+    'a binary file would be grepped'
+  );
+  check(
+    'source files are kept',
+    ['main.ts', 'app.tsx', 'index.js', 'style.scss', 'data.json', 'ci.yml', 'notes.md'].every((n) => !isSkippedFileName(n)),
+    'a source file would be skipped'
+  );
+  check('glob: "**"/ matches at any depth', globToRegExp('**/x.js').test('a/b/x.js') && globToRegExp('**/x.js').test('x.js'), 'no');
+  check('glob: "*" stops at a slash', globToRegExp('a/*.js').test('a/b.js') && !globToRegExp('a/*.js').test('a/b/c.js'), 'no');
+  check('glob: "?" is one character', globToRegExp('a?.js').test('ab.js') && !globToRegExp('a?.js').test('a/.js'), 'no');
+
+  const gi = parseGitignore('# comment\n\nbuild/\n!keep.js\n/anchored.txt\n**/deep/*.log\n');
+  check('gitignore: comments and blank lines are dropped', gi.length === 4, JSON.stringify(gi.map((x) => x.re.source)));
+  check('gitignore: a trailing slash means directories only', gi[0].dirOnly === true && gi[0].negated === false, JSON.stringify(gi[0]));
+  check('gitignore: "!" negates', gi[1].negated === true, JSON.stringify(gi[1]));
+  check('gitignore: a leading slash anchors the pattern', gi[2].anchored === true && gi[2].re.test('anchored.txt') && !gi[2].re.test('sub/anchored.txt'), JSON.stringify(gi[2]));
+
+  const proj2 = path.join(tmp, 'proj');
+  fs.mkdirSync(path.join(proj2, '.git', 'info'), { recursive: true });
+  const put = (rel, text) => {
+    const f = path.join(proj2, rel);
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    fs.writeFileSync(f, text);
+  };
+  put('src/app.js', "const target = 'FIND-ME';\n");
+  put('.angular/cache/cache.js', 'FIND-ME angular cache\n');
+  put('node_modules/pkg/index.js', 'FIND-ME dependency\n');
+  put('dist/bundle.js', 'FIND-ME bundle\n');
+  put('coverage/index.html', 'FIND-ME coverage\n');
+  put('ignored/secret.js', 'FIND-ME ignored\n');
+  put('src/generated.gen.js', 'FIND-ME generated\n');
+  put('src/logo.png', 'FIND-ME image\n');
+  put('src/app.local.js', 'FIND-ME local\n');
+  put('nested/thing.local.js', 'FIND-ME nested\n');
+  put('.gitignore', 'ignored/\n*.gen.js\n*.local.js\n');
+  put('src/.gitignore', '!app.local.js\n'); // a nested file can re-include what the root ignored
+
+  const searchTools = createTools({ workspace: proj2, commandTimeout: 15, shell: null });
+  r = await searchTools.execute('search_files', { pattern: 'FIND-ME' });
+  check('search_files finds source matches', r.includes('src/app.js:1:'), r);
+  check('search_files skips .angular/cache', !r.includes('.angular'), r);
+  check('search_files skips node_modules', !r.includes('node_modules'), r);
+  check('search_files skips build output', !r.includes('dist/') && !r.includes('coverage/'), r);
+  check('search_files honours .gitignore', !r.includes('ignored/secret.js') && !r.includes('generated.gen.js'), r);
+  check('a nested .gitignore can re-include a path', r.includes('src/app.local.js') && !r.includes('nested/thing.local.js'), r);
+  check('search_files skips binary files', !r.includes('logo.png'), r);
+  r = await searchTools.execute('search_files', { pattern: 'FIND-ME', include_ignored: true });
+  check('include_ignored searches caches and dependencies', r.includes('.angular/cache/cache.js') && r.includes('node_modules/pkg/index.js'), r);
+  check('include_ignored searches .gitignore paths', r.includes('ignored/secret.js') && r.includes('generated.gen.js'), r);
+  r = await searchTools.execute('search_files', { pattern: 'NO-SUCH-TEXT-XYZ' });
+  check('a search with no hits says what was skipped', r.startsWith('No matches') && r.includes('include_ignored'), r);
+  r = await searchTools.execute('search_files', { pattern: 'FIND-ME', path: 'ignored' });
+  check('searching inside a skipped directory explicitly still works', r.includes('ignored/secret.js'), r);
+
+  const extraTools = createTools({ workspace: proj2, commandTimeout: 15, shell: null, searchIgnore: ['vendor-cache/', '!ignored'] });
+  put('vendor-cache/dep.js', 'FIND-ME vendored\n');
+  r = await extraTools.execute('search_files', { pattern: 'FIND-ME' });
+  check('config searchIgnore skips extra paths', !r.includes('vendor-cache'), r);
+  check('config searchIgnore can re-include a path', r.includes('ignored/secret.js'), r);
+
+  /* ---------------- 0e. multiline input rules ---------------- */
+  console.log('\n[multiline input]');
+  const { createComposer, splitContinuation, createEscapeEnterScanner, createInputReader } = await import(
+    pathToFileURL(path.join(proj, 'lib', 'input.js')).href
+  );
+  const compose = (specs) => {
+    const c = createComposer();
+    const out = [];
+    for (const spec of specs) {
+      const [text, opts] = Array.isArray(spec) ? spec : [spec];
+      const message = c.push(text, opts || {});
+      if (message != null) out.push(message);
+    }
+    return out;
+  };
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+  check('a plain line is one message', eq(compose(['hello']), ['hello']), JSON.stringify(compose(['hello'])));
+  check('a blank line alone sends nothing', compose(['   ']).length === 0, JSON.stringify(compose(['   '])));
+  check('a trailing backslash keeps composing', eq(compose(['first \\', 'second']), ['first \nsecond']), JSON.stringify(compose(['first \\', 'second'])));
+  check('an escaped backslash is literal', eq(compose(['a\\\\']), ['a\\\\']), JSON.stringify(compose(['a\\\\'])));
+  check('splitContinuation strips the continuation backslash', eq(splitContinuation('a \\'), { text: 'a ', continued: true }), JSON.stringify(splitContinuation('a \\')));
+  check('splitContinuation leaves an escaped backslash alone', splitContinuation('a\\\\').continued === false, JSON.stringify(splitContinuation('a\\\\')));
+  check(
+    'Shift+Enter lines stay in the draft',
+    eq(compose([['a', { continuation: true }], ['b', { continuation: true }], ['']]), ['a\nb']),
+    JSON.stringify(compose([['a', { continuation: true }], ['b', { continuation: true }], ['']]))
+  );
+  check('blank lines inside a draft survive', eq(compose(['head \\', '\\', '  indented']), ['head \n\n  indented']), JSON.stringify(compose(['head \\', '\\', '  indented'])));
+  check('a draft keeps first-line indentation', eq(compose(['  code \\', 'more']), ['  code \nmore']), JSON.stringify(compose(['  code \\', 'more'])));
+  check('a draft can be dropped', (() => { const c = createComposer(); c.push('x \\'); c.reset(); return c.pending === 0 && c.push('y') === 'y'; })(), 'draft survived reset');
+
+  const scan = createEscapeEnterScanner();
+  check('ESC+CR is detected', scan.scan('ab\x1b\rc') === 1, 'not found');
+  check('an ESC+CR split across reads is detected', scan.scan('\x1b') === 0 && scan.scan('\r') === 1, 'not found');
+  check('a lone ESC or CR is not Shift+Enter', scan.scan('\x1b') === 0 && scan.scan('x') === 0 && scan.scan('\r') === 0, 'false positive');
+
+  const { EventEmitter } = await import('node:events');
+  const makeFakeRl = () => {
+    const bus = new EventEmitter();
+    return {
+      bus,
+      line: '',
+      current: '',
+      prompts: [],
+      setPrompt(p) { this.current = p; },
+      prompt() { this.prompts.push(this.current); },
+      write(_d, key) {
+        if (key?.name === 'return') {
+          const line = this.line;
+          this.line = '';
+          bus.emit('line', line); // readline clears the line before emitting
+        }
+      },
+      on: (ev, fn) => bus.on(ev, fn),
+      emit: (ev, ...args) => bus.emit(ev, ...args),
+    };
+  };
+  const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+  const msgs = [];
+  const rl1 = makeFakeRl();
+  const stdin1 = new EventEmitter();
+  const reader = createInputReader({
+    rl: rl1,
+    stdin: stdin1,
+    isTty: true,
+    prompt: '> ',
+    continuationPrompt: '| ',
+    onMessage: (m) => msgs.push(m),
+  });
+  rl1.emit('line', 'hello');
+  await tick();
+  check('reader: a plain line is sent right away', eq(msgs, ['hello']), JSON.stringify(msgs));
+  check('reader: the plain prompt comes back', rl1.prompts.at(-1) === '> ', JSON.stringify(rl1.prompts));
+
+  rl1.line = 'first';
+  stdin1.emit('data', '\x1b\r'); // Shift+Enter
+  await tick();
+  check('reader: Shift+Enter opens a draft instead of sending', msgs.length === 1 && reader.pending === 1, JSON.stringify(msgs));
+  check('reader: the continuation prompt is shown', rl1.prompts.at(-1) === '| ', JSON.stringify(rl1.prompts));
+  rl1.emit('line', 'second');
+  await tick();
+  check('reader: the draft is sent as one message', eq(msgs, ['hello', 'first\nsecond']), JSON.stringify(msgs));
+
+  rl1.emit('line', 'one');
+  rl1.emit('line', 'two');
+  await tick();
+  check('reader: a multi-line paste becomes a draft', msgs.length === 2 && reader.pending === 2, JSON.stringify(msgs));
+  rl1.emit('line', 'three');
+  await tick();
+  check('reader: the pasted draft is sent whole', msgs.at(-1) === 'one\ntwo\nthree', JSON.stringify(msgs));
+
+  rl1.emit('line', 'kept \\');
+  await tick();
+  reader.discard();
+  rl1.emit('line', 'fresh');
+  await tick();
+  check('reader: a discarded draft does not leak', reader.pending === 0 && msgs.at(-1) === 'fresh', JSON.stringify(msgs));
+
+  rl1.emit('line', 'left over \\');
+  await tick();
+  reader.flushDraft();
+  check('reader: a draft left at EOF is still sent', msgs.at(-1) === 'left over', JSON.stringify(msgs));
+
+  const msgs2 = [];
+  const rl2 = makeFakeRl();
+  const reader2 = createInputReader({ rl: rl2, stdin: null, isTty: false, onMessage: (m) => msgs2.push(m) });
+  rl2.emit('line', 'one');
+  rl2.emit('line', 'two');
+  check('reader: piped lines are not batched as a paste', eq(msgs2, ['one', 'two']), JSON.stringify(msgs2));
+  rl2.emit('line', 'cont \\');
+  rl2.emit('line', 'inued');
+  check('reader: piped input supports the backslash continuation', msgs2.at(-1) === 'cont \ninued', JSON.stringify(msgs2));
+
   /* ---------------- 0c. system prompt: work method + custom instructions ---------------- */
   console.log('\n[system prompt]');
   const { createAgent, resolveInstructions } = await import(pathToFileURL(path.join(proj, 'lib', 'agent.js')).href);
@@ -282,6 +475,18 @@ async function main() {
   const cfgInsFile = writeConfig('cfg-ins-file.json', { ...baseConfig(port), workspace: workB, instructions: insFile });
   res = await run(process.execPath, [harness, '--config', cfgInsFile, '--no-stream', '--once', 'hello'], { cwd: workB });
   check('instructions file reaches the system message', res.out.includes('MOCK-DONE instructions-seen'), res.out);
+
+  /* ---------------- 2c. multiline input over a pipe ---------------- */
+  console.log('\n[multiline input, piped]');
+  res = await runWithInput([harness, '--config', cfg1, '--no-stream'], 'MULTILINE-PROBE alpha \\\nthen beta\n', { cwd: workB });
+  check('a continued line and the next line arrive as one message', res.out.includes('MOCK-DONE users=1 multiline=true'), res.out);
+  check('the composed message is echoed as one block', res.out.includes('MULTILINE-PROBE alpha') && res.out.includes('then beta'), res.out);
+
+  res = await runWithInput([harness, '--config', cfg1, '--no-stream'], 'MULTILINE-PROBE plain\n', { cwd: workB });
+  check('a single line is still a single message', res.out.includes('MOCK-DONE users=1 multiline=false'), res.out);
+
+  res = await runWithInput([harness, '--config', cfg1, '--no-stream'], 'MULTILINE-PROBE tail \\\n', { cwd: workB });
+  check('a draft left over at EOF is still sent', res.out.includes('MOCK-DONE users=1'), res.out);
 
   /* ---------------- 3. MCP tools ---------------- */
   console.log('\n[MCP]');
