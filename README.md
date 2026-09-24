@@ -32,6 +32,7 @@ Everything lives in one JSON file in the user's home directory: `~/.coding-harne
   "workspace": null,
   "shell": null,
   "lineEndings": "auto",
+  "instructions": null,
   "autoCompact": true,
   "commandTimeout": 60,
   "mcp": {
@@ -52,6 +53,7 @@ Everything lives in one JSON file in the user's home directory: `~/.coding-harne
 | `workspace` | Root for file tools and commands. `null` = the directory you launch from. |
 | `shell` | Override the command shell. `null` = OS-aware default (`cmd.exe /d /s /c` on Windows, bash/sh `-c` elsewhere). A string like `"powershell"` or `"zsh"` is understood; or `{ "command": "...", "args": [...] }` for full control. |
 | `lineEndings` | Newline style for files the tools write: `auto` (default — keep the file's own style, else the OS default), `lf`, `crlf`, `cr`, `native`. |
+| `instructions` | Extra rules appended to the system prompt: literal text, or the path to a text file (`~` expanded, relative paths resolve against the workspace). Re-read on every system-prompt rebuild, so edits apply mid-session. Env override: `HARNESS_INSTRUCTIONS`. |
 | `autoCompact` | `true` (default) = summarize the conversation automatically before the context fills up. `false` = only warn; use `/compact` yourself. |
 | `commandTimeout` | Default timeout (seconds) for `run_command`. |
 | `mcp.servers` | Named MCP servers (see below). |
@@ -79,6 +81,46 @@ If a match still fails, `edit_file` retries line-by-line ignoring trailing white
 Commands run through an **OS-aware shell**: `cmd.exe /d /s /c` on Windows, `/bin/bash` (or `zsh`/`sh`) `-c` on Unix. The system prompt tells the model which OS/shell it is writing for.
 
 > The harness runs with your user's permissions — review commands the model wants to run if that matters to you.
+
+## Work method (the system prompt)
+
+Every session opens with a system message that sets the workspace, platform, shell and date, the tool
+policy, and the working method the model is asked to follow:
+
+| Rule | What it asks for |
+| --- | --- |
+| Understand before changing | Infer the project type (language, framework, libraries) from its files, find the code a change touches with `search_files`, read it — never guess at wiring. |
+| Batch independent work | Tool calls in one reply run in order: read the files a change touches together, chain shell steps with `&&` instead of one `run_command` per step. |
+| Few meaningful reads | Small files in full, large files by window (`offset`/`limit`) once the interesting lines are located. |
+| Targeted edits | `edit_file` with `old_text` copied verbatim from `read_file`; `write_file` only for new files or full rewrites, never for a file that has not been read. |
+| Match the code | Same language level, indentation, naming and dependency style; a well-known library installed with the project's package manager beats hand-rolling one. |
+| No acting on truncated output | Read the real content instead of editing around a `[truncated …]` marker. |
+| No loops | Never re-read a file just written or re-run a command that already succeeded; if the same fix fails twice, report the blocker, the error and the options instead of a third variation. |
+| Verify before claiming success | Run the build / tests / linters, read the output, fix failures in the same turn, and say what could not be verified. |
+| Stay oriented | A line on what is about to happen, then a short summary of what changed and how it was verified. |
+
+Alongside it, the tool policy spells out which tool to use for what, how `edit_file` matching works,
+that `run_command` follows the platform shell (and has `cwd`/`timeout` options), and that commands run
+with your permissions — so destructive steps get announced instead of sprung.
+
+### Custom instructions
+
+`instructions` adds your own rules on top of the built-in ones:
+
+```json
+{ "instructions": "Use pnpm, never npm. Tests are run with node --test." }
+```
+
+or point it at a file — handy for rules you want to keep in the repo or share across a team:
+
+```json
+{ "instructions": "~/harness-rules.md" }
+```
+
+A single-line value that names an existing file is read from disk (`~` expanded, relative to the
+workspace); anything else is used as literal text. The file is re-read whenever the system prompt is
+rebuilt — after `/set dir` for example — so you can edit your rules mid-session. `HARNESS_INSTRUCTIONS`
+overrides the config value, and `/config` shows what is active.
 
 ## MCP servers (optional)
 

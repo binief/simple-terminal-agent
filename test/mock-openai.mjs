@@ -20,6 +20,12 @@ function plan(messages) {
     return { text: 'COMPACTED: earlier messages summarized. Task: write hello-harness.txt.' };
   }
 
+  // proves that config "instructions" reached the model's system message
+  const systemText = messages.filter((m) => m.role === 'system').map((m) => m.content).join(' ');
+  if (systemText.includes('HAIKU-RULE')) {
+    return { text: 'MOCK-DONE instructions-seen' };
+  }
+
   if (userText.includes('ADD2')) {
     if (toolMsgs.length === 0) {
       return { tool: { id: 'call_m', name: 'mcp_fake_add', arguments: JSON.stringify({ a: 2, b: 40 }) } };
