@@ -27,6 +27,7 @@ Everything lives in one JSON file in the user's home directory: `~/.coding-harne
   },
   "contextSize": 64000,
   "maxTokens": 4096,
+  "maxSteps": 50,
   "temperature": 0.2,
   "streaming": true,
   "workspace": null,
@@ -48,6 +49,7 @@ Everything lives in one JSON file in the user's home directory: `~/.coding-harne
 | `openai.model` | Model name. |
 | `contextSize` | Total context budget (tokens). Older turns are dropped once history grows past it. |
 | `maxTokens` | Max tokens the model may generate per reply. |
+| `maxSteps` | Max model replies (tool round-trips) per user turn before the harness stops and asks you to say "continue". Default 50. |
 | `temperature` | Sampling temperature. |
 | `streaming` | `true` = stream tokens as they arrive; `false` = show the reply when complete. Also `--stream` / `--no-stream`. |
 | `workspace` | Root for file tools and commands. `null` = the directory you launch from. |
@@ -59,7 +61,7 @@ Everything lives in one JSON file in the user's home directory: `~/.coding-harne
 | `mcp.servers` | Named MCP servers (see below). |
 
 Env var overrides: `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL`,
-`HARNESS_STREAMING`, `HARNESS_CONTEXT_SIZE`, `HARNESS_TEMPERATURE`.
+`HARNESS_STREAMING`, `HARNESS_CONTEXT_SIZE`, `HARNESS_TEMPERATURE`, `HARNESS_MAX_STEPS`.
 
 ## Built-in coding tools
 
@@ -201,6 +203,25 @@ a warning to run `/compact` before the oldest turns start getting dropped.
 switch to it immediately and the model is told about the new workspace. Paths may be absolute or relative
 to the current directory, `~` is expanded, and quotes are allowed (`/set dir "C:\My Project"`).
 `/set dir` without an argument (or `/cwd`) prints the current directory.
+
+### Not getting cut off mid-task
+
+The harness actively keeps a turn running to completion instead of stopping half-way:
+
+- **Token-limit cut-offs are continued.** When a reply arrives with `finish_reason: "length"` (the model
+  hit `max_tokens` mid-sentence), the harness appends a `[continue]` nudge and the model finishes the
+  reply — the turn picks up where it stopped. You are told what happened:
+  `the reply was cut off by the token limit — asking the model to continue…`
+- **Half tool calls are never executed.** If the token limit cut a tool call mid-JSON, the call is *not*
+  run; the model gets an error result asking it to re-issue the complete call, so no command ever runs
+  with truncated arguments.
+- **The step limit warns before it bites.** A turn is capped at `maxSteps` model replies (default 50 —
+  previously a hardcoded 25). Three steps before the limit the model is told to wrap the task up or say
+  what remains; if the limit is still reached, the message points at the `"maxSteps"` config key. Raise
+  it for long autonomous runs (env override: `HARNESS_MAX_STEPS`).
+- **Transient API errors are retried.** Connection failures and HTTP 408/429/5xx are retried up to three
+  attempts (honoring `Retry-After`) — never once anything has been streamed to your terminal, so output
+  is never duplicated. A turn aborted by a persistent error keeps its history: say "continue".
 
 ## CLI flags
 
