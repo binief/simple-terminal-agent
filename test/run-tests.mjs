@@ -384,6 +384,79 @@ async function main() {
   check('autoCompact:false warns instead of compacting', captured.includes('run /compact'), captured.slice(0, 400));
   check('autoCompact:false does not summarize', !captured.includes('compacted conversation'), captured.slice(0, 400));
 
+  /* ---------------- 3d. cut-off recovery (truncation, step limit, retries) ---------------- */
+  console.log('\n[cut-off recovery]');
+
+  // config plumbing for the step limit
+  const { config: cfgStepsDefault } = loadConfig(writeConfig('cfg-steps-default.json', baseConfig(1)));
+  check('default maxSteps is 50', cfgStepsDefault.maxSteps === 50, JSON.stringify(cfgStepsDefault.maxSteps));
+  check('maxSteps out of range falls back to the default', loadConfig(writeConfig('cfg-steps-bad.json', { ...baseConfig(1), maxSteps: 0 })).config.maxSteps === 50, 'not 50');
+  check('maxSteps is clamped to 1000', loadConfig(writeConfig('cfg-steps-huge.json', { ...baseConfig(1), maxSteps: 99999 })).config.maxSteps === 1000, 'not 1000');
+  check('maxSteps appears in the /config view', maskConfig(cfgStepsDefault).maxSteps === 50, 'missing');
+  process.env.HARNESS_MAX_STEPS = '7';
+  const { config: cfgStepsEnv } = loadConfig(writeConfig('cfg-steps-env.json', baseConfig(1)));
+  delete process.env.HARNESS_MAX_STEPS;
+  check('HARNESS_MAX_STEPS overrides the config', cfgStepsEnv.maxSteps === 7, JSON.stringify(cfgStepsEnv.maxSteps));
+
+  // a text reply cut off by the token limit is continued automatically
+  res = await run(
+    process.execPath,
+    [harness, '--config', writeConfig('cfg-trunc-text.json', { ...baseConfig(port), workspace: workB }), '--no-stream', '--once', 'please TRUNCATE-CUT the file'],
+    { cwd: workB }
+  );
+  check('truncated text reply is continued automatically', res.code === 0 && res.out.includes('MOCK-DONE continued-ok'), res.out);
+  check('the cut-off is reported to the user', res.out.includes('token limit'), res.out);
+
+  // a tool call cut off mid-JSON is not executed; the model re-issues it and finishes
+  const workG = path.join(tmp, 'workG');
+  fs.mkdirSync(workG, { recursive: true });
+  res = await run(
+    process.execPath,
+    [harness, '--config', writeConfig('cfg-trunc-tool.json', { ...baseConfig(port), workspace: workG }), '--no-stream', '--once', 'please TRUNCATE-TOOL the file'],
+    { cwd: workG }
+  );
+  check('truncated tool call is not executed', res.out.includes('not executed'), res.out);
+  check('truncated arguments are not reported as bad JSON', !res.out.includes('not valid JSON'), res.out);
+  check('model re-issues the complete tool call', res.out.includes('write_file'), res.out);
+  check('task finishes after cut-off recovery', res.code === 0 && res.out.includes('MOCK-DONE tool-recovered'), res.out);
+  check('the recovered file was actually written', fs.readFileSync(path.join(workG, 'cut-file.txt'), 'utf8') === 'recovered-ok', 'wrong content');
+
+  // streaming captures finish_reason too
+  res = await run(
+    process.execPath,
+    [harness, '--config', writeConfig('cfg-trunc-stream.json', { ...baseConfig(port), streaming: true, workspace: workB }), '--once', 'please TRUNCATE-CUT again'],
+    { cwd: workB }
+  );
+  check('streaming: truncated reply is continued', res.code === 0 && res.out.includes('MOCK-DONE continued-ok'), res.out);
+
+  // step limit: wrap-up nudge before the limit, clear message at the limit
+  const workH = path.join(tmp, 'workH');
+  fs.mkdirSync(workH, { recursive: true });
+  const loopCfg = { ...baseConfig(port), maxSteps: 4, workspace: workH, streaming: false };
+  const agentH = createAgent({ config: loopCfg, builtins: createTools(loopCfg), mcp: null });
+  captured = '';
+  process.stdout.write = (chunk, ...rest) => {
+    captured += String(chunk);
+    return true;
+  };
+  try {
+    await agentH.turn('LOOP-FOREVER please');
+  } finally {
+    process.stdout.write = origWrite;
+  }
+  check('wrap-up nudge is injected before the step limit', agentH.history.some((m) => /steps left in this turn/.test(String(m.content ?? ''))), JSON.stringify(agentH.history.map((m) => m.role)));
+  check('turn stops at maxSteps with a clear message', captured.includes('step limit (4)'), captured.slice(0, 600));
+  check('step-limit message points at the config key', captured.includes('maxSteps'), captured.slice(0, 600));
+  check('wrap-up nudge tells the model to finish', captured.includes('telling the model to wrap up'), captured.slice(0, 600));
+
+  // transient API errors are retried, the task still finishes
+  res = await run(
+    process.execPath,
+    [harness, '--config', writeConfig('cfg-retry.json', { ...baseConfig(port), workspace: workB }), '--no-stream', '--once', 'RETRY-ME please'],
+    { cwd: workB }
+  );
+  check('transient API errors are retried', res.code === 0 && res.out.includes('MOCK-DONE retried-ok'), res.out);
+
   /* ---------------- 4. CLI plumbing ---------------- */
   console.log('\n[cli]');
   const workD = path.join(tmp, 'workD');
