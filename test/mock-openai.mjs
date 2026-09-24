@@ -6,12 +6,19 @@
 
 import http from 'node:http';
 
+import { COMPACT_TAG } from '../lib/agent.js';
+
 const isWin = process.platform === 'win32';
 
 function plan(messages) {
   const toolMsgs = messages.filter((m) => m.role === 'tool');
   const userText = messages.filter((m) => m.role === 'user').map((m) => m.content).join(' ');
   const lastTool = toolMsgs.length ? String(toolMsgs[toolMsgs.length - 1].content) : '';
+
+  // compaction request: answer with a summary, never with a tool call
+  if (userText.includes(COMPACT_TAG)) {
+    return { text: 'COMPACTED: earlier messages summarized. Task: write hello-harness.txt.' };
+  }
 
   if (userText.includes('ADD2')) {
     if (toolMsgs.length === 0) {
@@ -63,6 +70,7 @@ function jsonReply(res, decision, body) {
       object: 'chat.completion',
       model: body.model,
       choices: [{ index: 0, message: msg, finish_reason: decision.tool ? 'tool_calls' : 'stop' }],
+      usage: { prompt_tokens: 111, completion_tokens: 22, total_tokens: 133 },
     })
   );
 }
@@ -99,6 +107,8 @@ function sseReply(res, decision) {
     for (const w of words) send({ choices: [{ index: 0, delta: { content: w } }] });
     send({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
   }
+  // usage arrives in its own final chunk when stream_options.include_usage is honoured
+  send({ choices: [], usage: { prompt_tokens: 222, completion_tokens: 33, total_tokens: 255 } });
   res.write('data: [DONE]\n\n');
   res.end();
 }
