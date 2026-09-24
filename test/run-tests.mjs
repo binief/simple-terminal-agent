@@ -181,10 +181,60 @@ async function main() {
   r = await crlfTools.execute('edit_file', { path: 'dollar.txt', old_text: 'cost', new_text: 'price' });
   check('lineEndings: "crlf" forces CRLF on edit', readRaw('dollar.txt') === 'price $& $1 100%\r\n', JSON.stringify(readRaw('dollar.txt')));
 
-  const { loadConfig } = await import(pathToFileURL(path.join(proj, 'lib', 'config.js')).href);
+  const { loadConfig, maskConfig } = await import(pathToFileURL(path.join(proj, 'lib', 'config.js')).href);
   const cfgEolPath = writeConfig('cfg-eol.json', { ...baseConfig(1), lineEndings: 'banana' });
   const { config: cfgEol } = loadConfig(cfgEolPath);
   check('unknown lineEndings falls back to auto', cfgEol.lineEndings === 'auto', JSON.stringify(cfgEol.lineEndings));
+
+  /* ---------------- 0c. system prompt: work method + custom instructions ---------------- */
+  console.log('\n[system prompt]');
+  const { createAgent, resolveInstructions } = await import(pathToFileURL(path.join(proj, 'lib', 'agent.js')).href);
+  const promptDir = path.join(tmp, 'prompt');
+  fs.mkdirSync(promptDir, { recursive: true });
+  const promptCfg = { ...baseConfig(1), workspace: promptDir, streaming: false };
+  const makeAgent = (extra = {}, cfg = {}) => {
+    const c = { ...promptCfg, ...cfg, ...extra };
+    return createAgent({ config: c, builtins: createTools(c), mcp: null });
+  };
+  const sysOf = (agent) => String(agent.history[0]?.content ?? '');
+
+  let sys = sysOf(makeAgent());
+  check('system prompt states the workspace', sys.includes(promptDir), sys.slice(0, 400));
+  check('system prompt states the platform/shell', sys.includes('shell:'), sys.slice(0, 400));
+  check('system prompt carries the work method', sys.includes('Work method:'), sys);
+  check('work method: understand before changing', /Understand before changing/.test(sys), sys);
+  check('work method: batch independent tool calls', /several tool calls in one reply/.test(sys), sys);
+  check('work method: never rewrite an unread file', /never rewrite a file you have not read/.test(sys), sys);
+  check('work method: no loops — report the blocker', /report the blocker/.test(sys), sys);
+  check('work method: verify before claiming success', /Verify before claiming success/.test(sys), sys);
+  check('work method: follow the conventions of the code', /Match the code you are editing/.test(sys), sys);
+  check('tool policy: old_text copied verbatim', /old_text copied verbatim from read_file/.test(sys), sys);
+  check('tool policy: destructive commands are announced', /destructive step/.test(sys), sys);
+  check('no user-instructions section by default', !sys.includes('User instructions'), sys);
+
+  sys = sysOf(makeAgent({ instructions: 'Use pnpm, not npm.\nAlways run node --test.' }));
+  check('config instructions land in the system prompt', sys.includes('Use pnpm, not npm.') && sys.includes('User instructions'), sys);
+  check('instructions come after the built-in defaults', sys.indexOf('Work method:') < sys.indexOf('Use pnpm'), sys);
+
+  const rulesFile = path.join(promptDir, 'RULES.md');
+  fs.writeFileSync(rulesFile, 'RULES-FILE: only commit when asked.\n');
+  const fileAgent = makeAgent({ instructions: 'RULES.md' }); // relative to the workspace
+  check('instructions file is read (relative path)', sysOf(fileAgent).includes('RULES-FILE: only commit when asked.'), sysOf(fileAgent));
+  fs.writeFileSync(rulesFile, 'RULES-FILE: amended.\n');
+  fileAgent.refreshSystem();
+  check('instructions file is re-read on refreshSystem', sysOf(fileAgent).includes('RULES-FILE: amended.'), sysOf(fileAgent));
+  check('instructions file is read (absolute path)', sysOf(makeAgent({ instructions: rulesFile })).includes('RULES-FILE: amended.'), sysOf(makeAgent({ instructions: rulesFile })));
+  check('resolveInstructions falls back to literal text', resolveInstructions('no such file xyz.md', promptDir) === 'no such file xyz.md', resolveInstructions('no such file xyz.md', promptDir));
+  check('resolveInstructions returns "" when unset', resolveInstructions(null, promptDir) === '' && resolveInstructions('   ', promptDir) === '', JSON.stringify(resolveInstructions(null, promptDir)));
+
+  process.env.HARNESS_INSTRUCTIONS = 'env rules: keep it terse';
+  const { config: cfgInsEnv } = loadConfig(writeConfig('cfg-ins-env.json', baseConfig(1)));
+  delete process.env.HARNESS_INSTRUCTIONS;
+  check('HARNESS_INSTRUCTIONS overrides config', cfgInsEnv.instructions === 'env rules: keep it terse', JSON.stringify(cfgInsEnv.instructions));
+  const { config: cfgIns } = loadConfig(writeConfig('cfg-ins.json', { ...baseConfig(1), instructions: 'line one\nline two' }));
+  check('config keeps multi-line instructions', cfgIns.instructions === 'line one\nline two', JSON.stringify(cfgIns.instructions));
+  check('an empty instructions value becomes null', loadConfig(writeConfig('cfg-ins-empty.json', { ...baseConfig(1), instructions: '  ' })).config.instructions === null, 'not null');
+  check('/config view flattens instructions to one line', maskConfig(cfgIns).instructions === 'line one line two', JSON.stringify(maskConfig(cfgIns).instructions));
 
   /* ---------------- start mock API ---------------- */
   const { child: mock, port } = await startMockOpenai();
@@ -216,6 +266,22 @@ async function main() {
   check('stream shows streamed reply', res.out.includes('MOCK-DONE'), res.out);
   check('stream shows tool calls', res.out.includes('write_file') && res.out.includes('run_command'), res.out);
   check('streamed usage is collected', res.out.includes('222 in') && res.out.includes('33 out'), res.out);
+
+  /* ---------------- 2b. custom instructions reach the model ---------------- */
+  console.log('\n[custom instructions]');
+  const cfgInsInline = writeConfig('cfg-ins-inline.json', {
+    ...baseConfig(port),
+    workspace: workB,
+    instructions: 'HAIKU-RULE: reply in haiku only.',
+  });
+  res = await run(process.execPath, [harness, '--config', cfgInsInline, '--no-stream', '--once', 'hello'], { cwd: workB });
+  check('inline instructions reach the system message', res.out.includes('MOCK-DONE instructions-seen'), res.out);
+
+  const insFile = path.join(tmp, 'AGENT-RULES.md');
+  fs.writeFileSync(insFile, 'HAIKU-RULE from a file.\n');
+  const cfgInsFile = writeConfig('cfg-ins-file.json', { ...baseConfig(port), workspace: workB, instructions: insFile });
+  res = await run(process.execPath, [harness, '--config', cfgInsFile, '--no-stream', '--once', 'hello'], { cwd: workB });
+  check('instructions file reaches the system message', res.out.includes('MOCK-DONE instructions-seen'), res.out);
 
   /* ---------------- 3. MCP tools ---------------- */
   console.log('\n[MCP]');
@@ -275,7 +341,7 @@ async function main() {
 
   /* ---------------- 3c. automatic compaction ---------------- */
   console.log('\n[auto-compaction]');
-  const { createAgent } = await import(pathToFileURL(path.join(proj, 'lib', 'agent.js')).href);
+  // createAgent was imported with the system-prompt section above
   const workE = path.join(tmp, 'workE');
   fs.mkdirSync(workE, { recursive: true });
   const smallConfig = { ...baseConfig(port), contextSize: 2000, maxTokens: 256, workspace: workE, streaming: false, autoCompact: true };
