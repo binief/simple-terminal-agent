@@ -69,7 +69,7 @@ Env var overrides: `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL`,
 
 | Tool | What it does |
 | --- | --- |
-| `read_file` | Read a text file (optional line window) |
+| `read_file` | Read a window of a text file (default 200 lines, ≤500 lines / 40k chars per call) |
 | `write_file` | Create/overwrite a file (makes parent dirs) |
 | `edit_file` | Exact-text replacement, line-ending aware (see below) |
 | `list_dir` | List a directory (dirs first) |
@@ -120,7 +120,7 @@ policy, and the working method the model is asked to follow:
 | --- | --- |
 | Understand before changing | Infer the project type (language, framework, libraries) from its files, find the code a change touches with `search_files`, read it — never guess at wiring. |
 | Batch independent work | Tool calls in one reply run in order: read the files a change touches together, chain shell steps with `&&` instead of one `run_command` per step. |
-| Few meaningful reads | Small files in full, large files by window (`offset`/`limit`) once the interesting lines are located. |
+| Locate, then window | `search_files` for the `file:line` hits, then `read_file` windows (`offset`/`limit`) around them — enforced: ≤500 lines and ≤40k chars per call (default 200), with a "…N more lines" hint instead of whole-file dumps. |
 | Targeted edits | `edit_file` with `old_text` copied verbatim from `read_file`; `write_file` only for new files or full rewrites, never for a file that has not been read. |
 | Match the code | Same language level, indentation, naming and dependency style; a well-known library installed with the project's package manager beats hand-rolling one. |
 | No acting on truncated output | Read the real content instead of editing around a `[truncated …]` marker. |

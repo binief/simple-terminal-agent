@@ -120,6 +120,23 @@ async function main() {
   check('edit_file replaces', r.includes('Replaced 1'), r);
   r = await tools.execute('read_file', { path: 'a/b.txt' });
   check('edit_file wrote through', r.includes('TWO') && !r.includes('\ntwo'), r);
+
+  // windowed reads are enforced: peek by default, hard caps per call, continuation hints
+  const big = Array.from({ length: 1200 }, (_, i) => `line-${i + 1}`).join('\n');
+  await tools.execute('write_file', { path: 'big.txt', content: big });
+  r = await tools.execute('read_file', { path: 'big.txt' });
+  check('read_file peeks 200 lines by default', r.includes('lines 1-200 of 1200'), r.slice(0, 200));
+  check('read_file hints at the remainder', r.includes('1000 more lines') && r.includes('search_files'), r.slice(-200));
+  r = await tools.execute('read_file', { path: 'big.txt', limit: 5000 });
+  check('read_file clamps limit to 500 lines per call', r.includes('lines 1-500 of 1200') && r.includes('clamped to 500'), r.slice(0, 200));
+  r = await tools.execute('read_file', { path: 'big.txt', offset: 1101 });
+  check('read_file pages with offset', r.includes('lines 1101-1200 of 1200') && !r.includes('more lines'), r.slice(0, 200));
+  r = await tools.execute('read_file', { path: 'big.txt', offset: 2000 });
+  check('read_file rejects past-the-end offsets', r.startsWith('Error:') && r.includes('past the end'), r);
+  await tools.execute('write_file', { path: 'dense.txt', content: 'x'.repeat(50_000) + '\nsecond' });
+  r = await tools.execute('read_file', { path: 'dense.txt' });
+  check('read_file hard-cuts an oversized line', r.includes('[line truncated'), r.slice(-300));
+  check('read_file result stays inside the char budget', r.length < 45_000, String(r.length));
   r = await tools.execute('edit_file', { path: 'a/b.txt', old_text: 'nope', new_text: 'x' });
   check('edit_file reports missing text', r.startsWith('Error:'), r);
   r = await tools.execute('search_files', { pattern: 'TWO' });
