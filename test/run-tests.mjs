@@ -982,6 +982,29 @@ async function main() {
   check('the turn still completes on a cramped context', captured.includes('MOCK-DONE'), captured.slice(0, 500));
   check('no compaction is attempted when it cannot help', agentG.stats().compactions === 0, JSON.stringify(agentG.stats()));
 
+  // a compaction that would not free anything must keep the raw history and say so
+  const workNoGain = path.join(tmp, 'workNoGain');
+  fs.mkdirSync(workNoGain, { recursive: true });
+  const noGainConfig = { ...baseConfig(port), contextSize: 2000, maxTokens: 256, workspace: workNoGain, streaming: false };
+  const agentNoGain = createAgent({ config: noGainConfig, builtins: createTools(noGainConfig), mcp: null });
+  agentNoGain.history.push({ role: 'user', content: 'a short question' }, { role: 'assistant', content: 'a short answer' });
+  const historyBefore = JSON.stringify(agentNoGain.history);
+  captured = '';
+  process.stdout.write = (chunk, ...rest) => {
+    captured += String(chunk);
+    return true;
+  };
+  let noGainResult;
+  try {
+    noGainResult = await agentNoGain.compact({ manual: true });
+  } finally {
+    process.stdout.write = origWrite;
+  }
+  check('a pointless compaction is refused', noGainResult === null, JSON.stringify(noGainResult));
+  check('the refusal is reported honestly', captured.includes('would not free anything') && !captured.includes('compacted conversation'), captured.slice(0, 300));
+  check('the raw history survives a refused compaction', JSON.stringify(agentNoGain.history) === historyBefore, 'history was replaced');
+  check('a refused compaction is not counted', agentNoGain.stats().compactions === 0, JSON.stringify(agentNoGain.stats().compactions));
+
   /* ---------------- 3d. cut-off recovery (truncation, step limit, retries) ---------------- */
   console.log('\n[cut-off recovery]');
 

@@ -365,6 +365,10 @@ silently and you are told what happened:
   ● compacted conversation (context 81% full): 58.2k → 3.1k tokens
 ```
 
+Compaction never makes things worse: if the summary comes back no smaller than the messages it would
+replace (a short history under a long system prompt), the raw messages are kept and you are told —
+`compacting would not free anything (2.2k → 2.3k tokens) — history kept as is`.
+
 Compaction only runs when it can actually free something. If the context is full but the summarizable
 part of the history is already tiny — a `contextSize` too small for the system prompt plus the last few
 messages — the harness says so once instead of compacting on every step:
