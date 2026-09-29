@@ -75,8 +75,11 @@ locate-then-window, batching, anti-loop rules and verify-before-claiming. Those 
 
 Values in `{braces}` are filled in by `buildSystemPrompt()`. The Git line is omitted when the
 workspace is not a repository, and the plan/approved-plan/instructions blocks only appear when they
-apply. Measured cost: ~9.1k characters, ≈2.3k tokens — about 3.5% of the default 64k context, and
-in line with Claude Code (~3k) and below Codex CLI (~5k).
+apply. The first Autonomy bullet is mode-dependent: in plan mode it becomes *"Research until you can
+hand over a complete, concrete plan — the plan is the deliverable, not the code"*, because the build-mode
+wording ("do not hand back a plan instead of the work") would otherwise contradict plan mode.
+Measured cost: ~9.1k characters, ≈2.3k tokens — about 3.5% of the default 64k context, in line with
+Claude Code (~3k) and below Codex CLI (~5k).
 
 ```text
 

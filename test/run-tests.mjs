@@ -453,6 +453,9 @@ async function main() {
   const built = buildSystemPrompt({ cwd: '/w', platform: 'p', date: '2025-01-02', planning: true, blocks: ['BLOCK-ONE'], instructions: 'RULE-LAST' });
   check('buildSystemPrompt is deterministic', built === buildSystemPrompt({ cwd: '/w', platform: 'p', date: '2025-01-02', planning: true, blocks: ['BLOCK-ONE'], instructions: 'RULE-LAST' }), 'differs');
   check('buildSystemPrompt marks plan mode in the environment block', /- Mode: plan \(read-only research/.test(built), built.slice(0, 400));
+  check('autonomy tells build mode not to hand back a plan', sys.includes('a plan instead of the work'), sys);
+  const planned = buildSystemPrompt({ cwd: '/w', platform: 'p', planning: true });
+  check('autonomy flips in plan mode: the plan is the deliverable', planned.includes('the plan is the deliverable') && !planned.includes('a plan instead of the work'), planned.slice(0, 1200));
   check('buildSystemPrompt appends blocks before the user instructions', built.indexOf('BLOCK-ONE') < built.indexOf('RULE-LAST') && built.indexOf('# Harness mechanics') < built.indexOf('BLOCK-ONE'), built);
 
   sys = sysOf(makeAgent({ instructions: 'Use pnpm, not npm.\nAlways run node --test.' }));
