@@ -122,26 +122,38 @@ relative to the workspace, `!` re-includes:
 ## Work method (the system prompt)
 
 Every session opens with a system message that sets the workspace, platform, shell and date, the tool
-policy, and the working method the model is asked to follow:
+policy, and a mandatory autonomous execution loop. A normal coding task follows this order without waiting
+for a plan approval:
+
+1. **Understand context** — parse the requested outcome, scope, constraints, acceptance criteria and
+   non-goals; inspect the relevant implementation, tests, configuration and project conventions.
+2. **Outline a minimal plan** — identify only the files and changes needed, then consider relevant happy,
+   boundary, malformed-input, error, compatibility, state/concurrency, security and performance cases.
+3. **Resolve material uncertainty** — ask one concise question only when an unknown would meaningfully
+   change the implementation; otherwise use the safest conventional interpretation and disclose it later.
+4. **Execute** — apply the smallest coherent change after reading the code it affects.
+5. **Verify** — inspect the diff, run the narrowest relevant test/build/linter, and check the failure and
+   edge cases identified in the plan before reporting completion.
 
 | Rule | What it asks for |
 | --- | --- |
-| Understand before changing | Infer the project type (language, framework, libraries) from its files, find the code a change touches with `search_files`, read it — never guess at wiring. |
+| Context before mutation | Never treat the user prompt as evidence of the wiring. Do not begin a coding task with `write_file`, `edit_file`, or a mutating command before inspecting the affected code and tests. |
+| Minimal, risk-aware plan | Work out the success path and the cases that could break this specific task, without inventing unrelated complexity. |
 | Batch independent work | Tool calls in one reply run in order: read the files a change touches together, chain shell steps with `&&` instead of one `run_command` per step. |
 | Locate, then window | `search_files` for the `file:line` hits, then `read_file` windows (`offset`/`limit`) around them — enforced: ≤500 lines and ≤40k chars per call (default 200), with a "…N more lines" hint instead of whole-file dumps. |
 | Targeted edits | `edit_file` with `old_text` copied verbatim from `read_file`; `write_file` only for new files or full rewrites, never for a file that has not been read. |
 | Match the code | Same language level, indentation, naming and dependency style; a well-known library installed with the project's package manager beats hand-rolling one. |
 | No acting on truncated output | Read the real content instead of editing around a `[truncated …]` marker. |
 | No loops | Never re-read a file just written or re-run a command that already succeeded; if the same fix fails twice, report the blocker, the error and the options instead of a third variation. |
-| Verify before claiming success | Run the build / tests / linters, read the output, fix failures in the same turn, and say what could not be verified. |
-| Stay oriented | A line on what is about to happen, then a short summary of what changed and how it was verified. |
+| Verify before claiming success | Inspect the resulting diff; run the build / tests / linters; read the output; fix regressions in the same turn; and say what could not be verified. |
+| Stay oriented | State the context and minimal plan in one line, execute without creating a manual gate, then summarize what changed, verification, and any assumption or remaining risk. |
 
 Alongside it, the tool policy spells out which tool to use for what, how `edit_file` matching works,
 that `run_command` follows the platform shell (and has `cwd`/`timeout` options), and that commands run
 with your permissions — so destructive steps get announced instead of sprung.
 
-In [plan mode](#plan-mode) the prompt swaps the "change the code" rules for "research it and hand over a
-plan", and the harness backs that up by withdrawing the tools that could change anything.
+In [plan mode](#plan-mode) the prompt swaps autonomous execution for "research it and hand over a plan",
+and the harness backs that up by withdrawing the tools that could change anything.
 
 ### Custom instructions
 
