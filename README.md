@@ -121,39 +121,30 @@ relative to the workspace, `!` re-includes:
 
 ## Work method (the system prompt)
 
-Every session opens with a system message that sets the workspace, platform, shell and date, the tool
-policy, and a mandatory autonomous execution loop. A normal coding task follows this order without waiting
-for a plan approval:
+The system message is built by `lib/prompt.js` (`buildSystemPrompt()`) and is the agent's working
+contract. It opens with the live environment — workspace, platform/shell, date, mode and, when the
+workspace is a git repository, the branch and whether the tree is clean — and then sets out the
+sections below. It costs ≈2.3k tokens.
 
-1. **Understand context** — parse the requested outcome, scope, constraints, acceptance criteria and
-   non-goals; inspect the relevant implementation, tests, configuration and project conventions.
-2. **Outline a minimal plan** — identify only the files and changes needed, then consider relevant happy,
-   boundary, malformed-input, error, compatibility, state/concurrency, security and performance cases.
-3. **Resolve material uncertainty** — ask one concise question only when an unknown would meaningfully
-   change the implementation; otherwise use the safest conventional interpretation and disclose it later.
-4. **Execute** — apply the smallest coherent change after reading the code it affects.
-5. **Verify** — inspect the diff, run the narrowest relevant test/build/linter, and check the failure and
-   edge cases identified in the plan before reporting completion.
-
-| Rule | What it asks for |
+| Section | What it fixes |
 | --- | --- |
-| Context before mutation | Never treat the user prompt as evidence of the wiring. Do not begin a coding task with `write_file`, `edit_file`, or a mutating command before inspecting the affected code and tests. |
-| Minimal, risk-aware plan | Work out the success path and the cases that could break this specific task, without inventing unrelated complexity. |
-| Batch independent work | Tool calls in one reply run in order: read the files a change touches together, chain shell steps with `&&` instead of one `run_command` per step. |
-| Locate, then window | `search_files` for the `file:line` hits, then `read_file` windows (`offset`/`limit`) around them — enforced: ≤500 lines and ≤40k chars per call (default 200), with a "…N more lines" hint instead of whole-file dumps. |
-| Targeted edits | `edit_file` with `old_text` copied verbatim from `read_file`; `write_file` only for new files or full rewrites, never for a file that has not been read. |
-| Match the code | Same language level, indentation, naming and dependency style; a well-known library installed with the project's package manager beats hand-rolling one. |
-| No acting on truncated output | Read the real content instead of editing around a `[truncated …]` marker. |
-| No loops | Never re-read a file just written or re-run a command that already succeeded; if the same fix fails twice, report the blocker, the error and the options instead of a third variation. |
-| Verify before claiming success | Inspect the resulting diff; run the build / tests / linters; read the output; fix regressions in the same turn; and say what could not be verified. |
-| Stay oriented | State the context and minimal plan in one line, execute without creating a manual gate, then summarize what changed, verification, and any assumption or remaining risk. |
+| **Autonomy** | Resolve the task end to end; stop only for one genuinely blocking question, an unsafe request, or a blocker. Answer "how do I…" questions instead of silently changing files. |
+| **Communication** | Terminal-sized Markdown, one short line before a batch of tool calls, `file.js:42` references, a final summary of outcome → changes → verification → assumptions. No emoji, no preamble, no tool names. |
+| **Tools** | What each tool is for; batch independent reads in one reply; locate with `search_files`, then read the window; results are capped and windowed, so never act on a `[truncated …]` marker; never re-read a file just written. |
+| **edit_file / write_file** | Read before changing, copy `old_text` verbatim (context over `replace_all`), line endings are handled for you, `write_file` only for new files or a deliberate rewrite, small edits over big ones. |
+| **run_command** | Syntax valid for *this* shell, non-interactive and non-paginated only, use `cwd`/`timeout` instead of `cd`/`sleep`, and never read or edit files through the shell. |
+| **Working method** | The six phases: understand → minimal plan → resolve uncertainty → execute → verify → report. Never jump from the prompt straight to an edit. |
+| **Code quality** | Match the surrounding code, check the manifest before using a library, fix root causes, comment like the file does, no drive-by refactors, no placeholder implementations. |
+| **Definition of done** | The diff is what you intended, something that exercises the change was actually run, no unverified success claims, and a blocker is reported after the second failed attempt — not a third variation. |
+| **Safety** | Announce destructive steps, never `git commit`/`push`/branch unless asked, never print secrets, stay in the workspace, defensive security only. |
+| **Harness mechanics** | The model is told about the step budget, compaction and token-limit continuation, so it cooperates with them instead of being surprised. |
 
-Alongside it, the tool policy spells out which tool to use for what, how `edit_file` matching works,
-that `run_command` follows the platform shell (and has `cwd`/`timeout` options), and that commands run
-with your permissions — so destructive steps get announced instead of sprung.
+The prompt was distilled from the published system prompts of Claude Code, Codex CLI, Cursor CLI,
+Warp, Augment, Gemini CLI and Antigravity — see `docs/system-prompt-proposal.md` for the analysis,
+what was adopted and what was deliberately left out.
 
-In [plan mode](#plan-mode) the prompt swaps autonomous execution for "research it and hand over a plan",
-and the harness backs that up by withdrawing the tools that could change anything.
+Order matters: [plan mode](#plan-mode) rules (or the approved plan) are appended after the defaults,
+and your own `instructions` come last so they win on conflict.
 
 ### Custom instructions
 
@@ -344,6 +335,14 @@ silently and you are told what happened:
 
 ```
   ● compacted conversation (context 81% full): 58.2k → 3.1k tokens
+```
+
+Compaction only runs when it can actually free something. If the context is full but the summarizable
+part of the history is already tiny — a `contextSize` too small for the system prompt plus the last few
+messages — the harness says so once instead of compacting on every step:
+
+```
+  ● context 159% full with nothing left to compact — the system prompt and the last messages alone fill it. Raise "contextSize" in the config.
 ```
 
 `/compact` does the same on demand. Turn it off with `"autoCompact": false` in the config — you then get

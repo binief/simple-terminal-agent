@@ -396,9 +396,10 @@ async function main() {
   rl2.emit('line', 'inued');
   check('reader: piped input supports the backslash continuation', msgs2.at(-1) === 'cont \ninued', JSON.stringify(msgs2));
 
-  /* ---------------- 0c. system prompt: work method + custom instructions ---------------- */
+  /* ---------------- 0c. system prompt: working contract + custom instructions ---------------- */
   console.log('\n[system prompt]');
   const { createAgent, resolveInstructions } = await import(pathToFileURL(path.join(proj, 'lib', 'agent.js')).href);
+  const { buildSystemPrompt, gitInfo, clearGitCache } = await import(pathToFileURL(path.join(proj, 'lib', 'prompt.js')).href);
   const promptDir = path.join(tmp, 'prompt');
   fs.mkdirSync(promptDir, { recursive: true });
   const promptCfg = { ...baseConfig(1), workspace: promptDir, streaming: false };
@@ -411,26 +412,52 @@ async function main() {
   let sys = sysOf(makeAgent());
   check('system prompt states the workspace', sys.includes(promptDir), sys.slice(0, 400));
   check('system prompt states the platform/shell', sys.includes('shell:'), sys.slice(0, 400));
-  check('system prompt carries the work method', sys.includes('Work method:'), sys);
-  check('system prompt carries the mandatory execution protocol', sys.includes('Mandatory execution protocol'), sys);
-  check('execution protocol: understand context before changing', /Understand before changing/.test(sys) && /acceptance criteria/.test(sys), sys);
-  check('execution protocol: outline a minimal plan before mutation', /Outline a minimal plan/.test(sys) && /before the first mutation/.test(sys), sys);
-  check('execution protocol: checks relevant failure and edge cases', /malformed input/.test(sys) && /failure and edge cases/.test(sys), sys);
-  check('execution protocol: material ambiguity pauses execution', /material ambiguity/.test(sys) && /ask one concise question before editing/.test(sys), sys);
-  check('execution protocol: forbids raw-prompt edits', /Do not start a coding task with write_file/.test(sys), sys);
-  check('execution protocol: inspects the resulting diff', /inspect the resulting diff/.test(sys), sys);
-  check('work method: batch independent tool calls', /several tool calls in one reply/.test(sys), sys);
-  check('work method: never rewrite an unread file', /never rewrite a file you have not read/.test(sys), sys);
-  check('work method: no loops — report the blocker', /report the blocker/.test(sys), sys);
-  check('work method: verify before claiming success', /Verify before claiming success/.test(sys), sys);
-  check('work method: follow the conventions of the code', /Match the code you are editing/.test(sys), sys);
-  check('tool policy: old_text copied verbatim', /old_text copied verbatim from read_file/.test(sys), sys);
-  check('tool policy: destructive commands are announced', /destructive step/.test(sys), sys);
-  check('no user-instructions section by default', !sys.includes('User instructions'), sys);
+  check('system prompt states the date and mode', /# Environment/.test(sys) && /- Today: \d{4}-\d{2}-\d{2}/.test(sys) && /- Mode: build/.test(sys), sys.slice(0, 600));
+  check('system prompt carries every default section', ['# Autonomy', '# Communication', '# Tools', '# Working method', '# Code quality', '# Definition of done', '# Safety', '# Harness mechanics'].every((h) => sys.includes(h)), sys);
+  check('autonomy: resolve the task instead of yielding early', /Keep working until the request is resolved/.test(sys) && /ask ONE concise question/.test(sys), sys);
+  check('autonomy: a how-to question is answered, not executed', /do not start changing files/.test(sys), sys);
+  check('communication: terse terminal output with file:line refs', /path\/to\/file\.js:42/.test(sys) && /No emoji unless asked/.test(sys), sys);
+  check('working method: understand context before changing', /Understand before changing/.test(sys) && /acceptance criteria/.test(sys), sys);
+  check('working method: outline a minimal plan before mutation', /Outline a minimal plan/.test(sys) && /before the first mutation/.test(sys), sys);
+  check('working method: checks relevant failure and edge cases', /malformed input/.test(sys) && /failure and edge cases/.test(sys), sys);
+  check('working method: material ambiguity pauses execution', /material ambiguity/.test(sys) && /ask one concise question before editing/.test(sys), sys);
+  check('working method: forbids raw-prompt edits', /Do not start a coding task with write_file/.test(sys), sys);
+  check('working method: inspects the resulting diff', /inspect the resulting diff/.test(sys), sys);
+  check('working method: follow the conventions of the code', /Match the code you are editing/.test(sys), sys);
+  check('tools: batch independent tool calls', /tool calls in one reply run in order/.test(sys), sys);
+  check('tools: locate then window instead of whole files', /Locate, then window/.test(sys) && /never scroll a large file into context/.test(sys), sys);
+  check('tools: old_text copied verbatim from read_file', /Copy old_text verbatim from read_file/.test(sys), sys);
+  check('tools: never rewrite an unread file', /a deliberate full rewrite of a file you have read/.test(sys), sys);
+  check('tools: no acting on truncated output', /never edit around a marker/.test(sys), sys);
+  check('tools: no loops — the tool result is the confirmation', /never re-run a command that already succeeded/.test(sys), sys);
+  check('run_command: non-interactive, non-paginated, OS-aware', /Non-interactive only/.test(sys) && /--no-pager/.test(sys) && /no bash-isms under Windows cmd\.exe/.test(sys), sys);
+  check('run_command: shell is not used to read or edit files', /Do not read files through the shell/.test(sys) && /Do not edit files through the shell/.test(sys), sys);
+  check('done: verification is required before claiming success', /Never claim success you did not verify/.test(sys), sys);
+  check('done: report the blocker after two failed attempts', /report the blocker/.test(sys), sys);
+  check('safety: destructive commands are announced', /destructive or irreversible/.test(sys), sys);
+  check('safety: no commits or pushes unless asked', /Never run git commit, git push/.test(sys), sys);
+  check('safety: secrets are never printed', /Never print, log or commit secrets/.test(sys), sys);
+  check('harness mechanics: steps, compaction and cut-off replies', /steps are running out/.test(sys) && /compacted into a summary/.test(sys) && /re-issue it complete/.test(sys), sys);
+  check('no user-instructions section by default', !sys.includes('# User instructions'), sys);
+
+  // git state: a real repository reports its branch, a plain directory reports nothing
+  clearGitCache();
+  const gitNone = gitInfo(promptDir);
+  check('gitInfo returns null outside a repository', gitNone === null, String(gitNone));
+  check('no Git line when the workspace is not a repository', !/^- Git:/m.test(sys), sys.slice(0, 600));
+  const gitSelf = gitInfo(proj);
+  check('gitInfo reports branch and cleanliness in a repository', typeof gitSelf === 'string' && /\((clean|\d+ uncommitted files?)\)$/.test(gitSelf), String(gitSelf));
+  check('the Git line lands in the environment block', buildSystemPrompt({ cwd: proj, platform: 'x', git: gitSelf }).includes(`- Git: ${gitSelf}`), String(gitSelf));
+
+  // buildSystemPrompt is pure: same inputs, same prompt, blocks in order
+  const built = buildSystemPrompt({ cwd: '/w', platform: 'p', date: '2025-01-02', planning: true, blocks: ['BLOCK-ONE'], instructions: 'RULE-LAST' });
+  check('buildSystemPrompt is deterministic', built === buildSystemPrompt({ cwd: '/w', platform: 'p', date: '2025-01-02', planning: true, blocks: ['BLOCK-ONE'], instructions: 'RULE-LAST' }), 'differs');
+  check('buildSystemPrompt marks plan mode in the environment block', /- Mode: plan \(read-only research/.test(built), built.slice(0, 400));
+  check('buildSystemPrompt appends blocks before the user instructions', built.indexOf('BLOCK-ONE') < built.indexOf('RULE-LAST') && built.indexOf('# Harness mechanics') < built.indexOf('BLOCK-ONE'), built);
 
   sys = sysOf(makeAgent({ instructions: 'Use pnpm, not npm.\nAlways run node --test.' }));
-  check('config instructions land in the system prompt', sys.includes('Use pnpm, not npm.') && sys.includes('User instructions'), sys);
-  check('instructions come after the built-in defaults', sys.indexOf('Work method:') < sys.indexOf('Use pnpm'), sys);
+  check('config instructions land in the system prompt', sys.includes('Use pnpm, not npm.') && sys.includes('# User instructions'), sys);
+  check('instructions come after the built-in defaults', sys.indexOf('# Working method') < sys.indexOf('Use pnpm'), sys);
 
   const rulesFile = path.join(promptDir, 'RULES.md');
   fs.writeFileSync(rulesFile, 'RULES-FILE: only commit when asked.\n');
@@ -807,9 +834,9 @@ async function main() {
   // createAgent was imported with the system-prompt section above
   const workE = path.join(tmp, 'workE');
   fs.mkdirSync(workE, { recursive: true });
-  const smallConfig = { ...baseConfig(port), contextSize: 2000, maxTokens: 256, workspace: workE, streaming: false, autoCompact: true };
+  const smallConfig = { ...baseConfig(port), contextSize: 8000, maxTokens: 256, workspace: workE, streaming: false, autoCompact: true };
   const agentE = createAgent({ config: smallConfig, builtins: createTools(smallConfig), mcp: null });
-  agentE.history.push({ role: 'user', content: 'filler filler '.repeat(1200) }); // pushes past the budget
+  agentE.history.push({ role: 'user', content: 'filler filler '.repeat(3000) }); // pushes past the budget
 
   let captured = '';
   const origWrite = process.stdout.write.bind(process.stdout);
@@ -833,7 +860,7 @@ async function main() {
   fs.mkdirSync(workF, { recursive: true });
   const offConfig = { ...smallConfig, workspace: workF, autoCompact: false };
   const agentF = createAgent({ config: offConfig, builtins: createTools(offConfig), mcp: null });
-  agentF.history.push({ role: 'user', content: 'filler filler '.repeat(1200) });
+  agentF.history.push({ role: 'user', content: 'filler filler '.repeat(3000) });
   captured = '';
   process.stdout.write = (chunk, ...rest) => {
     captured += String(chunk);
@@ -846,6 +873,26 @@ async function main() {
   }
   check('autoCompact:false warns instead of compacting', captured.includes('run /compact'), captured.slice(0, 400));
   check('autoCompact:false does not summarize', !captured.includes('compacted conversation'), captured.slice(0, 400));
+
+  // a context too small for the system prompt itself must warn once, not compact on every step
+  const workCramped = path.join(tmp, 'workCramped');
+  fs.mkdirSync(workCramped, { recursive: true });
+  const crampedConfig = { ...baseConfig(port), contextSize: 2000, maxTokens: 256, workspace: workCramped, streaming: false, autoCompact: true };
+  const agentG = createAgent({ config: crampedConfig, builtins: createTools(crampedConfig), mcp: null });
+  captured = '';
+  process.stdout.write = (chunk, ...rest) => {
+    captured += String(chunk);
+    return true;
+  };
+  try {
+    await agentG.turn('continue please');
+  } finally {
+    process.stdout.write = origWrite;
+  }
+  check('a context smaller than the system prompt warns instead of looping', captured.includes('nothing left to compact'), captured.slice(0, 500));
+  check('the warning points at contextSize', /Raise "contextSize"/.test(captured), captured.slice(0, 500));
+  check('the turn still completes on a cramped context', captured.includes('MOCK-DONE'), captured.slice(0, 500));
+  check('no compaction is attempted when it cannot help', agentG.stats().compactions === 0, JSON.stringify(agentG.stats()));
 
   /* ---------------- 3d. cut-off recovery (truncation, step limit, retries) ---------------- */
   console.log('\n[cut-off recovery]');
