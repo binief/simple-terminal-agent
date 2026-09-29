@@ -241,7 +241,7 @@ description — you read it, so it counts.
 
 ## MCP servers (optional)
 
-Any [Model Context Protocol](https://modelcontextprotocol.io) stdio server can be plugged in via config. Its tools become `mcp_<server>_<tool>` and are offered to the model next to the built-ins.
+Any [Model Context Protocol](https://modelcontextprotocol.io) stdio or Streamable HTTP server can be plugged in via config. Its tools become `mcp_<server>_<tool>` and are offered to the model next to the built-ins.
 
 ```json
 {
@@ -251,13 +251,18 @@ Any [Model Context Protocol](https://modelcontextprotocol.io) stdio server can b
         "command": "npx",
         "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/extra/dir"],
         "env": {}
+      },
+      "remote": {
+        "type": "http",
+        "url": "https://example.com/mcp",
+        "headers": { "Authorization": "Bearer YOUR_TOKEN" }
       }
     }
   }
 }
 ```
 
-A failing server is reported at startup and skipped; the rest keep working.
+For HTTP servers, use `type: "http"` and the server's MCP endpoint URL. Optional `headers` are sent with every request. A failing server is reported at startup and skipped; the rest keep working.
 
 ## Terminal chat view
 
