@@ -377,6 +377,28 @@ async function main() {
           agent.reset(); // drops the plan too: a fresh context implies a fresh plan
           ui.printSystem(`conversation cleared${agent.planning ? ' (still in plan mode)' : ''}`);
           break;
+        case '/export': {
+          const file = text.slice(cmd.length).trim();
+          if (!file) { ui.printError('usage: /export <file>'); break; }
+          try {
+            const target = path.resolve(builtins.cwd, file.replace(/^['"]|['"]$/g, ''));
+            fs.writeFileSync(target, JSON.stringify({ format: 'coding-harness-chat', version: 1, exportedAt: new Date().toISOString(), messages: agent.history }, null, 2) + '\\n');
+            ui.printSystem(`chat exported to ${target}`);
+          } catch (e) { ui.printError(`could not export chat: ${e.message}`); }
+          break;
+        }
+        case '/import': {
+          const file = text.slice(cmd.length).trim();
+          if (!file) { ui.printError('usage: /import <file>'); break; }
+          try {
+            const source = path.resolve(builtins.cwd, file.replace(/^['"]|['"]$/g, ''));
+            const data = JSON.parse(fs.readFileSync(source, 'utf8'));
+            if (data?.format !== 'coding-harness-chat' || !Array.isArray(data.messages) || !data.messages.length || data.messages[0].role !== 'system') throw new Error('invalid chat export');
+            agent.history.splice(0, agent.history.length, ...data.messages);
+            ui.printSystem(`chat imported from ${source} (${data.messages.length - 1} message(s))`);
+          } catch (e) { ui.printError(`could not import chat: ${e.message}`); }
+          break;
+        }
         case '/clear':
           process.stdout.write('\x1b[2J\x1b[H');
           break;
@@ -398,7 +420,8 @@ async function main() {
 
   rl.on('SIGINT', () => {
     if (reader.busy) {
-      ui.printSystem('working… let the turn finish (the session is single-threaded)');
+      agent.cancel();
+      ui.printSystem('interrupt requested — stopping the current execution…');
       return;
     }
     if (reader.pending || rl.line) {

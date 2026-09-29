@@ -295,7 +295,7 @@ Simple ANSI styling, no TUI framework: role headers, streaming output with light
 | **Shift+Enter** / **Alt+Enter** | same, in terminals that report those keys as `ESC+CR` (VS Code's terminal, and iTerm2 / WezTerm / kitty / most terminals once shift+enter is bound to send it — Alt+Enter works out of the box in most of them) |
 | paste several lines | the pasted lines become one draft |
 | plain **Enter** | sends the whole draft as a single message |
-| **Ctrl+C** | discards the draft and gives you a fresh prompt |
+| **Ctrl+C** | discards the draft; while the agent is working, interrupts the active model request |
 
 The draft is delivered as one message with its newlines intact, so code snippets and multi-paragraph
 prompts survive. Blank lines are part of the message: put a `\` on an empty line to keep one. A draft
@@ -303,7 +303,7 @@ that was never finished is still sent when the input ends (piped scripts, Ctrl+D
 
 ## Session commands
 
-`/help` `/config` `/tools` `/set dir <path>` `/cwd` `/usage` `/compact` `/reset` (clear conversation) `/clear` (clear screen) `/exit`
+`/help` `/config` `/tools` `/set dir <path>` `/cwd` `/usage` `/compact` `/reset` (clear conversation) `/export <file>` (save chat) `/import <file>` (load chat) `/clear` (clear screen) `/exit`
 
 Plan first: `/plan <task>` `/plan show` `/approve [note]` `/plan off` (see [Plan mode](#plan-mode)).
 
