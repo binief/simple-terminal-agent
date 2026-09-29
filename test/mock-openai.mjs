@@ -1,5 +1,8 @@
 /* Mock OpenAI-compatible /chat/completions server for tests.
    Prints "PORT <n>" on startup. Behavior (keyed on user text):
+   - "PLAN-ME"       -> tries to write a file (plan mode must refuse it), tries a mutating
+                        command (refused), runs a read-only one, then calls present_plan;
+                        once the approval message arrives it implements the plan
    - "TRUNCATE-CUT"  -> text reply cut off mid-sentence (finish_reason "length"),
                         then a complete reply once the [continue] nudge arrives
    - "TRUNCATE-TOOL" -> tool call whose arguments were cut off mid-JSON
@@ -13,6 +16,7 @@
 import http from 'node:http';
 
 import { COMPACT_TAG, CONTINUE_TAG } from '../lib/agent.js';
+import { APPROVED_TAG } from '../lib/plan.js';
 
 const isWin = process.platform === 'win32';
 
@@ -38,6 +42,45 @@ function plan(messages) {
     const users = messages.filter((m) => m.role === 'user');
     const multiline = users.some((m) => String(m.content ?? '').includes('\n'));
     return { text: `MOCK-DONE users=${users.length} multiline=${multiline}` };
+  }
+
+  // plan mode: research (the mutating calls must be refused), hand over a plan,
+  // then implement it once the user has approved it
+  if (userText.includes('PLAN-ME')) {
+    if (userText.includes(APPROVED_TAG)) {
+      if (/^(Wrote|Overwrote) plan-probe\.txt/.test(lastTool)) return { text: 'MOCK-DONE plan-approved' };
+      return {
+        tool: { id: 'call_pa', name: 'write_file', arguments: JSON.stringify({ path: 'plan-probe.txt', content: 'plan-ok' }) },
+      };
+    }
+    switch (toolMsgs.length) {
+      case 0: // must be refused: plan mode has no write_file
+        return {
+          tool: { id: 'call_p0', name: 'write_file', arguments: JSON.stringify({ path: 'plan-probe.txt', content: 'should-not-exist' }) },
+        };
+      case 1: // must be refused: the command changes the workspace
+        return {
+          tool: { id: 'call_p1', name: 'run_command', arguments: JSON.stringify({ command: isWin ? 'del plan-probe.txt' : 'rm -f plan-probe.txt' }) },
+        };
+      case 2: // read-only commands are still allowed
+        return { tool: { id: 'call_p2', name: 'run_command', arguments: JSON.stringify({ command: isWin ? 'dir' : 'ls -a' }) } };
+      case 3:
+        return {
+          tool: {
+            id: 'call_p3',
+            name: 'present_plan',
+            arguments: JSON.stringify({
+              title: 'Add the probe file',
+              steps: ['create plan-probe.txt with the probe text', 'read it back to confirm'],
+              files: ['plan-probe.txt'],
+              verification: 'cat plan-probe.txt',
+              notes: 'PLAN-NOTES: nothing risky here',
+            }),
+          },
+        };
+      default:
+        return { text: 'MOCK-DONE plan-stalled' }; // present_plan should have ended the turn
+    }
   }
 
   // a text reply that the token limit cut in half; the harness should send a

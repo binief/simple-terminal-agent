@@ -446,6 +446,193 @@ async function main() {
   check('an empty instructions value becomes null', loadConfig(writeConfig('cfg-ins-empty.json', { ...baseConfig(1), instructions: '  ' })).config.instructions === null, 'not null');
   check('/config view flattens instructions to one line', maskConfig(cfgIns).instructions === 'line one line two', JSON.stringify(maskConfig(cfgIns).instructions));
 
+  /* ---------------- 0f. plan mode (read-only research, then approval) ---------------- */
+  console.log('\n[plan mode]');
+  const {
+    isReadOnlyCommand,
+    createPlanState,
+    normalizePlan,
+    formatPlan,
+    scanCommand,
+    PLAN_MODE,
+    BUILD_MODE,
+    APPROVED_TAG,
+  } = await import(pathToFileURL(path.join(proj, 'lib', 'plan.js')).href);
+
+  const isWin = process.platform === 'win32';
+  const ro = (cmd, extra) => isReadOnlyCommand(cmd, extra).ok;
+  const allRo = (cmds, extra) => cmds.filter((c) => !ro(c, extra));
+  const noneRo = (cmds, extra) => cmds.filter((c) => ro(c, extra));
+
+  let bad = allRo([
+    'ls -la',
+    'cat src/app.js',
+    'head -n 40 README.md',
+    'rg TODO src | head -20',
+    'wc -l *.js',
+    'git status',
+    'git log --oneline -n 20',
+    'git diff HEAD~1 -- lib/',
+    'git -C ../other show HEAD',
+    'git branch -v',
+    'git config --get user.name',
+    'npm ls --depth=0',
+    'node --version',
+    'echo hi && pwd',
+  ]);
+  check('read-only commands run in plan mode', bad.length === 0, `refused: ${bad.join(' | ')}`);
+
+  let leaked = noneRo([
+    'rm -rf build',
+    'mkdir out',
+    'touch new.txt',
+    'cp a b',
+    'mv a b',
+    'chmod +x run.sh',
+    'npm install left-pad',
+    'npm run build',
+    'yarn add lodash',
+    'git commit -m "wip"',
+    'git push origin main',
+    'git checkout -b feature',
+    'git config user.name Bob',
+    'node build.js',
+    'python setup.py install',
+    'sed -i s/a/b/ file.txt',
+    'curl -o out.zip https://example.com',
+  ]);
+  check('mutating commands are refused in plan mode', leaked.length === 0, `allowed: ${leaked.join(' | ')}`);
+
+  check('one mutating step refuses the whole chain', !ro('ls && rm -rf build') && !ro('cat a.txt; git push'), 'a chain slipped through');
+  check('output redirection is refused', !ro('echo hi > out.txt') && !ro('cat a >> b.log'), 'redirection allowed');
+  check('stderr redirection stays read-only', ro('ls -la 2>&1') && ro('git status 2>&1 | head'), 'rejected 2>&1');
+  check('command substitution is refused', !ro('echo $(rm -rf tmp)') && !ro('echo `whoami`'), 'substitution allowed');
+  check('find -delete / -exec are refused', !ro('find . -name "*.log" -delete') && !ro('find . -exec rm {} ;'), 'find can write');
+  check('plain find still works', ro('find . -name "*.js"'), 'find rejected');
+  check('separators inside quotes are not chains', ro('grep "a && rm -rf b" src'), 'quoted text split');
+  check('env assignments do not hide a command', !ro('FOO=1 rm -rf x') && ro('FOO=1 ls'), 'assignment prefix mishandled');
+  check('an absolute path resolves to the base command', ro('/bin/ls -la') && !ro('/bin/rm -rf x'), 'path not resolved');
+  check('planAllowCommands adds a command', ro('make check', ['make']) && !ro('make check'), 'extra allow ignored');
+  check('planAllowCommands can allow an exact prefix', ro('npm test --silent', ['npm test']) && !ro('npm start', ['npm test']), 'prefix allow ignored');
+  check('the refusal says why', /not a known read-only command/.test(isReadOnlyCommand('rm -rf x').reason || ''), isReadOnlyCommand('rm -rf x').reason);
+  check('scanCommand splits on shell separators', scanCommand('a && b | c; d').segments.length === 4, JSON.stringify(scanCommand('a && b | c; d').segments));
+
+  // --- the plan object ---
+  check('normalizePlan keeps the steps in order', normalizePlan({ title: 't', steps: ['one', 'two'] }).steps.join('|') === 'one|two', 'reordered');
+  check('normalizePlan accepts steps as a numbered string', normalizePlan({ title: 't', steps: '1. one\n2. two' }).steps.length === 2, 'not split');
+  check('normalizePlan needs a title', (() => { try { normalizePlan({ steps: ['a'] }); return false; } catch { return true; } })(), 'no error');
+  check('normalizePlan needs steps', (() => { try { normalizePlan({ title: 't' }); return false; } catch { return true; } })(), 'no error');
+  const shown = formatPlan({ title: 'T', steps: ['a', 'b'], files: ['x.js'], verification: 'npm test', notes: 'n' });
+  check('formatPlan numbers the steps', shown.includes('1. a') && shown.includes('2. b'), shown);
+  check('formatPlan carries files, verification and notes', shown.includes('x.js') && shown.includes('npm test') && shown.includes('n'), shown);
+
+  const state = createPlanState();
+  check('a session starts in build mode', state.mode === BUILD_MODE && !state.planning, state.mode);
+  state.setMode(PLAN_MODE);
+  check('setMode switches to plan mode', state.planning, state.mode);
+  state.present({ title: 'Ship it', steps: ['edit a.js'] });
+  check('a presented plan is picked up once', state.takePresented()?.title === 'Ship it' && state.takePresented() === null, 'not consumed');
+  check('approve returns to build mode', state.approve()?.title === 'Ship it' && state.mode === BUILD_MODE, state.mode);
+  check('the approved plan is remembered', state.approved?.title === 'Ship it' && state.proposed === null, 'lost');
+  check('approving without a plan does nothing', createPlanState().approve() === null, 'approved nothing');
+  state.clear();
+  check('clear drops the plans', state.approved === null && state.proposed === null, 'kept');
+
+  // --- tools honour the mode ---
+  const planDir = path.join(tmp, 'planwork');
+  fs.mkdirSync(planDir, { recursive: true });
+  fs.writeFileSync(path.join(planDir, 'app.js'), 'console.log(1)\n');
+  const planState = createPlanState({ mode: PLAN_MODE });
+  const planTools = createTools({ workspace: planDir, commandTimeout: 15, shell: null }, planState);
+  const planNames = planTools.listTools().map((t) => t.name);
+  check('plan mode hides the mutating tools', !planNames.includes('write_file') && !planNames.includes('edit_file'), planNames.join(', '));
+  check('plan mode keeps the read-only tools', ['read_file', 'list_dir', 'search_files', 'run_command'].every((n) => planNames.includes(n)), planNames.join(', '));
+  check('plan mode offers present_plan', planNames.includes('present_plan'), planNames.join(', '));
+
+  r = await planTools.execute('write_file', { path: 'nope.txt', content: 'x' });
+  check('write_file is refused in plan mode', r.startsWith('Error:') && r.includes('read-only'), r);
+  check('the refused write did not happen', !fs.existsSync(path.join(planDir, 'nope.txt')), 'the file was created');
+  r = await planTools.execute('edit_file', { path: 'app.js', old_text: '1', new_text: '2' });
+  check('edit_file is refused in plan mode', r.startsWith('Error:') && r.includes('plan mode'), r);
+  check('the refused edit did not happen', fs.readFileSync(path.join(planDir, 'app.js'), 'utf8').includes('console.log(1)'), 'the file changed');
+  check('the refusal points at present_plan', r.includes('present_plan') && r.includes('/approve'), r);
+  r = await planTools.execute('read_file', { path: 'app.js' });
+  check('read_file still works in plan mode', r.includes('console.log(1)'), r);
+  r = await planTools.execute('search_files', { pattern: 'console' });
+  check('search_files still works in plan mode', r.includes('app.js:1:'), r);
+  r = await planTools.execute('run_command', { command: isWin ? 'dir' : 'ls -a' });
+  check('read-only commands still run in plan mode', r.includes('exit code: 0'), r);
+  r = await planTools.execute('run_command', { command: isWin ? 'echo x > made-by-plan.txt' : 'touch made-by-plan.txt' });
+  check('a writing command is refused in plan mode', r.startsWith('Error:') && r.includes('plan mode is read-only'), r);
+  check('the refused command did not run', !fs.existsSync(path.join(planDir, 'made-by-plan.txt')), 'the file was created');
+  const allowTools = createTools({ workspace: planDir, commandTimeout: 15, shell: null, planAllowCommands: ['make'] }, planState);
+  r = await allowTools.execute('run_command', { command: 'make --version' });
+  check('planAllowCommands reaches run_command', !r.startsWith('Error: plan mode'), r);
+
+  r = await planTools.execute('present_plan', { title: 'Do the thing', steps: ['step one', 'step two'] });
+  check('present_plan records the plan', planState.proposed?.steps.length === 2, r);
+  check('present_plan tells the model to stop and wait', /Stop here/.test(r) && r.includes('/approve'), r);
+  r = await planTools.execute('present_plan', { steps: ['x'] });
+  check('present_plan rejects a plan without a title', r.startsWith('Error:') && r.includes('title'), r);
+
+  planState.setMode(BUILD_MODE);
+  const buildNames = planTools.listTools().map((t) => t.name);
+  check('build mode restores the mutating tools', buildNames.includes('write_file') && buildNames.includes('edit_file'), buildNames.join(', '));
+  check('build mode hides present_plan', !buildNames.includes('present_plan'), buildNames.join(', '));
+  r = await planTools.execute('write_file', { path: 'nope.txt', content: 'x' });
+  check('build mode writes files again', r.includes('Wrote') && fs.existsSync(path.join(planDir, 'nope.txt')), r);
+  r = await planTools.execute('present_plan', { title: 't', steps: ['a'] });
+  check('present_plan is rejected outside plan mode', r.startsWith('Error:') && r.includes('/plan'), r);
+
+  // --- the agent: system prompt, tool list, approval ---
+  const planCfg = { ...promptCfg, planMode: true };
+  const planBuiltins = createTools(planCfg);
+  const planAgent = createAgent({ config: planCfg, builtins: planBuiltins, mcp: null });
+  check('config planMode starts the session in plan mode', planAgent.planning && planAgent.mode === PLAN_MODE, planAgent.mode);
+  sys = sysOf(planAgent);
+  check('the system prompt states the mode', /Mode: plan/.test(sys), sys.slice(0, 500));
+  check('plan mode rules are in the system prompt', sys.includes('PLAN MODE IS ON'), sys);
+  check('plan mode rules forbid implementing', /do not implement/i.test(sys) && /present_plan/.test(sys), sys);
+  check('plan mode advertises no mutating tools', planAgent.tools().every((t) => t.name !== 'write_file' && t.name !== 'edit_file'), planAgent.tools().map((t) => t.name).join(', '));
+  check('plan mode advertises present_plan', planAgent.tools().some((t) => t.name === 'present_plan'), planAgent.tools().map((t) => t.name).join(', '));
+
+  planBuiltins.plan.present({ title: 'Ship the flag', steps: ['edit harness.js', 'add a test'], verification: 'npm test' });
+  const accepted = planAgent.approvePlan('keep it small');
+  check('approving leaves plan mode', !planAgent.planning && planAgent.mode === BUILD_MODE, planAgent.mode);
+  check('the approved plan is pinned in the system prompt', sysOf(planAgent).includes('Approved plan') && sysOf(planAgent).includes('Ship the flag'), sysOf(planAgent));
+  check('build mode drops the plan-mode rules', !sysOf(planAgent).includes('PLAN MODE IS ON'), sysOf(planAgent));
+  check('the approval message carries the plan', accepted.message.includes(APPROVED_TAG) && accepted.message.includes('1. edit harness.js'), accepted.message);
+  check('the approval message carries the user note', accepted.message.includes('keep it small'), accepted.message);
+  check('the mutating tools are back after approval', planAgent.tools().some((t) => t.name === 'write_file'), planAgent.tools().map((t) => t.name).join(', '));
+  planAgent.setMode(PLAN_MODE);
+  check('setMode(plan) puts the rules back', sysOf(planAgent).includes('PLAN MODE IS ON'), sysOf(planAgent));
+  check('switching modes tells the running conversation', planAgent.history.some((m) => /Plan mode is ON/.test(String(m.content ?? ''))) || planAgent.history.length === 1, JSON.stringify(planAgent.history.map((m) => m.role)));
+  planAgent.reset();
+  check('/reset drops the approved plan', !planAgent.plan.approved && !sysOf(planAgent).includes('Approved plan'), sysOf(planAgent));
+  check('/reset keeps the mode', planAgent.planning, planAgent.mode);
+  check('approving nothing at all is refused', planAgent.approvePlan() === null, 'approved an empty session');
+
+  // a model that described its approach in prose instead of calling present_plan
+  const proseAgent = createAgent({ config: planCfg, builtins: createTools(planCfg), mcp: null });
+  proseAgent.history.push({ role: 'user', content: 'add the flag' }, { role: 'assistant', content: 'I would edit harness.js and add a test.' });
+  const prose = proseAgent.approvePlan('go');
+  check('/approve also accepts an approach described in prose', prose !== null && prose.plan === null, JSON.stringify(prose));
+  check('the prose approval leaves plan mode', !proseAgent.planning, proseAgent.mode);
+  check('the prose approval message is explicit', prose.message.includes(APPROVED_TAG) && prose.message.includes('go'), prose.message);
+
+  // --- config plumbing ---
+  check('planMode defaults to false', loadConfig(writeConfig('cfg-plan-default.json', baseConfig(1))).config.planMode === false, 'not false');
+  check('planMode can be set in the config', loadConfig(writeConfig('cfg-plan-on.json', { ...baseConfig(1), planMode: true })).config.planMode === true, 'not true');
+  process.env.HARNESS_PLAN_MODE = '1';
+  const { config: cfgPlanEnv } = loadConfig(writeConfig('cfg-plan-env.json', baseConfig(1)));
+  delete process.env.HARNESS_PLAN_MODE;
+  check('HARNESS_PLAN_MODE overrides the config', cfgPlanEnv.planMode === true, 'not overridden');
+  const { config: cfgPlanAllow } = loadConfig(
+    writeConfig('cfg-plan-allow.json', { ...baseConfig(1), planAllowCommands: ['  make  ', '', 'npm test'], planAllowTools: ['mcp_fake_add'] })
+  );
+  check('planAllowCommands is cleaned up', cfgPlanAllow.planAllowCommands.join('|') === 'make|npm test', JSON.stringify(cfgPlanAllow.planAllowCommands));
+  check('the plan keys show up in /config', maskConfig(cfgPlanAllow).planMode === false && maskConfig(cfgPlanAllow).planAllowTools.includes('mcp_fake_add'), JSON.stringify(maskConfig(cfgPlanAllow).planAllowTools));
+
   /* ---------------- start mock API ---------------- */
   const { child: mock, port } = await startMockOpenai();
   const workB = path.join(tmp, 'workB');
@@ -560,6 +747,54 @@ async function main() {
   check('/compact frees tokens', /compacted conversation: [\d.,kM]+ → [\d.,kM]+ tokens/.test(res.out), res.out);
   check('session continues after /compact', (res.out.match(/MOCK-DONE/g) || []).length >= 2, res.out);
   check('/compact usage is counted', /\/usage|session/.test(res.out), res.out);
+
+  /* ---------------- 3b2. plan mode, end to end ---------------- */
+  console.log('\n[plan mode, end to end]');
+  const workPlan = path.join(tmp, 'workPlan');
+  fs.mkdirSync(workPlan, { recursive: true });
+  const cfgPlanSession = writeConfig('cfg-plan-session.json', { ...baseConfig(port), workspace: workPlan });
+
+  res = await runWithInput([harness, '--config', cfgPlanSession, '--no-stream'], '/plan PLAN-ME add the probe file\n', { cwd: workPlan });
+  check('/plan switches the session to plan mode', res.code === 0 && res.out.includes('plan mode on'), res.out);
+  check('plan mode refuses write_file during the turn', res.out.includes('plan mode is read-only'), res.out);
+  check('plan mode refuses a mutating command', res.out.includes('was not run'), res.out);
+  check('plan mode still runs read-only commands', res.out.includes('exit code: 0'), res.out);
+  check('the plan is rendered as its own block', res.out.includes('Plan') && res.out.includes('Add the probe file'), res.out);
+  check('the plan steps are numbered', /1\.\s+create plan-probe\.txt/.test(res.out), res.out);
+  check('the plan shows files and verification', res.out.includes('plan-probe.txt') && res.out.includes('cat plan-probe.txt'), res.out);
+  check('the plan notes are shown', res.out.includes('PLAN-NOTES'), res.out);
+  check('the turn stops at the plan', !res.out.includes('MOCK-DONE plan-stalled'), res.out);
+  check('the user is told how to approve', res.out.includes('/approve'), res.out);
+  check('planning changed nothing on disk', !fs.existsSync(path.join(workPlan, 'plan-probe.txt')), 'the workspace was modified in plan mode');
+
+  res = await runWithInput([harness, '--config', cfgPlanSession, '--no-stream'], '/plan PLAN-ME add the probe file\n/approve\n', { cwd: workPlan });
+  check('/approve reports the plan it accepted', res.out.includes('plan approved: Add the probe file'), res.out);
+  check('/approve runs the implementation', res.out.includes('MOCK-DONE plan-approved'), res.out);
+  check('the approved plan is actually implemented', fs.existsSync(path.join(workPlan, 'plan-probe.txt')) && fs.readFileSync(path.join(workPlan, 'plan-probe.txt'), 'utf8') === 'plan-ok', 'wrong content');
+
+  res = await runWithInput([harness, '--config', cfgPlanSession, '--no-stream'], '/approve\n', { cwd: workPlan });
+  check('/approve without a plan explains itself', res.out.includes('no plan to approve'), res.out);
+
+  res = await runWithInput([harness, '--config', cfgPlanSession, '--no-stream'], '/plan\n/plan off\n', { cwd: workPlan });
+  check('/plan with no task just turns the mode on', res.out.includes('plan mode on'), res.out);
+  check('/plan off leaves plan mode', res.out.includes('plan mode off'), res.out);
+
+  res = await runWithInput([harness, '--config', cfgPlanSession, '--no-stream'], '/plan\n/tools\n/config\n', { cwd: workPlan });
+  check('/tools hides the mutating tools in plan mode', (res.out.match(/write_file/g) || []).length === 1, res.out);
+  check('/tools lists present_plan in plan mode', res.out.includes('present_plan'), res.out);
+  check('/config reports the current mode', res.out.includes('mode: plan'), res.out);
+  check('/help documents the plan commands', res.out.includes('/plan') && res.out.includes('/approve'), res.out);
+
+  const workPlanOnce = path.join(tmp, 'workPlanOnce');
+  fs.mkdirSync(workPlanOnce, { recursive: true });
+  res = await run(
+    process.execPath,
+    [harness, '--config', cfgPlanSession, '--plan', '--dir', workPlanOnce, '--no-stream', '--once', 'PLAN-ME add the probe file'],
+    { cwd: workPlanOnce }
+  );
+  check('--plan starts the session in plan mode', res.code === 0 && res.out.includes('read-only: research'), res.out);
+  check('--plan produces a plan', res.out.includes('Add the probe file'), res.out);
+  check('--plan leaves the workspace untouched', !fs.existsSync(path.join(workPlanOnce, 'plan-probe.txt')), 'the workspace was modified');
 
   /* ---------------- 3c. automatic compaction ---------------- */
   console.log('\n[auto-compaction]');

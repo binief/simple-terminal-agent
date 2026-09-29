@@ -1,6 +1,6 @@
 # coding-harness
 
-A minimal, concretely working **coding harness** in Node.js — a single-session terminal chat agent for any OpenAI-compatible API, with built-in coding tools, OS-aware command execution, optional MCP servers, and a styled chat view.
+A minimal, concretely working **coding harness** in Node.js — a single-session terminal chat agent for any OpenAI-compatible API, with built-in coding tools, OS-aware command execution, a read-only [plan mode](#plan-mode) for agreeing on the work before it starts, optional MCP servers, and a styled chat view.
 
 **Zero npm dependencies.** Node.js >= 18 only.
 
@@ -37,6 +37,9 @@ Everything lives in one JSON file in the user's home directory: `~/.coding-harne
   "instructions": null,
   "autoCompact": true,
   "commandTimeout": 60,
+  "planMode": false,
+  "planAllowCommands": [],
+  "planAllowTools": [],
   "mcp": {
     "servers": {}
   }
@@ -60,10 +63,14 @@ Everything lives in one JSON file in the user's home directory: `~/.coding-harne
 | `instructions` | Extra rules appended to the system prompt: literal text, or the path to a text file (`~` expanded, relative paths resolve against the workspace). Re-read on every system-prompt rebuild, so edits apply mid-session. Env override: `HARNESS_INSTRUCTIONS`. |
 | `autoCompact` | `true` (default) = summarize the conversation automatically before the context fills up. `false` = only warn; use `/compact` yourself. |
 | `commandTimeout` | Default timeout (seconds) for `run_command`. |
+| `planMode` | `true` = start every session in plan mode (read-only research, see below). Default `false`. Also `--plan`. |
+| `planAllowCommands` | Extra commands `run_command` may run in plan mode: `["make"]` allows the command, `["npm test"]` allows exactly that prefix. Default `[]`. |
+| `planAllowTools` | MCP tools that stay available in plan mode (they are hidden by default because an MCP server can write anywhere): `["mcp_docs_search"]`. Default `[]`. |
 | `mcp.servers` | Named MCP servers (see below). |
 
 Env var overrides: `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL`,
-`HARNESS_STREAMING`, `HARNESS_CONTEXT_SIZE`, `HARNESS_TEMPERATURE`, `HARNESS_MAX_STEPS`.
+`HARNESS_STREAMING`, `HARNESS_CONTEXT_SIZE`, `HARNESS_TEMPERATURE`, `HARNESS_MAX_STEPS`,
+`HARNESS_PLAN_MODE`.
 
 ## Built-in coding tools
 
@@ -75,6 +82,7 @@ Env var overrides: `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL`,
 | `list_dir` | List a directory (dirs first) |
 | `search_files` | Recursive regex content search (skips dependencies, build output, caches, `.gitignore` matches and binary files — see below) |
 | `run_command` | Run a shell command in the workspace, returns stdout/stderr/exit code |
+| `present_plan` | Plan mode only: hand a titled, numbered plan to the user for approval (see [Plan mode](#plan-mode)) |
 
 **Line endings are OS-aware.** Files are read and normalised to `\n`, so a CRLF (Windows) file matches
 the `old_text` you copied out of `read_file`, and it is written back with its own CRLF endings intact.
@@ -132,6 +140,9 @@ Alongside it, the tool policy spells out which tool to use for what, how `edit_f
 that `run_command` follows the platform shell (and has `cwd`/`timeout` options), and that commands run
 with your permissions — so destructive steps get announced instead of sprung.
 
+In [plan mode](#plan-mode) the prompt swaps the "change the code" rules for "research it and hand over a
+plan", and the harness backs that up by withdrawing the tools that could change anything.
+
 ### Custom instructions
 
 `instructions` adds your own rules on top of the built-in ones:
@@ -150,6 +161,83 @@ A single-line value that names an existing file is read from disk (`~` expanded,
 workspace); anything else is used as literal text. The file is re-read whenever the system prompt is
 rebuilt — after `/set dir` for example — so you can edit your rules mid-session. `HARNESS_INSTRUCTIONS`
 overrides the config value, and `/config` shows what is active.
+
+## Plan mode
+
+Think before you type. `/plan <task>` puts the session in **plan mode**: the model may read the
+project but cannot touch it, and the turn ends with a plan you approve — or don't.
+
+```
+❯ /plan add a --version flag
+  ● plan mode on — read-only research (no edits, no commands that change anything).
+    The model finishes with a plan; /approve accepts it, /plan off leaves.
+
+  ── ⚙ search_files {"pattern":"process.argv"} ──
+  ── ⚙ read_file {"path":"harness.js","offset":40} ──
+  ── ⚙ run_command {"command":"git log --oneline -n 5"} ──
+
+  ── ✦ Plan ─────────────────────────────────────
+  Add a --version flag to the CLI
+
+   1. add a `--version` case to parseArgs in harness.js (opts.version)
+   2. print `coding-harness v<pkg.version>` and return before the config is loaded
+   3. document the flag in the CLI flags block of README.md
+
+  files  harness.js, README.md
+  verify node harness.js --version
+  notes  --help already prints the version, so the two should agree
+  ● plan ready — /approve to implement it, /plan off to leave plan mode, or reply with changes
+
+plan ❯ /approve
+  ● plan approved: Add a --version flag to the CLI — implementing (3 step(s))
+```
+
+| Command | What it does |
+| --- | --- |
+| `/plan <task>` | Turn plan mode on and start researching that task |
+| `/plan` | Turn plan mode on (then type the task as a normal message) |
+| `/plan show` | Print the current plan again |
+| `/approve [note]` | Accept the plan, leave plan mode, start implementing. The note is passed to the model (`/approve skip the README part`) |
+| `/plan off`, `/build` | Leave plan mode without a plan |
+
+`--plan` starts a session in plan mode (`node harness.js --plan`), `"planMode": true` makes it the
+default, and the prompt (`plan ❯`) plus the `mode` row in the banner show which mode you are in.
+
+### What "read-only" actually means
+
+Plan mode is enforced by the harness, not by asking the model nicely:
+
+- **`write_file` and `edit_file` are not offered at all**, and are refused even if the model calls one
+  from memory.
+- **`run_command` only accepts commands that cannot change anything** — `ls`, `cat`, `head`, `wc`,
+  `grep`/`rg`, `find`, `git status|log|diff|show|blame|ls-files`, `git branch -v`, `npm ls`,
+  `<anything> --version`, and pipelines of those. Every segment of a chain is checked, so
+  `ls && rm -rf build` is refused as a whole. Output redirection (`> file`), command substitution
+  (`$(…)`, backticks), `find -delete`/`-exec`, `sed -i`, installers, `git commit`/`push`, and
+  interpreters that can run arbitrary code (`node x.js`, `python …`) are all rejected — with a reason
+  the model can act on.
+- **MCP tools are hidden** (an MCP server can write anywhere); list the safe ones in `planAllowTools`.
+- Project-specific read-only commands go in `planAllowCommands`: `["make"]` allows the command,
+  `["npm test"]` allows exactly that prefix.
+
+```json
+{ "planAllowCommands": ["make", "npm test"], "planAllowTools": ["mcp_docs_search"] }
+```
+
+### From plan to implementation
+
+`present_plan` is how a planning turn ends: the model calls it with a title, ordered steps, the files
+involved, how it will verify the result and any open questions. The harness renders the plan and stops
+the turn there — nothing is implemented while you read it.
+
+`/approve` then does three things: it switches back to build mode (the mutating tools come back), pins
+the approved plan into the system prompt so it survives compaction and stays in front of the model for
+the whole implementation, and sends the "implement this now" turn. If you would rather refine the plan,
+just keep chatting — plan mode stays on until a plan is approved or you leave it. `/reset` clears the
+conversation and the plan together.
+
+If the model describes its approach in prose instead of calling `present_plan`, `/approve` accepts that
+description — you read it, so it counts.
 
 ## MCP servers (optional)
 
@@ -212,6 +300,8 @@ that was never finished is still sent when the input ends (piped scripts, Ctrl+D
 
 `/help` `/config` `/tools` `/set dir <path>` `/cwd` `/usage` `/compact` `/reset` (clear conversation) `/clear` (clear screen) `/exit`
 
+Plan first: `/plan <task>` `/plan show` `/approve [note]` `/plan off` (see [Plan mode](#plan-mode)).
+
 One conversation per run (single session). `/reset` starts fresh context inside the same session.
 
 ## Progress, tokens and context
@@ -269,12 +359,15 @@ The harness actively keeps a turn running to completion instead of stopping half
 ## CLI flags
 
 ```
-node harness.js [--config <path>] [--dir <path>] [--init] [--once "<prompt>"] [--stream | --no-stream] [--model <name>]
+node harness.js [--config <path>] [--dir <path>] [--init] [--once "<prompt>"] [--plan] [--stream | --no-stream] [--model <name>]
 ```
 
 `--dir <path>` starts the session in a different working directory (same as typing `/set dir <path>` first).
 
 `--once` runs a single turn and exits (handy for scripting/tests).
+
+`--plan` starts in plan mode — combined with `--once` it prints a plan for a task and changes nothing
+(`node harness.js --plan --once "add caching to the API client"`).
 
 ## Tests
 
@@ -283,4 +376,5 @@ npm test
 ```
 
 Runs an end-to-end suite against a mock OpenAI server and a mock MCP server (streaming on/off, tool
-round-trips, MCP tools, built-in tool smoke tests, search ignore rules and multiline input rules).
+round-trips, MCP tools, built-in tool smoke tests, search ignore rules, multiline input rules, and plan
+mode: the read-only command rules, the tool gating, and a full plan → `/approve` → implementation run).
