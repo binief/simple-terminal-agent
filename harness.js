@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 import { loadConfig, maskConfig, DEFAULT_CONFIG_PATH } from './lib/config.js';
 import { createTools, shellInfo } from './lib/tools.js';
+import { BUILD_MODE, PLAN_MODE } from './lib/plan.js';
 import { connectMcpServers } from './lib/mcp.js';
 import { createAgent } from './lib/agent.js';
 import { createInputReader } from './lib/input.js';
@@ -29,6 +30,12 @@ const HELP = `
     /clear             clear the terminal screen
     /exit  /quit       exit
 
+  Plan first, then build
+    /plan <task>       plan mode: read-only research, ends with a plan to review
+    /plan              turn plan mode on (or /plan show to re-print the plan)
+    /approve [note]    accept the plan, leave plan mode and start implementing
+    /build [message]   leave plan mode without a plan (changes allowed again)
+
   Multiline input
     one line ending in \\     keeps composing (the backslash is dropped)
     Shift+Enter / Alt+Enter  same, in terminals that report them as ESC+CR
@@ -36,11 +43,11 @@ const HELP = `
     plain Enter              sends the whole draft (Ctrl+C discards it)
 
   Anything else is sent to the model as a chat message.
-  CLI flags: --config <path>  --dir <path>  --once "<prompt>"  --stream | --no-stream  --model <name>  --init
+  CLI flags: --config <path>  --dir <path>  --once "<prompt>"  --plan  --stream | --no-stream  --model <name>  --init
 `;
 
 function parseArgs(argv) {
-  const opts = { config: null, dir: null, once: null, streaming: undefined, model: null, init: false, help: false };
+  const opts = { config: null, dir: null, once: null, streaming: undefined, model: null, init: false, help: false, plan: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     switch (a) {
@@ -64,6 +71,10 @@ function parseArgs(argv) {
         break;
       case '--model':
         opts.model = argv[++i];
+        break;
+      case '--plan':
+      case '-p':
+        opts.plan = true;
         break;
       case '--init':
         opts.init = true;
@@ -110,6 +121,9 @@ async function main() {
     return;
   }
 
+  // --plan starts the session in read-only plan mode (same as typing /plan first)
+  if (opts.plan) config.planMode = true;
+
   const builtins = createTools(config);
 
   // --dir <path>: start in a different working directory (same as "/set dir <path>")
@@ -138,6 +152,7 @@ async function main() {
     workspace: builtins.cwd,
     tools: builtins.listTools().map((t) => t.name),
     mcp: mcp.size ? mcp.describe() : null,
+    planning: builtins.plan.planning,
   });
 
   if (!config.openai.apiKey || config.openai.apiKey === 'sk-REPLACE_ME') {
@@ -162,10 +177,13 @@ async function main() {
 
   // ---- interactive single session ----
   const isTty = Boolean(process.stdin.isTTY);
+  // the prompt shows the mode, so it is re-evaluated before every draw
+  const promptText = () =>
+    agent.planning ? `${ui.s.bold(ui.s.magenta('plan ❯'))} ` : `${ui.s.bold(ui.s.cyan('❯'))} `;
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
-    prompt: isTty ? `${ui.s.bold(ui.s.cyan('❯'))} ` : '',
+    prompt: isTty ? promptText() : '',
     historySize: 200,
     terminal: isTty,
   });
@@ -179,7 +197,7 @@ async function main() {
     rl,
     stdin: process.stdin,
     isTty,
-    prompt: `${ui.s.bold(ui.s.cyan('❯'))} `,
+    prompt: promptText,
     continuationPrompt: `${ui.s.dim('│')} `,
     onMessage(text) {
       queued.push(text);
@@ -222,6 +240,7 @@ async function main() {
           ui.out(ui.s.dim(JSON.stringify(maskConfig(config), null, 2)));
           ui.out(ui.s.dim(`config file: ${configPath}`));
           ui.out(ui.s.dim(`shell: ${shellInfo(config)}`));
+          ui.out(ui.s.dim(`mode: ${agent.mode}${agent.plan.approved ? ` (implementing "${agent.plan.approved.title}")` : ''}`));
           break;
         case '/tools': {
           const width = Math.max(20, ui.termWidth() - 20);
@@ -229,8 +248,13 @@ async function main() {
             const d = desc.split('\n')[0];
             ui.out(`  ${colorFn(name.slice(0, 16).padEnd(16))} ${ui.s.dim(d.length > width ? d.slice(0, width - 1) + '…' : d)}`);
           };
+          // the list mirrors what the model is actually offered, so plan mode shows fewer tools
+          const offered = new Set(agent.tools().map((t) => t.name));
           for (const t of builtins.listTools()) line(ui.s.green, t.name, t.description);
-          for (const t of mcp.listTools()) line(ui.s.yellow, t.name, t.description);
+          for (const t of mcp.listTools()) if (offered.has(t.name)) line(ui.s.yellow, t.name, t.description);
+          if (agent.planning) {
+            ui.printSystem('plan mode: only read-only tools are offered (/approve or /plan off for the rest)');
+          }
           break;
         }
         case '/set': {
@@ -264,6 +288,74 @@ async function main() {
         case '/pwd':
           ui.printSystem(`working directory: ${builtins.cwd}`);
           break;
+        case '/plan': {
+          const rest = text.slice(cmd.length).trim();
+          if (/^(off|stop|exit|end|no)$/i.test(rest)) {
+            agent.setMode(BUILD_MODE);
+            ui.printSystem('plan mode off — changes are allowed again');
+            break;
+          }
+          if (/^show$/i.test(rest)) {
+            const current = agent.plan.proposed || agent.plan.approved;
+            if (!current) ui.printSystem('no plan yet — describe the task with /plan <task>');
+            else {
+              ui.printPlan(current);
+              ui.printSystem(agent.plan.approved ? 'this plan was approved — it is being implemented' : 'plan pending — /approve to implement it');
+            }
+            break;
+          }
+          const wasPlanning = agent.planning;
+          agent.setMode(PLAN_MODE);
+          if (!wasPlanning) {
+            ui.printSystem(
+              'plan mode on — read-only research (no edits, no commands that change anything). ' +
+                'The model finishes with a plan; /approve accepts it, /plan off leaves.'
+            );
+          }
+          if (rest) {
+            ui.printUser(rest);
+            await agent.turn(rest);
+          } else if (wasPlanning) {
+            ui.printSystem('already in plan mode — describe the task, or /plan off to leave');
+          }
+          break;
+        }
+        case '/approve':
+        case '/accept': {
+          const note = text.slice(cmd.length).trim();
+          const accepted = agent.approvePlan(note);
+          if (!accepted) {
+            ui.printSystem(
+              agent.planning
+                ? 'no plan to approve yet — let the model finish researching, or describe the task with /plan <task>'
+                : 'no plan to approve — /plan <task> researches one first'
+            );
+            break;
+          }
+          ui.printSystem(
+            accepted.plan
+              ? `plan approved: ${accepted.plan.title} — implementing (${accepted.plan.steps.length} step(s))`
+              : 'approved — implementing the approach from the conversation'
+          );
+          ui.printUser(note || `/approve — implement the plan${accepted.plan ? `: ${accepted.plan.title}` : ''}`);
+          await agent.turn(accepted.message);
+          break;
+        }
+        case '/build':
+        case '/normal': {
+          const rest = text.slice(cmd.length).trim();
+          if (agent.planning) {
+            agent.setMode(BUILD_MODE);
+            ui.printSystem('plan mode off — changes are allowed again');
+          } else {
+            ui.printSystem('already in build mode');
+          }
+          if (rest) {
+            ui.printUser(rest);
+            await agent.turn(rest);
+          }
+          break;
+        }
         case '/usage': {
           const st = agent.stats();
           ui.printStats({
@@ -282,8 +374,8 @@ async function main() {
           await agent.compact({ manual: true });
           break;
         case '/reset':
-          agent.reset();
-          ui.printSystem('conversation cleared');
+          agent.reset(); // drops the plan too: a fresh context implies a fresh plan
+          ui.printSystem(`conversation cleared${agent.planning ? ' (still in plan mode)' : ''}`);
           break;
         case '/clear':
           process.stdout.write('\x1b[2J\x1b[H');
