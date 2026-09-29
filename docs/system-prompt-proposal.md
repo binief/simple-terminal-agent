@@ -98,8 +98,11 @@ Claude Code (~3k) and below Codex CLI (~5k).
 
 1. **Git line** — included. Costs one `git rev-parse` + one `git status --porcelain` per prompt rebuild
    (session start, `/set dir`, mode switch), cached for 3s, silently skipped outside a repository.
-2. **Length** — kept the full version (≈2.3k tokens). No compact variant yet; if you run small local
-   models, the cheapest cuts are `# Harness mechanics` and the tool matrix (~400 tokens).
+2. **Length** — both, switchable. `full` (≈2.2k tokens) is the default; `compact` (≈790 tokens) keeps
+   every rule that changes behaviour and drops the explanations, the tool matrix and the
+   harness-mechanics section. Set it with `promptStyle` in the config, `--prompt <style>`,
+   `HARNESS_PROMPT_STYLE`, or `/set prompt <style>` mid-session. Both styles are generated from the
+   same module, so a rule added to one is a deliberate choice about the other rather than drift.
 3. **Comments** — softened from Claude Code's "no comments unless asked" to "comment the way the
    surrounding file does", which matches this codebase.
 4. **git commit** — kept the hard rule: never commit, push or switch branches unless asked.

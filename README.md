@@ -34,6 +34,7 @@ Everything lives in one JSON file in the user's home directory: `~/.coding-harne
   "shell": null,
   "lineEndings": "auto",
   "searchIgnore": [],
+  "promptStyle": "full",
   "instructions": null,
   "autoCompact": true,
   "commandTimeout": 60,
@@ -60,6 +61,7 @@ Everything lives in one JSON file in the user's home directory: `~/.coding-harne
 | `shell` | Override the command shell. `null` = OS-aware default (`cmd.exe /d /s /c` on Windows, bash/sh `-c` elsewhere). A string like `"powershell"` or `"zsh"` is understood; or `{ "command": "...", "args": [...] }` for full control. |
 | `searchIgnore` | Extra globs `search_files` should skip (relative to the workspace): `["vendor-cache/", "*.snap"]`. `!pattern` re-includes something the built-ins or `.gitignore` exclude. Default `[]`. |
 | `lineEndings` | Newline style for files the tools write: `auto` (default — keep the file's own style, else the OS default), `lf`, `crlf`, `cr`, `native`. |
+| `promptStyle` | System prompt variant: `full` (default, ≈2.2k tokens) or `compact` (≈790 tokens — same rules, no explanations; for small context windows and small local models). Also `--prompt <style>`, `/set prompt <style>`, `HARNESS_PROMPT_STYLE`. |
 | `instructions` | Extra rules appended to the system prompt: literal text, or the path to a text file (`~` expanded, relative paths resolve against the workspace). Re-read on every system-prompt rebuild, so edits apply mid-session. Env override: `HARNESS_INSTRUCTIONS`. |
 | `autoCompact` | `true` (default) = summarize the conversation automatically before the context fills up. `false` = only warn; use `/compact` yourself. |
 | `commandTimeout` | Default timeout (seconds) for `run_command`. |
@@ -70,7 +72,7 @@ Everything lives in one JSON file in the user's home directory: `~/.coding-harne
 
 Env var overrides: `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL`,
 `HARNESS_STREAMING`, `HARNESS_CONTEXT_SIZE`, `HARNESS_TEMPERATURE`, `HARNESS_MAX_STEPS`,
-`HARNESS_PLAN_MODE`.
+`HARNESS_PLAN_MODE`, `HARNESS_PROMPT_STYLE`.
 
 ## Built-in coding tools
 
@@ -145,6 +147,27 @@ what was adopted and what was deliberately left out.
 
 Order matters: [plan mode](#plan-mode) rules (or the approved plan) are appended after the defaults,
 and your own `instructions` come last so they win on conflict.
+
+### Full or compact
+
+The prompt ships in two styles built from the same source, so they cannot drift apart:
+
+| Style | Cost | What you get |
+| --- | --- | --- |
+| `full` (default) | ≈2.2k tokens | Every section above, with the reasoning behind each rule and the harness-mechanics notes. |
+| `compact` | ≈790 tokens | Every rule that changes behaviour, with the explanations, the tool matrix and the harness-mechanics section removed. Meant for small context windows and small local models. |
+
+```bash
+node harness.js --prompt compact      # for this session
+```
+
+```json
+{ "promptStyle": "compact" }
+```
+
+`/set prompt compact` (or `full`) switches mid-session — the system message is rebuilt immediately and
+the rest of the conversation is kept. `/set prompt` on its own prints the current style, `/config` shows
+it, and the banner flags it whenever it is not `full`. `HARNESS_PROMPT_STYLE` overrides the config.
 
 ### Custom instructions
 
@@ -306,7 +329,7 @@ that was never finished is still sent when the input ends (piped scripts, Ctrl+D
 
 ## Session commands
 
-`/help` `/config` `/tools` `/set dir <path>` `/cwd` `/usage` `/compact` `/reset` (clear conversation) `/export <file>` (save chat) `/import <file>` (load chat) `/clear` (clear screen) `/exit`
+`/help` `/config` `/tools` `/set dir <path>` `/set prompt <full|compact>` `/cwd` `/usage` `/compact` `/reset` (clear conversation) `/export <file>` (save chat) `/import <file>` (load chat) `/clear` (clear screen) `/exit`
 
 Plan first: `/plan <task>` `/plan show` `/approve [note]` `/plan off` (see [Plan mode](#plan-mode)).
 
@@ -375,10 +398,12 @@ The harness actively keeps a turn running to completion instead of stopping half
 ## CLI flags
 
 ```
-node harness.js [--config <path>] [--dir <path>] [--init] [--once "<prompt>"] [--plan] [--stream | --no-stream] [--model <name>]
+node harness.js [--config <path>] [--dir <path>] [--init] [--once "<prompt>"] [--plan] [--stream | --no-stream] [--model <name>] [--prompt <full|compact>]
 ```
 
 `--dir <path>` starts the session in a different working directory (same as typing `/set dir <path>` first).
+
+`--prompt <full|compact>` picks the system prompt style for the session (see [Full or compact](#full-or-compact)).
 
 `--once` runs a single turn and exits (handy for scripting/tests).
 

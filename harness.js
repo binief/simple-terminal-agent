@@ -12,6 +12,7 @@ import { BUILD_MODE, PLAN_MODE } from './lib/plan.js';
 import { connectMcpServers } from './lib/mcp.js';
 import { createAgent } from './lib/agent.js';
 import { createInputReader } from './lib/input.js';
+import { matchPromptStyle, PROMPT_STYLES } from './lib/prompt.js';
 import * as ui from './lib/ui.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -23,6 +24,7 @@ const HELP = `
     /config            show effective configuration (key masked)
     /tools             list available tools
     /set dir <path>    change the working directory (file tools + commands run there)
+    /set prompt <s>    system prompt style: full (default) or compact (~790 vs ~2.2k tokens)
     /cwd               show the current working directory
     /usage             token usage, speed and context fill for this session
     /compact           summarize the conversation to free context (also automatic)
@@ -43,11 +45,11 @@ const HELP = `
     plain Enter              sends the whole draft (Ctrl+C discards it)
 
   Anything else is sent to the model as a chat message.
-  CLI flags: --config <path>  --dir <path>  --once "<prompt>"  --plan  --stream | --no-stream  --model <name>  --init
+  CLI flags: --config <path>  --dir <path>  --once "<prompt>"  --plan  --stream | --no-stream  --model <name>  --prompt <full|compact>  --init
 `;
 
 function parseArgs(argv) {
-  const opts = { config: null, dir: null, once: null, streaming: undefined, model: null, init: false, help: false, plan: false };
+  const opts = { config: null, dir: null, once: null, streaming: undefined, model: null, promptStyle: null, init: false, help: false, plan: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     switch (a) {
@@ -71,6 +73,9 @@ function parseArgs(argv) {
         break;
       case '--model':
         opts.model = argv[++i];
+        break;
+      case '--prompt':
+        opts.promptStyle = argv[++i];
         break;
       case '--plan':
       case '-p':
@@ -106,9 +111,13 @@ async function main() {
   const configPath = opts.config ? path.resolve(opts.config) : DEFAULT_CONFIG_PATH;
   let config, created;
   try {
+    if (opts.promptStyle && !matchPromptStyle(opts.promptStyle)) {
+      throw new Error(`--prompt: unknown style "${opts.promptStyle}" — use ${PROMPT_STYLES.join(' or ')}`);
+    }
     ({ config, created } = loadConfig(configPath, {
       streaming: opts.streaming,
       model: opts.model,
+      promptStyle: opts.promptStyle ? matchPromptStyle(opts.promptStyle) : null,
     }));
   } catch (e) {
     ui.printError(e.message);
@@ -142,6 +151,7 @@ async function main() {
 
   ui.banner({
     version: pkg.version,
+    promptStyle: config.promptStyle,
     configPath,
     configCreated: created,
     model: config.openai.model,
@@ -262,8 +272,23 @@ async function main() {
           const m = /^(\S+)\s*([\s\S]*)$/.exec(rest);
           const key = (m?.[1] || '').toLowerCase();
           let value = (m?.[2] || '').trim();
+          if (key === 'prompt' || key === 'promptstyle') {
+            if (!value) {
+              ui.printSystem(`system prompt style: ${config.promptStyle} (/set prompt ${config.promptStyle === 'full' ? 'compact' : 'full'} to switch)`);
+              break;
+            }
+            const style = matchPromptStyle(value);
+            if (!style) {
+              ui.printError(`unknown prompt style "${value}" — use ${PROMPT_STYLES.join(' or ')}`);
+              break;
+            }
+            config.promptStyle = style;
+            agent.refreshSystem();
+            ui.printSystem(`system prompt style: ${style}`);
+            break;
+          }
           if (key !== 'dir') {
-            ui.printError('usage: /set dir <path>   (e.g. /set dir ../other-project)');
+            ui.printError('usage: /set dir <path>   or   /set prompt <full|compact>');
             break;
           }
           if (!value) {

@@ -399,7 +399,7 @@ async function main() {
   /* ---------------- 0c. system prompt: working contract + custom instructions ---------------- */
   console.log('\n[system prompt]');
   const { createAgent, resolveInstructions } = await import(pathToFileURL(path.join(proj, 'lib', 'agent.js')).href);
-  const { buildSystemPrompt, gitInfo, clearGitCache } = await import(pathToFileURL(path.join(proj, 'lib', 'prompt.js')).href);
+  const { buildSystemPrompt, gitInfo, clearGitCache, matchPromptStyle, normalizePromptStyle, PROMPT_STYLES } = await import(pathToFileURL(path.join(proj, 'lib', 'prompt.js')).href);
   const promptDir = path.join(tmp, 'prompt');
   fs.mkdirSync(promptDir, { recursive: true });
   const promptCfg = { ...baseConfig(1), workspace: promptDir, streaming: false };
@@ -457,6 +457,44 @@ async function main() {
   const planned = buildSystemPrompt({ cwd: '/w', platform: 'p', planning: true });
   check('autonomy flips in plan mode: the plan is the deliverable', planned.includes('the plan is the deliverable') && !planned.includes('a plan instead of the work'), planned.slice(0, 1200));
   check('buildSystemPrompt appends blocks before the user instructions', built.indexOf('BLOCK-ONE') < built.indexOf('RULE-LAST') && built.indexOf('# Harness mechanics') < built.indexOf('BLOCK-ONE'), built);
+
+  /* ---------------- 0d. prompt style: full vs compact ---------------- */
+  console.log('\n[prompt style]');
+  const full = buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'full' });
+  const compact = buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'compact' });
+  check('two styles are offered', Array.isArray(PROMPT_STYLES) && PROMPT_STYLES.join(',') === 'full,compact', JSON.stringify(PROMPT_STYLES));
+  check('compact is much smaller than full', compact.length < full.length * 0.5, `full ${full.length} / compact ${compact.length}`);
+  check('compact keeps the environment block', compact.includes('# Environment') && compact.includes('- Workspace (cwd): /w'), compact.slice(0, 300));
+  check('compact keeps the behaviour-changing rules', ['# Autonomy', '# Communication', '# Tools', '# Working method', '# Code quality', '# Done, and safe'].every((h) => compact.includes(h)), compact);
+  check('compact still forbids unverified success', /Never claim unverified success/.test(compact), compact);
+  check('compact still forbids commits and secrets', /Never commit, push or switch branches unless asked/.test(compact) && /Never print secrets/.test(compact), compact);
+  check('compact still pins read-before-edit and verbatim old_text', /Read a file before changing it/.test(compact) && /copy old_text verbatim/.test(compact), compact);
+  check('compact drops the harness-mechanics section', !compact.includes('# Harness mechanics'), compact);
+  check('compact respects plan mode in the autonomy block', buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'compact', planning: true }).includes('the plan is the deliverable'), 'missing');
+  check('compact still carries plan blocks and instructions', buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'compact', blocks: ['BLOCK'], instructions: 'RULE' }).includes('BLOCK') === true && buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'compact', instructions: 'RULE' }).includes('RULE'), 'missing');
+  check('an unknown style falls back to full', buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'nonsense' }) === full, 'not the full prompt');
+  check('style aliases resolve', normalizePromptStyle('SHORT') === 'compact' && normalizePromptStyle('long') === 'full' && normalizePromptStyle(null) === 'full', 'bad aliases');
+  check('matchPromptStyle rejects a non-style', matchPromptStyle('weird') === null && matchPromptStyle('compact') === 'compact', 'bad match');
+
+  // config plumbing
+  check('promptStyle defaults to full', loadConfig(writeConfig('cfg-style-default.json', baseConfig(1))).config.promptStyle === 'full', 'not full');
+  check('promptStyle is read from the config', loadConfig(writeConfig('cfg-style-compact.json', { ...baseConfig(1), promptStyle: 'compact' })).config.promptStyle === 'compact', 'not compact');
+  check('an invalid promptStyle falls back to full', loadConfig(writeConfig('cfg-style-bad.json', { ...baseConfig(1), promptStyle: 'tiny-ish' })).config.promptStyle === 'full', 'not full');
+  process.env.HARNESS_PROMPT_STYLE = 'compact';
+  const { config: cfgStyleEnv } = loadConfig(writeConfig('cfg-style-env.json', baseConfig(1)));
+  delete process.env.HARNESS_PROMPT_STYLE;
+  check('HARNESS_PROMPT_STYLE overrides the config', cfgStyleEnv.promptStyle === 'compact', JSON.stringify(cfgStyleEnv.promptStyle));
+  check('promptStyle appears in the /config view', maskConfig(cfgStyleEnv).promptStyle === 'compact', 'missing');
+
+  // the agent actually uses the configured style, and /set prompt switches mid-session
+  const compactAgent = makeAgent({ promptStyle: 'compact' });
+  check('the agent builds the configured style', sysOf(compactAgent).includes('# Done, and safe') && !sysOf(compactAgent).includes('# Harness mechanics'), sysOf(compactAgent).slice(0, 300));
+  const styleCfg = { ...promptCfg, promptStyle: 'full' };
+  const switchAgent = createAgent({ config: styleCfg, builtins: createTools(styleCfg), mcp: null });
+  check('session starts on the full prompt', sysOf(switchAgent).includes('# Harness mechanics'), 'not full');
+  styleCfg.promptStyle = 'compact';
+  switchAgent.refreshSystem();
+  check('refreshSystem picks up the new style mid-session', !sysOf(switchAgent).includes('# Harness mechanics') && sysOf(switchAgent).includes('# Done, and safe'), sysOf(switchAgent).slice(0, 300));
 
   sys = sysOf(makeAgent({ instructions: 'Use pnpm, not npm.\nAlways run node --test.' }));
   check('config instructions land in the system prompt', sys.includes('Use pnpm, not npm.') && sys.includes('# User instructions'), sys);
@@ -766,6 +804,23 @@ async function main() {
 
   res = await runWithInput([harness, '--config', cfg1, '--no-stream'], '/set model foo\n', { cwd: workB });
   check('/set with a bad key shows usage', res.out.includes('usage: /set dir'), res.out);
+  check('/set usage mentions the prompt key', res.out.includes('/set prompt <full|compact>'), res.out);
+
+  res = await runWithInput([harness, '--config', cfg1, '--no-stream'], '/set prompt\n/set prompt compact\n/config\n', { cwd: workB });
+  check('/set prompt with no argument reports the current style', res.out.includes('system prompt style: full'), res.out);
+  check('/set prompt switches the style mid-session', res.out.includes('system prompt style: compact'), res.out);
+  check('/config reflects the switched style', /"promptStyle":\s*"compact"/.test(res.out), res.out);
+
+  res = await runWithInput([harness, '--config', cfg1, '--no-stream'], '/set prompt tiny\n', { cwd: workB });
+  check('/set prompt rejects an unknown style', res.out.includes('unknown prompt style') && res.out.includes('full or compact'), res.out);
+
+  res = await runWithInput([harness, '--config', cfg1, '--no-stream', '--prompt', 'compact'], '/config\n', { cwd: workB });
+  check('--prompt compact is applied to the session', /"promptStyle":\s*"compact"/.test(res.out), res.out);
+  check('the banner flags a non-default prompt style', res.out.includes('prompt: compact'), res.out);
+  res = await run(process.execPath, [harness, '--config', cfg1, '--prompt', 'weird', '--once', 'hi'], { cwd: workB });
+  check('--prompt rejects an unknown style', res.code !== 0 && res.out.includes('unknown style'), res.out);
+  res = await runWithInput([harness, '--config', cfg1, '--no-stream'], '/help\n', { cwd: workB });
+  check('/help documents /set prompt', res.out.includes('/set prompt'), res.out);
 
   res = await runWithInput([harness, '--config', cfg1, '--no-stream'], '/usage\n', { cwd: workB });
   check('/usage reports session totals', res.out.includes('session ') && res.out.includes('tokens'), res.out);
