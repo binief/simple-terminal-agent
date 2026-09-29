@@ -412,7 +412,13 @@ async function main() {
   check('system prompt states the workspace', sys.includes(promptDir), sys.slice(0, 400));
   check('system prompt states the platform/shell', sys.includes('shell:'), sys.slice(0, 400));
   check('system prompt carries the work method', sys.includes('Work method:'), sys);
-  check('work method: understand before changing', /Understand before changing/.test(sys), sys);
+  check('system prompt carries the mandatory execution protocol', sys.includes('Mandatory execution protocol'), sys);
+  check('execution protocol: understand context before changing', /Understand before changing/.test(sys) && /acceptance criteria/.test(sys), sys);
+  check('execution protocol: outline a minimal plan before mutation', /Outline a minimal plan/.test(sys) && /before the first mutation/.test(sys), sys);
+  check('execution protocol: checks relevant failure and edge cases', /malformed input/.test(sys) && /failure and edge cases/.test(sys), sys);
+  check('execution protocol: material ambiguity pauses execution', /material ambiguity/.test(sys) && /ask one concise question before editing/.test(sys), sys);
+  check('execution protocol: forbids raw-prompt edits', /Do not start a coding task with write_file/.test(sys), sys);
+  check('execution protocol: inspects the resulting diff', /inspect the resulting diff/.test(sys), sys);
   check('work method: batch independent tool calls', /several tool calls in one reply/.test(sys), sys);
   check('work method: never rewrite an unread file', /never rewrite a file you have not read/.test(sys), sys);
   check('work method: no loops — report the blocker', /report the blocker/.test(sys), sys);
