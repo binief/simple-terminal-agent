@@ -128,7 +128,12 @@ async function main() {
   check('read_file peeks 200 lines by default', r.includes('lines 1-200 of 1200'), r.slice(0, 200));
   check('read_file hints at the remainder', r.includes('1000 more lines') && r.includes('search_files'), r.slice(-200));
   r = await tools.execute('read_file', { path: 'big.txt', limit: 5000 });
-  check('read_file clamps limit to 500 lines per call', r.includes('lines 1-500 of 1200') && r.includes('clamped to 500'), r.slice(0, 200));
+  const { TOOL_LIMITS: LIMITS_FOR_READ } = await import(pathToFileURL(path.join(proj, 'lib', 'tools.js')).href);
+  check(
+    `read_file clamps limit to ${LIMITS_FOR_READ.maxReadLines} lines per call`,
+    r.includes(`lines 1-${LIMITS_FOR_READ.maxReadLines} of 1200`) && r.includes(`clamped to ${LIMITS_FOR_READ.maxReadLines}`),
+    r.slice(0, 200)
+  );
   r = await tools.execute('read_file', { path: 'big.txt', offset: 1101 });
   check('read_file pages with offset', r.includes('lines 1101-1200 of 1200') && !r.includes('more lines'), r.slice(0, 200));
   r = await tools.execute('read_file', { path: 'big.txt', offset: 2000 });
@@ -457,6 +462,31 @@ async function main() {
   const planned = buildSystemPrompt({ cwd: '/w', platform: 'p', planning: true });
   check('autonomy flips in plan mode: the plan is the deliverable', planned.includes('the plan is the deliverable') && !planned.includes('a plan instead of the work'), planned.slice(0, 1200));
   check('buildSystemPrompt appends blocks before the user instructions', built.indexOf('BLOCK-ONE') < built.indexOf('RULE-LAST') && built.indexOf('# Harness mechanics') < built.indexOf('BLOCK-ONE'), built);
+
+  /* ---------------- 0c-bis. the prompt quotes the real tool limits ---------------- */
+  const { TOOL_LIMITS } = await import(pathToFileURL(path.join(proj, 'lib', 'tools.js')).href);
+  check('the prompt quotes the real read_file caps', sys.includes(`at most ${TOOL_LIMITS.maxReadLines} lines per call (default ${TOOL_LIMITS.defaultReadLines})`), sys);
+  check('the prompt quotes the real tool-result cap', sys.includes(`~${Math.round(TOOL_LIMITS.toolResultCap / 1000)}k chars`), sys);
+  check('the read_file description quotes the real caps', createTools(promptCfg).listTools().find((t) => t.name === 'read_file').description.includes(`at most ${TOOL_LIMITS.maxReadLines} lines and ${Math.round(TOOL_LIMITS.maxReadChars / 1000)}k chars`), 'description drifted');
+
+  // drift guard: change the constant in a copy of lib/ — the prompt must follow it
+  const driftDir = path.join(tmp, 'drift-lib');
+  fs.mkdirSync(driftDir, { recursive: true });
+  for (const f of fs.readdirSync(path.join(proj, 'lib'))) fs.copyFileSync(path.join(proj, 'lib', f), path.join(driftDir, f));
+  const driftTools = path.join(driftDir, 'tools.js');
+  fs.writeFileSync(
+    driftTools,
+    fs
+      .readFileSync(driftTools, 'utf8')
+      .replace(`maxReadLines: ${TOOL_LIMITS.maxReadLines}`, 'maxReadLines: 777')
+      .replace(`toolResultCap: ${String(TOOL_LIMITS.toolResultCap).replace(/^(\d+)(\d{3})$/, '$1_$2')}`, 'toolResultCap: 33_000')
+  );
+  const driftPrompt = await import(pathToFileURL(driftTools.replace('tools.js', 'prompt.js')).href);
+  const drifted = driftPrompt.buildSystemPrompt({ cwd: '/w', platform: 'p' });
+  const driftedCompact = driftPrompt.buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'compact' });
+  check('a changed read cap flows into the full prompt', drifted.includes('at most 777 lines per call') && !drifted.includes(`at most ${TOOL_LIMITS.maxReadLines} lines per call`), drifted.split('\n').find((l) => l.includes('Locate, then window')));
+  check('a changed read cap flows into the compact prompt', driftedCompact.includes('max 777 lines/call'), driftedCompact.split('\n').find((l) => l.includes('search_files to locate')));
+  check('a changed result cap flows into the prompt', drifted.includes('~33k chars'), drifted.split('\n').find((l) => l.includes('Truncation is real')));
 
   /* ---------------- 0d. prompt style: full vs compact ---------------- */
   console.log('\n[prompt style]');

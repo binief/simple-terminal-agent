@@ -148,6 +148,11 @@ what was adopted and what was deliberately left out.
 Order matters: [plan mode](#plan-mode) rules (or the approved plan) are appended after the defaults,
 and your own `instructions` come last so they win on conflict.
 
+The numbers the prompt quotes to the model — the `read_file` window caps and the tool-result cap — are
+interpolated from `TOOL_LIMITS` in `lib/tools.js`, the same constants the tools enforce, so raising a
+limit updates the prompt and the tool descriptions together. A test changes the constant in a copy of
+`lib/` and fails if the prompt does not follow.
+
 ### Full or compact
 
 The prompt ships in two styles built from the same source, so they cannot drift apart:

@@ -93,6 +93,7 @@ Claude Code (~3k) and below Codex CLI (~5k).
 | `lib/agent.js` | `systemPrompt()` reduced to gathering `cwd`, shell, plan blocks and instructions and calling `buildSystemPrompt()`. Compaction gained a guard: when the summarizable part of the history is under 500 tokens, it warns once ("nothing left to compact — raise contextSize") instead of compacting on every step. Exposed by the larger prompt; it would also have hit any user with a small `contextSize`. |
 | `test/run-tests.mjs` | The system-prompt block now asserts every section, the environment/git line, the harness-mechanics block, block ordering (defaults → plan → instructions) and determinism of `buildSystemPrompt`; the compaction tests use a realistic `contextSize` and a new case covers the cramped-context warning. 304 checks pass. |
 | `README.md` | "Work method (the system prompt)" rewritten as a section-by-section table; compaction docs mention the new warning. |
+| `lib/tools.js` | `TOOL_LIMITS` exported (read window caps + tool-result cap). The `read_file` description, the tool schema and the prompt all interpolate it, so the numbers the model is told cannot drift from the ones enforced. |
 
 ## 6. Decisions taken
 
