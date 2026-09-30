@@ -34,6 +34,7 @@ Everything lives in one JSON file in the user's home directory: `~/.coding-harne
   "shell": null,
   "lineEndings": "auto",
   "searchIgnore": [],
+  "promptStyle": "full",
   "instructions": null,
   "autoCompact": true,
   "commandTimeout": 60,
@@ -60,6 +61,7 @@ Everything lives in one JSON file in the user's home directory: `~/.coding-harne
 | `shell` | Override the command shell. `null` = OS-aware default (`cmd.exe /d /s /c` on Windows, bash/sh `-c` elsewhere). A string like `"powershell"` or `"zsh"` is understood; or `{ "command": "...", "args": [...] }` for full control. |
 | `searchIgnore` | Extra globs `search_files` should skip (relative to the workspace): `["vendor-cache/", "*.snap"]`. `!pattern` re-includes something the built-ins or `.gitignore` exclude. Default `[]`. |
 | `lineEndings` | Newline style for files the tools write: `auto` (default — keep the file's own style, else the OS default), `lf`, `crlf`, `cr`, `native`. |
+| `promptStyle` | System prompt variant: `full` (default, ≈2.2k tokens) or `compact` (≈790 tokens — same rules, no explanations; for small context windows and small local models). Also `--prompt <style>`, `/set prompt <style>`, `HARNESS_PROMPT_STYLE`. |
 | `instructions` | Extra rules appended to the system prompt: literal text, or the path to a text file (`~` expanded, relative paths resolve against the workspace). Re-read on every system-prompt rebuild, so edits apply mid-session. Env override: `HARNESS_INSTRUCTIONS`. |
 | `autoCompact` | `true` (default) = summarize the conversation automatically before the context fills up. `false` = only warn; use `/compact` yourself. |
 | `commandTimeout` | Default timeout (seconds) for `run_command`. |
@@ -70,7 +72,7 @@ Everything lives in one JSON file in the user's home directory: `~/.coding-harne
 
 Env var overrides: `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL`,
 `HARNESS_STREAMING`, `HARNESS_CONTEXT_SIZE`, `HARNESS_TEMPERATURE`, `HARNESS_MAX_STEPS`,
-`HARNESS_PLAN_MODE`.
+`HARNESS_PLAN_MODE`, `HARNESS_PROMPT_STYLE`.
 
 ## Built-in coding tools
 
@@ -121,39 +123,56 @@ relative to the workspace, `!` re-includes:
 
 ## Work method (the system prompt)
 
-Every session opens with a system message that sets the workspace, platform, shell and date, the tool
-policy, and a mandatory autonomous execution loop. A normal coding task follows this order without waiting
-for a plan approval:
+The system message is built by `lib/prompt.js` (`buildSystemPrompt()`) and is the agent's working
+contract. It opens with the live environment — workspace, platform/shell, date, mode and, when the
+workspace is a git repository, the branch and whether the tree is clean — and then sets out the
+sections below. It costs ≈2.3k tokens.
 
-1. **Understand context** — parse the requested outcome, scope, constraints, acceptance criteria and
-   non-goals; inspect the relevant implementation, tests, configuration and project conventions.
-2. **Outline a minimal plan** — identify only the files and changes needed, then consider relevant happy,
-   boundary, malformed-input, error, compatibility, state/concurrency, security and performance cases.
-3. **Resolve material uncertainty** — ask one concise question only when an unknown would meaningfully
-   change the implementation; otherwise use the safest conventional interpretation and disclose it later.
-4. **Execute** — apply the smallest coherent change after reading the code it affects.
-5. **Verify** — inspect the diff, run the narrowest relevant test/build/linter, and check the failure and
-   edge cases identified in the plan before reporting completion.
-
-| Rule | What it asks for |
+| Section | What it fixes |
 | --- | --- |
-| Context before mutation | Never treat the user prompt as evidence of the wiring. Do not begin a coding task with `write_file`, `edit_file`, or a mutating command before inspecting the affected code and tests. |
-| Minimal, risk-aware plan | Work out the success path and the cases that could break this specific task, without inventing unrelated complexity. |
-| Batch independent work | Tool calls in one reply run in order: read the files a change touches together, chain shell steps with `&&` instead of one `run_command` per step. |
-| Locate, then window | `search_files` for the `file:line` hits, then `read_file` windows (`offset`/`limit`) around them — enforced: ≤500 lines and ≤40k chars per call (default 200), with a "…N more lines" hint instead of whole-file dumps. |
-| Targeted edits | `edit_file` with `old_text` copied verbatim from `read_file`; `write_file` only for new files or full rewrites, never for a file that has not been read. |
-| Match the code | Same language level, indentation, naming and dependency style; a well-known library installed with the project's package manager beats hand-rolling one. |
-| No acting on truncated output | Read the real content instead of editing around a `[truncated …]` marker. |
-| No loops | Never re-read a file just written or re-run a command that already succeeded; if the same fix fails twice, report the blocker, the error and the options instead of a third variation. |
-| Verify before claiming success | Inspect the resulting diff; run the build / tests / linters; read the output; fix regressions in the same turn; and say what could not be verified. |
-| Stay oriented | State the context and minimal plan in one line, execute without creating a manual gate, then summarize what changed, verification, and any assumption or remaining risk. |
+| **Autonomy** | Resolve the task end to end; stop only for one genuinely blocking question, an unsafe request, or a blocker. Answer "how do I…" questions instead of silently changing files. |
+| **Communication** | Terminal-sized Markdown, one short line before a batch of tool calls, `file.js:42` references, a final summary of outcome → changes → verification → assumptions. No emoji, no preamble, no tool names. |
+| **Tools** | What each tool is for; batch independent reads in one reply; locate with `search_files`, then read the window; results are capped and windowed, so never act on a `[truncated …]` marker; never re-read a file just written. |
+| **edit_file / write_file** | Read before changing, copy `old_text` verbatim (context over `replace_all`), line endings are handled for you, `write_file` only for new files or a deliberate rewrite, small edits over big ones. |
+| **run_command** | Syntax valid for *this* shell, non-interactive and non-paginated only, use `cwd`/`timeout` instead of `cd`/`sleep`, and never read or edit files through the shell. |
+| **Working method** | The six phases: understand → minimal plan → resolve uncertainty → execute → verify → report. Never jump from the prompt straight to an edit. |
+| **Code quality** | Match the surrounding code, check the manifest before using a library, fix root causes, comment like the file does, no drive-by refactors, no placeholder implementations. |
+| **Definition of done** | The diff is what you intended, something that exercises the change was actually run, no unverified success claims, and a blocker is reported after the second failed attempt — not a third variation. |
+| **Safety** | Announce destructive steps, never `git commit`/`push`/branch unless asked, never print secrets, stay in the workspace, defensive security only. |
+| **Harness mechanics** | The model is told about the step budget, compaction and token-limit continuation, so it cooperates with them instead of being surprised. |
 
-Alongside it, the tool policy spells out which tool to use for what, how `edit_file` matching works,
-that `run_command` follows the platform shell (and has `cwd`/`timeout` options), and that commands run
-with your permissions — so destructive steps get announced instead of sprung.
+The prompt was distilled from the published system prompts of Claude Code, Codex CLI, Cursor CLI,
+Warp, Augment, Gemini CLI and Antigravity — see `docs/system-prompt-proposal.md` for the analysis,
+what was adopted and what was deliberately left out.
 
-In [plan mode](#plan-mode) the prompt swaps autonomous execution for "research it and hand over a plan",
-and the harness backs that up by withdrawing the tools that could change anything.
+Order matters: [plan mode](#plan-mode) rules (or the approved plan) are appended after the defaults,
+and your own `instructions` come last so they win on conflict.
+
+The numbers the prompt quotes to the model — the `read_file` window caps and the tool-result cap — are
+interpolated from `TOOL_LIMITS` in `lib/tools.js`, the same constants the tools enforce, so raising a
+limit updates the prompt and the tool descriptions together. A test changes the constant in a copy of
+`lib/` and fails if the prompt does not follow.
+
+### Full or compact
+
+The prompt ships in two styles built from the same source, so they cannot drift apart:
+
+| Style | Cost | What you get |
+| --- | --- | --- |
+| `full` (default) | ≈2.2k tokens | Every section above, with the reasoning behind each rule and the harness-mechanics notes. |
+| `compact` | ≈790 tokens | Every rule that changes behaviour, with the explanations, the tool matrix and the harness-mechanics section removed. Meant for small context windows and small local models. |
+
+```bash
+node harness.js --prompt compact      # for this session
+```
+
+```json
+{ "promptStyle": "compact" }
+```
+
+`/set prompt compact` (or `full`) switches mid-session — the system message is rebuilt immediately and
+the rest of the conversation is kept. `/set prompt` on its own prints the current style, `/config` shows
+it, and the banner flags it whenever it is not `full`. `HARNESS_PROMPT_STYLE` overrides the config.
 
 ### Custom instructions
 
@@ -315,7 +334,7 @@ that was never finished is still sent when the input ends (piped scripts, Ctrl+D
 
 ## Session commands
 
-`/help` `/config` `/tools` `/set dir <path>` `/cwd` `/usage` `/compact` `/reset` (clear conversation) `/export <file>` (save chat) `/import <file>` (load chat) `/clear` (clear screen) `/exit`
+`/help` `/config` `/tools` `/set dir <path>` `/set prompt <full|compact>` `/cwd` `/usage` `/compact` `/reset` (clear conversation) `/export <file>` (save chat) `/import <file>` (load chat) `/clear` (clear screen) `/exit`
 
 Plan first: `/plan <task>` `/plan show` `/approve [note]` `/plan off` (see [Plan mode](#plan-mode)).
 
@@ -344,6 +363,18 @@ silently and you are told what happened:
 
 ```
   ● compacted conversation (context 81% full): 58.2k → 3.1k tokens
+```
+
+Compaction never makes things worse: if the summary comes back no smaller than the messages it would
+replace (a short history under a long system prompt), the raw messages are kept and you are told —
+`compacting would not free anything (2.2k → 2.3k tokens) — history kept as is`.
+
+Compaction only runs when it can actually free something. If the context is full but the summarizable
+part of the history is already tiny — a `contextSize` too small for the system prompt plus the last few
+messages — the harness says so once instead of compacting on every step:
+
+```
+  ● context 159% full with nothing left to compact — the system prompt and the last messages alone fill it. Raise "contextSize" in the config.
 ```
 
 `/compact` does the same on demand. Turn it off with `"autoCompact": false` in the config — you then get
@@ -376,10 +407,12 @@ The harness actively keeps a turn running to completion instead of stopping half
 ## CLI flags
 
 ```
-node harness.js [--config <path>] [--dir <path>] [--init] [--once "<prompt>"] [--plan] [--stream | --no-stream] [--model <name>]
+node harness.js [--config <path>] [--dir <path>] [--init] [--once "<prompt>"] [--plan] [--stream | --no-stream] [--model <name>] [--prompt <full|compact>]
 ```
 
 `--dir <path>` starts the session in a different working directory (same as typing `/set dir <path>` first).
+
+`--prompt <full|compact>` picks the system prompt style for the session (see [Full or compact](#full-or-compact)).
 
 `--once` runs a single turn and exits (handy for scripting/tests).
 

@@ -128,7 +128,12 @@ async function main() {
   check('read_file peeks 200 lines by default', r.includes('lines 1-200 of 1200'), r.slice(0, 200));
   check('read_file hints at the remainder', r.includes('1000 more lines') && r.includes('search_files'), r.slice(-200));
   r = await tools.execute('read_file', { path: 'big.txt', limit: 5000 });
-  check('read_file clamps limit to 500 lines per call', r.includes('lines 1-500 of 1200') && r.includes('clamped to 500'), r.slice(0, 200));
+  const { TOOL_LIMITS: LIMITS_FOR_READ } = await import(pathToFileURL(path.join(proj, 'lib', 'tools.js')).href);
+  check(
+    `read_file clamps limit to ${LIMITS_FOR_READ.maxReadLines} lines per call`,
+    r.includes(`lines 1-${LIMITS_FOR_READ.maxReadLines} of 1200`) && r.includes(`clamped to ${LIMITS_FOR_READ.maxReadLines}`),
+    r.slice(0, 200)
+  );
   r = await tools.execute('read_file', { path: 'big.txt', offset: 1101 });
   check('read_file pages with offset', r.includes('lines 1101-1200 of 1200') && !r.includes('more lines'), r.slice(0, 200));
   r = await tools.execute('read_file', { path: 'big.txt', offset: 2000 });
@@ -396,9 +401,10 @@ async function main() {
   rl2.emit('line', 'inued');
   check('reader: piped input supports the backslash continuation', msgs2.at(-1) === 'cont \ninued', JSON.stringify(msgs2));
 
-  /* ---------------- 0c. system prompt: work method + custom instructions ---------------- */
+  /* ---------------- 0c. system prompt: working contract + custom instructions ---------------- */
   console.log('\n[system prompt]');
   const { createAgent, resolveInstructions } = await import(pathToFileURL(path.join(proj, 'lib', 'agent.js')).href);
+  const { buildSystemPrompt, gitInfo, clearGitCache, matchPromptStyle, normalizePromptStyle, PROMPT_STYLES } = await import(pathToFileURL(path.join(proj, 'lib', 'prompt.js')).href);
   const promptDir = path.join(tmp, 'prompt');
   fs.mkdirSync(promptDir, { recursive: true });
   const promptCfg = { ...baseConfig(1), workspace: promptDir, streaming: false };
@@ -411,26 +417,118 @@ async function main() {
   let sys = sysOf(makeAgent());
   check('system prompt states the workspace', sys.includes(promptDir), sys.slice(0, 400));
   check('system prompt states the platform/shell', sys.includes('shell:'), sys.slice(0, 400));
-  check('system prompt carries the work method', sys.includes('Work method:'), sys);
-  check('system prompt carries the mandatory execution protocol', sys.includes('Mandatory execution protocol'), sys);
-  check('execution protocol: understand context before changing', /Understand before changing/.test(sys) && /acceptance criteria/.test(sys), sys);
-  check('execution protocol: outline a minimal plan before mutation', /Outline a minimal plan/.test(sys) && /before the first mutation/.test(sys), sys);
-  check('execution protocol: checks relevant failure and edge cases', /malformed input/.test(sys) && /failure and edge cases/.test(sys), sys);
-  check('execution protocol: material ambiguity pauses execution', /material ambiguity/.test(sys) && /ask one concise question before editing/.test(sys), sys);
-  check('execution protocol: forbids raw-prompt edits', /Do not start a coding task with write_file/.test(sys), sys);
-  check('execution protocol: inspects the resulting diff', /inspect the resulting diff/.test(sys), sys);
-  check('work method: batch independent tool calls', /several tool calls in one reply/.test(sys), sys);
-  check('work method: never rewrite an unread file', /never rewrite a file you have not read/.test(sys), sys);
-  check('work method: no loops — report the blocker', /report the blocker/.test(sys), sys);
-  check('work method: verify before claiming success', /Verify before claiming success/.test(sys), sys);
-  check('work method: follow the conventions of the code', /Match the code you are editing/.test(sys), sys);
-  check('tool policy: old_text copied verbatim', /old_text copied verbatim from read_file/.test(sys), sys);
-  check('tool policy: destructive commands are announced', /destructive step/.test(sys), sys);
-  check('no user-instructions section by default', !sys.includes('User instructions'), sys);
+  check('system prompt states the date and mode', /# Environment/.test(sys) && /- Today: \d{4}-\d{2}-\d{2}/.test(sys) && /- Mode: build/.test(sys), sys.slice(0, 600));
+  check('system prompt carries every default section', ['# Autonomy', '# Communication', '# Tools', '# Working method', '# Code quality', '# Definition of done', '# Safety', '# Harness mechanics'].every((h) => sys.includes(h)), sys);
+  check('autonomy: resolve the task instead of yielding early', /Keep working until the request is resolved/.test(sys) && /ask ONE concise question/.test(sys), sys);
+  check('autonomy: a how-to question is answered, not executed', /do not start changing files/.test(sys), sys);
+  check('communication: terse terminal output with file:line refs', /path\/to\/file\.js:42/.test(sys) && /No emoji unless asked/.test(sys), sys);
+  check('working method: understand context before changing', /Understand before changing/.test(sys) && /acceptance criteria/.test(sys), sys);
+  check('working method: outline a minimal plan before mutation', /Outline a minimal plan/.test(sys) && /before the first mutation/.test(sys), sys);
+  check('working method: checks relevant failure and edge cases', /malformed input/.test(sys) && /failure and edge cases/.test(sys), sys);
+  check('working method: material ambiguity pauses execution', /material ambiguity/.test(sys) && /ask one concise question before editing/.test(sys), sys);
+  check('working method: forbids raw-prompt edits', /Do not start a coding task with write_file/.test(sys), sys);
+  check('working method: inspects the resulting diff', /inspect the resulting diff/.test(sys), sys);
+  check('working method: follow the conventions of the code', /Match the code you are editing/.test(sys), sys);
+  check('tools: batch independent tool calls', /tool calls in one reply run in order/.test(sys), sys);
+  check('tools: locate then window instead of whole files', /Locate, then window/.test(sys) && /never scroll a large file into context/.test(sys), sys);
+  check('tools: old_text copied verbatim from read_file', /Copy old_text verbatim from read_file/.test(sys), sys);
+  check('tools: never rewrite an unread file', /a deliberate full rewrite of a file you have read/.test(sys), sys);
+  check('tools: no acting on truncated output', /never edit around a marker/.test(sys), sys);
+  check('tools: no loops — the tool result is the confirmation', /never re-run a command that already succeeded/.test(sys), sys);
+  check('run_command: non-interactive, non-paginated, OS-aware', /Non-interactive only/.test(sys) && /--no-pager/.test(sys) && /no bash-isms under Windows cmd\.exe/.test(sys), sys);
+  check('run_command: shell is not used to read or edit files', /Do not read files through the shell/.test(sys) && /Do not edit files through the shell/.test(sys), sys);
+  check('done: verification is required before claiming success', /Never claim success you did not verify/.test(sys), sys);
+  check('done: report the blocker after two failed attempts', /report the blocker/.test(sys), sys);
+  check('safety: destructive commands are announced', /destructive or irreversible/.test(sys), sys);
+  check('safety: no commits or pushes unless asked', /Never run git commit, git push/.test(sys), sys);
+  check('safety: secrets are never printed', /Never print, log or commit secrets/.test(sys), sys);
+  check('harness mechanics: steps, compaction and cut-off replies', /steps are running out/.test(sys) && /compacted into a summary/.test(sys) && /re-issue it complete/.test(sys), sys);
+  check('no user-instructions section by default', !sys.includes('# User instructions'), sys);
+
+  // git state: a real repository reports its branch, a plain directory reports nothing
+  clearGitCache();
+  const gitNone = gitInfo(promptDir);
+  check('gitInfo returns null outside a repository', gitNone === null, String(gitNone));
+  check('no Git line when the workspace is not a repository', !/^- Git:/m.test(sys), sys.slice(0, 600));
+  const gitSelf = gitInfo(proj);
+  check('gitInfo reports branch and cleanliness in a repository', typeof gitSelf === 'string' && /\((clean|\d+ uncommitted files?)\)$/.test(gitSelf), String(gitSelf));
+  check('the Git line lands in the environment block', buildSystemPrompt({ cwd: proj, platform: 'x', git: gitSelf }).includes(`- Git: ${gitSelf}`), String(gitSelf));
+
+  // buildSystemPrompt is pure: same inputs, same prompt, blocks in order
+  const built = buildSystemPrompt({ cwd: '/w', platform: 'p', date: '2025-01-02', planning: true, blocks: ['BLOCK-ONE'], instructions: 'RULE-LAST' });
+  check('buildSystemPrompt is deterministic', built === buildSystemPrompt({ cwd: '/w', platform: 'p', date: '2025-01-02', planning: true, blocks: ['BLOCK-ONE'], instructions: 'RULE-LAST' }), 'differs');
+  check('buildSystemPrompt marks plan mode in the environment block', /- Mode: plan \(read-only research/.test(built), built.slice(0, 400));
+  check('autonomy tells build mode not to hand back a plan', sys.includes('a plan instead of the work'), sys);
+  const planned = buildSystemPrompt({ cwd: '/w', platform: 'p', planning: true });
+  check('autonomy flips in plan mode: the plan is the deliverable', planned.includes('the plan is the deliverable') && !planned.includes('a plan instead of the work'), planned.slice(0, 1200));
+  check('buildSystemPrompt appends blocks before the user instructions', built.indexOf('BLOCK-ONE') < built.indexOf('RULE-LAST') && built.indexOf('# Harness mechanics') < built.indexOf('BLOCK-ONE'), built);
+
+  /* ---------------- 0c-bis. the prompt quotes the real tool limits ---------------- */
+  const { TOOL_LIMITS } = await import(pathToFileURL(path.join(proj, 'lib', 'tools.js')).href);
+  check('the prompt quotes the real read_file caps', sys.includes(`at most ${TOOL_LIMITS.maxReadLines} lines per call (default ${TOOL_LIMITS.defaultReadLines})`), sys);
+  check('the prompt quotes the real tool-result cap', sys.includes(`~${Math.round(TOOL_LIMITS.toolResultCap / 1000)}k chars`), sys);
+  check('the read_file description quotes the real caps', createTools(promptCfg).listTools().find((t) => t.name === 'read_file').description.includes(`at most ${TOOL_LIMITS.maxReadLines} lines and ${Math.round(TOOL_LIMITS.maxReadChars / 1000)}k chars`), 'description drifted');
+
+  // drift guard: change the constant in a copy of lib/ — the prompt must follow it
+  const driftDir = path.join(tmp, 'drift-lib');
+  fs.mkdirSync(driftDir, { recursive: true });
+  for (const f of fs.readdirSync(path.join(proj, 'lib'))) fs.copyFileSync(path.join(proj, 'lib', f), path.join(driftDir, f));
+  const driftTools = path.join(driftDir, 'tools.js');
+  fs.writeFileSync(
+    driftTools,
+    fs
+      .readFileSync(driftTools, 'utf8')
+      .replace(`maxReadLines: ${TOOL_LIMITS.maxReadLines}`, 'maxReadLines: 777')
+      .replace(`toolResultCap: ${String(TOOL_LIMITS.toolResultCap).replace(/^(\d+)(\d{3})$/, '$1_$2')}`, 'toolResultCap: 33_000')
+  );
+  const driftPrompt = await import(pathToFileURL(driftTools.replace('tools.js', 'prompt.js')).href);
+  const drifted = driftPrompt.buildSystemPrompt({ cwd: '/w', platform: 'p' });
+  const driftedCompact = driftPrompt.buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'compact' });
+  check('a changed read cap flows into the full prompt', drifted.includes('at most 777 lines per call') && !drifted.includes(`at most ${TOOL_LIMITS.maxReadLines} lines per call`), drifted.split('\n').find((l) => l.includes('Locate, then window')));
+  check('a changed read cap flows into the compact prompt', driftedCompact.includes('max 777 lines/call'), driftedCompact.split('\n').find((l) => l.includes('search_files to locate')));
+  check('a changed result cap flows into the prompt', drifted.includes('~33k chars'), drifted.split('\n').find((l) => l.includes('Truncation is real')));
+
+  /* ---------------- 0d. prompt style: full vs compact ---------------- */
+  console.log('\n[prompt style]');
+  const full = buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'full' });
+  const compact = buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'compact' });
+  check('two styles are offered', Array.isArray(PROMPT_STYLES) && PROMPT_STYLES.join(',') === 'full,compact', JSON.stringify(PROMPT_STYLES));
+  check('compact is much smaller than full', compact.length < full.length * 0.5, `full ${full.length} / compact ${compact.length}`);
+  check('compact keeps the environment block', compact.includes('# Environment') && compact.includes('- Workspace (cwd): /w'), compact.slice(0, 300));
+  check('compact keeps the behaviour-changing rules', ['# Autonomy', '# Communication', '# Tools', '# Working method', '# Code quality', '# Done, and safe'].every((h) => compact.includes(h)), compact);
+  check('compact still forbids unverified success', /Never claim unverified success/.test(compact), compact);
+  check('compact still forbids commits and secrets', /Never commit, push or switch branches unless asked/.test(compact) && /Never print secrets/.test(compact), compact);
+  check('compact still pins read-before-edit and verbatim old_text', /Read a file before changing it/.test(compact) && /copy old_text verbatim/.test(compact), compact);
+  check('compact drops the harness-mechanics section', !compact.includes('# Harness mechanics'), compact);
+  check('compact respects plan mode in the autonomy block', buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'compact', planning: true }).includes('the plan is the deliverable'), 'missing');
+  check('compact still carries plan blocks and instructions', buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'compact', blocks: ['BLOCK'], instructions: 'RULE' }).includes('BLOCK') === true && buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'compact', instructions: 'RULE' }).includes('RULE'), 'missing');
+  check('an unknown style falls back to full', buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'nonsense' }) === full, 'not the full prompt');
+  check('style aliases resolve', normalizePromptStyle('SHORT') === 'compact' && normalizePromptStyle('long') === 'full' && normalizePromptStyle(null) === 'full', 'bad aliases');
+  check('matchPromptStyle rejects a non-style', matchPromptStyle('weird') === null && matchPromptStyle('compact') === 'compact', 'bad match');
+
+  // config plumbing
+  check('promptStyle defaults to full', loadConfig(writeConfig('cfg-style-default.json', baseConfig(1))).config.promptStyle === 'full', 'not full');
+  check('promptStyle is read from the config', loadConfig(writeConfig('cfg-style-compact.json', { ...baseConfig(1), promptStyle: 'compact' })).config.promptStyle === 'compact', 'not compact');
+  check('an invalid promptStyle falls back to full', loadConfig(writeConfig('cfg-style-bad.json', { ...baseConfig(1), promptStyle: 'tiny-ish' })).config.promptStyle === 'full', 'not full');
+  process.env.HARNESS_PROMPT_STYLE = 'compact';
+  const { config: cfgStyleEnv } = loadConfig(writeConfig('cfg-style-env.json', baseConfig(1)));
+  delete process.env.HARNESS_PROMPT_STYLE;
+  check('HARNESS_PROMPT_STYLE overrides the config', cfgStyleEnv.promptStyle === 'compact', JSON.stringify(cfgStyleEnv.promptStyle));
+  check('promptStyle appears in the /config view', maskConfig(cfgStyleEnv).promptStyle === 'compact', 'missing');
+
+  // the agent actually uses the configured style, and /set prompt switches mid-session
+  const compactAgent = makeAgent({ promptStyle: 'compact' });
+  check('the agent builds the configured style', sysOf(compactAgent).includes('# Done, and safe') && !sysOf(compactAgent).includes('# Harness mechanics'), sysOf(compactAgent).slice(0, 300));
+  const styleCfg = { ...promptCfg, promptStyle: 'full' };
+  const switchAgent = createAgent({ config: styleCfg, builtins: createTools(styleCfg), mcp: null });
+  check('session starts on the full prompt', sysOf(switchAgent).includes('# Harness mechanics'), 'not full');
+  styleCfg.promptStyle = 'compact';
+  switchAgent.refreshSystem();
+  check('refreshSystem picks up the new style mid-session', !sysOf(switchAgent).includes('# Harness mechanics') && sysOf(switchAgent).includes('# Done, and safe'), sysOf(switchAgent).slice(0, 300));
 
   sys = sysOf(makeAgent({ instructions: 'Use pnpm, not npm.\nAlways run node --test.' }));
-  check('config instructions land in the system prompt', sys.includes('Use pnpm, not npm.') && sys.includes('User instructions'), sys);
-  check('instructions come after the built-in defaults', sys.indexOf('Work method:') < sys.indexOf('Use pnpm'), sys);
+  check('config instructions land in the system prompt', sys.includes('Use pnpm, not npm.') && sys.includes('# User instructions'), sys);
+  check('instructions come after the built-in defaults', sys.indexOf('# Working method') < sys.indexOf('Use pnpm'), sys);
 
   const rulesFile = path.join(promptDir, 'RULES.md');
   fs.writeFileSync(rulesFile, 'RULES-FILE: only commit when asked.\n');
@@ -736,6 +834,23 @@ async function main() {
 
   res = await runWithInput([harness, '--config', cfg1, '--no-stream'], '/set model foo\n', { cwd: workB });
   check('/set with a bad key shows usage', res.out.includes('usage: /set dir'), res.out);
+  check('/set usage mentions the prompt key', res.out.includes('/set prompt <full|compact>'), res.out);
+
+  res = await runWithInput([harness, '--config', cfg1, '--no-stream'], '/set prompt\n/set prompt compact\n/config\n', { cwd: workB });
+  check('/set prompt with no argument reports the current style', res.out.includes('system prompt style: full'), res.out);
+  check('/set prompt switches the style mid-session', res.out.includes('system prompt style: compact'), res.out);
+  check('/config reflects the switched style', /"promptStyle":\s*"compact"/.test(res.out), res.out);
+
+  res = await runWithInput([harness, '--config', cfg1, '--no-stream'], '/set prompt tiny\n', { cwd: workB });
+  check('/set prompt rejects an unknown style', res.out.includes('unknown prompt style') && res.out.includes('full or compact'), res.out);
+
+  res = await runWithInput([harness, '--config', cfg1, '--no-stream', '--prompt', 'compact'], '/config\n', { cwd: workB });
+  check('--prompt compact is applied to the session', /"promptStyle":\s*"compact"/.test(res.out), res.out);
+  check('the banner flags a non-default prompt style', res.out.includes('prompt: compact'), res.out);
+  res = await run(process.execPath, [harness, '--config', cfg1, '--prompt', 'weird', '--once', 'hi'], { cwd: workB });
+  check('--prompt rejects an unknown style', res.code !== 0 && res.out.includes('unknown style'), res.out);
+  res = await runWithInput([harness, '--config', cfg1, '--no-stream'], '/help\n', { cwd: workB });
+  check('/help documents /set prompt', res.out.includes('/set prompt'), res.out);
 
   res = await runWithInput([harness, '--config', cfg1, '--no-stream'], '/usage\n', { cwd: workB });
   check('/usage reports session totals', res.out.includes('session ') && res.out.includes('tokens'), res.out);
@@ -807,9 +922,9 @@ async function main() {
   // createAgent was imported with the system-prompt section above
   const workE = path.join(tmp, 'workE');
   fs.mkdirSync(workE, { recursive: true });
-  const smallConfig = { ...baseConfig(port), contextSize: 2000, maxTokens: 256, workspace: workE, streaming: false, autoCompact: true };
+  const smallConfig = { ...baseConfig(port), contextSize: 8000, maxTokens: 256, workspace: workE, streaming: false, autoCompact: true };
   const agentE = createAgent({ config: smallConfig, builtins: createTools(smallConfig), mcp: null });
-  agentE.history.push({ role: 'user', content: 'filler filler '.repeat(1200) }); // pushes past the budget
+  agentE.history.push({ role: 'user', content: 'filler filler '.repeat(3000) }); // pushes past the budget
 
   let captured = '';
   const origWrite = process.stdout.write.bind(process.stdout);
@@ -833,7 +948,7 @@ async function main() {
   fs.mkdirSync(workF, { recursive: true });
   const offConfig = { ...smallConfig, workspace: workF, autoCompact: false };
   const agentF = createAgent({ config: offConfig, builtins: createTools(offConfig), mcp: null });
-  agentF.history.push({ role: 'user', content: 'filler filler '.repeat(1200) });
+  agentF.history.push({ role: 'user', content: 'filler filler '.repeat(3000) });
   captured = '';
   process.stdout.write = (chunk, ...rest) => {
     captured += String(chunk);
@@ -846,6 +961,49 @@ async function main() {
   }
   check('autoCompact:false warns instead of compacting', captured.includes('run /compact'), captured.slice(0, 400));
   check('autoCompact:false does not summarize', !captured.includes('compacted conversation'), captured.slice(0, 400));
+
+  // a context too small for the system prompt itself must warn once, not compact on every step
+  const workCramped = path.join(tmp, 'workCramped');
+  fs.mkdirSync(workCramped, { recursive: true });
+  const crampedConfig = { ...baseConfig(port), contextSize: 2000, maxTokens: 256, workspace: workCramped, streaming: false, autoCompact: true };
+  const agentG = createAgent({ config: crampedConfig, builtins: createTools(crampedConfig), mcp: null });
+  captured = '';
+  process.stdout.write = (chunk, ...rest) => {
+    captured += String(chunk);
+    return true;
+  };
+  try {
+    await agentG.turn('continue please');
+  } finally {
+    process.stdout.write = origWrite;
+  }
+  check('a context smaller than the system prompt warns instead of looping', captured.includes('nothing left to compact'), captured.slice(0, 500));
+  check('the warning points at contextSize', /Raise "contextSize"/.test(captured), captured.slice(0, 500));
+  check('the turn still completes on a cramped context', captured.includes('MOCK-DONE'), captured.slice(0, 500));
+  check('no compaction is attempted when it cannot help', agentG.stats().compactions === 0, JSON.stringify(agentG.stats()));
+
+  // a compaction that would not free anything must keep the raw history and say so
+  const workNoGain = path.join(tmp, 'workNoGain');
+  fs.mkdirSync(workNoGain, { recursive: true });
+  const noGainConfig = { ...baseConfig(port), contextSize: 2000, maxTokens: 256, workspace: workNoGain, streaming: false };
+  const agentNoGain = createAgent({ config: noGainConfig, builtins: createTools(noGainConfig), mcp: null });
+  agentNoGain.history.push({ role: 'user', content: 'a short question' }, { role: 'assistant', content: 'a short answer' });
+  const historyBefore = JSON.stringify(agentNoGain.history);
+  captured = '';
+  process.stdout.write = (chunk, ...rest) => {
+    captured += String(chunk);
+    return true;
+  };
+  let noGainResult;
+  try {
+    noGainResult = await agentNoGain.compact({ manual: true });
+  } finally {
+    process.stdout.write = origWrite;
+  }
+  check('a pointless compaction is refused', noGainResult === null, JSON.stringify(noGainResult));
+  check('the refusal is reported honestly', captured.includes('would not free anything') && !captured.includes('compacted conversation'), captured.slice(0, 300));
+  check('the raw history survives a refused compaction', JSON.stringify(agentNoGain.history) === historyBefore, 'history was replaced');
+  check('a refused compaction is not counted', agentNoGain.stats().compactions === 0, JSON.stringify(agentNoGain.stats().compactions));
 
   /* ---------------- 3d. cut-off recovery (truncation, step limit, retries) ---------------- */
   console.log('\n[cut-off recovery]');
