@@ -15,6 +15,7 @@ import { createInputReader } from './lib/input.js';
 import { matchPromptStyle, PROMPT_STYLES } from './lib/prompt.js';
 import { GATE_MODES } from './lib/gate.js';
 import { DELEGATION_MODES, normalizeDelegation } from './lib/delegate.js';
+import { buildSession, listSessions, loadSession, resolveLoadPath, resolveSessionPath, saveSession, sessionDir, sessionTitle } from './lib/session.js';
 import * as ui from './lib/ui.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -36,6 +37,12 @@ const HELP = `
     /clear             clear the terminal screen
     /exit  /quit       exit
 
+  Save and load the chat
+    /save [name|file]  write this conversation to disk (default: ~/.coding-harness/chats)
+    /load <name|file>  replace this conversation with a saved one
+    /chats             list saved chats
+    --resume [name]    load one at startup (no name = the most recent)
+
   Plan first, then build
     /plan <task>       plan mode: read-only research, ends with a plan to review
     /plan              turn plan mode on (or /plan show to re-print the plan)
@@ -53,11 +60,12 @@ const HELP = `
   A .llmignore file in the workspace hides paths from read_file and search_files entirely.
 
   Anything else is sent to the model as a chat message.
-  CLI flags: --config <path>  --dir <path>  --once "<prompt>"  --plan  --stream | --no-stream  --model <name>  --prompt <full|compact>  --init
+  CLI flags: --config <path>  --dir <path>  --once "<prompt>"  --plan  --resume [name]
+             --stream | --no-stream  --model <name>  --prompt <full|compact>  --init
 `;
 
 function parseArgs(argv) {
-  const opts = { config: null, dir: null, once: null, streaming: undefined, model: null, promptStyle: null, init: false, help: false, plan: false };
+  const opts = { config: null, dir: null, once: null, streaming: undefined, model: null, promptStyle: null, init: false, help: false, plan: false, resume: undefined };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     switch (a) {
@@ -85,6 +93,13 @@ function parseArgs(argv) {
       case '--prompt':
         opts.promptStyle = argv[++i];
         break;
+      case '--resume':
+      case '--continue': {
+        // the name is optional: `--resume` alone means "the most recent chat"
+        const next = argv[i + 1];
+        opts.resume = next && !next.startsWith('-') ? argv[++i] : '';
+        break;
+      }
       case '--plan':
       case '-p':
         opts.plan = true;
@@ -163,6 +178,25 @@ async function main() {
   // built before the banner lists what the model will actually be offered
   const agent = createAgent({ config, builtins, mcp: mcp.size ? mcp : null });
 
+  // --resume runs before the banner so the mode and tool rows describe the
+  // restored session rather than the empty one it replaced.
+  let resumed = null;
+  if (opts.resume !== undefined) {
+    try {
+      const target = opts.resume ? resolveLoadPath(opts.resume, { cwd: builtins.cwd }) : { file: listSessions()[0]?.file };
+      if (!target.file) throw new Error(`no saved chats in ${sessionDir()} — /save writes one`);
+      const session = loadSession(target);
+      const file = target.file;
+      builtins.plan.restore({ mode: session.mode, proposed: session.plan.proposed, approved: session.plan.approved });
+      if (session.delegation) agent.setDelegation(session.delegation);
+      agent.restore({ conversation: session.conversation, stats: session.stats });
+      resumed = { file, session };
+    } catch (e) {
+      ui.printError(`--resume: ${e.message}`);
+      process.exit(1);
+    }
+  }
+
   ui.banner({
     version: pkg.version,
     promptStyle: config.promptStyle,
@@ -181,6 +215,13 @@ async function main() {
     delegation: agent.delegation,
     configAdded: added,
   });
+
+  if (resumed) {
+    ui.printSystem(
+      `resumed ${path.basename(resumed.file, '.json')}${resumed.session.title ? ` — "${resumed.session.title}"` : ''} ` +
+        `(${resumed.session.conversation.length} message(s))`
+    );
+  }
 
   if (!config.openai.apiKey || config.openai.apiKey === 'sk-REPLACE_ME') {
     ui.printSystem('no API key set — fine for local servers that do not need one; otherwise edit the config or set OPENAI_API_KEY');
@@ -456,26 +497,81 @@ async function main() {
           agent.reset(); // drops the plan too: a fresh context implies a fresh plan
           ui.printSystem(`conversation cleared${agent.planning ? ' (still in plan mode)' : ''}`);
           break;
+        case '/save':
         case '/export': {
-          const file = text.slice(cmd.length).trim();
-          if (!file) { ui.printError('usage: /export <file>'); break; }
+          const arg = text.slice(cmd.length).trim();
+          // an empty chat file is clutter, not a save point
+          if (agent.history.length <= 1) {
+            ui.printError('nothing to save yet — say something first');
+            break;
+          }
           try {
-            const target = path.resolve(builtins.cwd, file.replace(/^['"]|['"]$/g, ''));
-            fs.writeFileSync(target, JSON.stringify({ format: 'coding-harness-chat', version: 1, exportedAt: new Date().toISOString(), messages: agent.history }, null, 2) + '\\n');
-            ui.printSystem(`chat exported to ${target}`);
-          } catch (e) { ui.printError(`could not export chat: ${e.message}`); }
+            const target = resolveSessionPath(arg, { cwd: builtins.cwd, title: sessionTitle(agent.history) });
+            saveSession(
+              target,
+              buildSession({
+                messages: agent.history,
+                plan: agent.plan,
+                delegation: agent.delegation,
+                promptStyle: config.promptStyle,
+                model: config.openai.model,
+                workspace: builtins.cwd,
+                stats: agent.stats(),
+                harnessVersion: pkg.version,
+              })
+            );
+            const turns = agent.history.filter((m) => m.role === 'user').length;
+            ui.printSystem(`chat saved to ${target} (${turns} turn(s), ${agent.history.length - 1} message(s))`);
+          } catch (e) {
+            ui.printError(`could not save the chat: ${e.message}`);
+          }
           break;
         }
+        case '/load':
         case '/import': {
-          const file = text.slice(cmd.length).trim();
-          if (!file) { ui.printError('usage: /import <file>'); break; }
+          const arg = text.slice(cmd.length).trim();
+          if (!arg) {
+            ui.printError('usage: /load <name|file>   (/chats lists what you have saved)');
+            break;
+          }
           try {
-            const source = path.resolve(builtins.cwd, file.replace(/^['"]|['"]$/g, ''));
-            const data = JSON.parse(fs.readFileSync(source, 'utf8'));
-            if (data?.format !== 'coding-harness-chat' || !Array.isArray(data.messages) || !data.messages.length || data.messages[0].role !== 'system') throw new Error('invalid chat export');
-            agent.history.splice(0, agent.history.length, ...data.messages);
-            ui.printSystem(`chat imported from ${source} (${data.messages.length - 1} message(s))`);
-          } catch (e) { ui.printError(`could not import chat: ${e.message}`); }
+            const session = loadSession(resolveLoadPath(arg, { cwd: builtins.cwd }));
+            // the plan goes back first: the rebuilt system prompt depends on it
+            builtins.plan.restore({ mode: session.mode, proposed: session.plan.proposed, approved: session.plan.approved });
+            if (session.delegation) agent.setDelegation(session.delegation);
+            const restored = agent.restore({ conversation: session.conversation, stats: session.stats });
+            ui.printSystem(
+              `chat loaded${session.title ? `: "${session.title}"` : ''} — ${restored} message(s)` +
+                `${session.savedAt ? `, saved ${new Date(session.savedAt).toLocaleString()}` : ''}`
+            );
+            if (agent.planning) ui.printSystem('restored in plan mode');
+            if (agent.plan.approved) ui.printSystem(`approved plan restored: ${agent.plan.approved.title}`);
+            // the prompt is rebuilt for *here*, so a chat from elsewhere is worth flagging
+            if (session.workspace && path.resolve(session.workspace) !== path.resolve(builtins.cwd)) {
+              ui.printSystem(`note: saved in ${session.workspace} — the conversation may refer to files that are not here`);
+            }
+            if (session.model && session.model !== config.openai.model) {
+              ui.printSystem(`note: saved with model ${session.model}, now using ${config.openai.model}`);
+            }
+          } catch (e) {
+            ui.printError(`could not load the chat: ${e.message}`);
+          }
+          break;
+        }
+        case '/chats': {
+          const saved = listSessions();
+          if (!saved.length) {
+            ui.printSystem(`no saved chats yet in ${sessionDir()} — /save [name] writes one`);
+            break;
+          }
+          const width = Math.max(12, Math.min(28, ...saved.map((s) => s.name.length)) || 12);
+          for (const s of saved) {
+            const when = s.savedAt ? new Date(s.savedAt).toISOString().slice(0, 16).replace('T', ' ') : '';
+            ui.out(
+              `  ${ui.s.green(s.name.padEnd(Math.max(width, s.name.length)))}  ${ui.s.dim(`${when} · ${s.turns} turn(s)`)}  ${s.title}`
+            );
+          }
+          ui.printSystem(`${saved.length} saved chat(s) in ${sessionDir()} — /load <name>`);
           break;
         }
         case '/clear':

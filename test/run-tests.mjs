@@ -1287,6 +1287,138 @@ async function main() {
   check('the raw history survives a refused compaction', JSON.stringify(agentNoGain.history) === historyBefore, 'history was replaced');
   check('a refused compaction is not counted', agentNoGain.stats().compactions === 0, JSON.stringify(agentNoGain.stats().compactions));
 
+  /* ---------------- 3b5. saving and loading a chat ---------------- */
+  console.log('\n[save / load chat]');
+  const sess = await import(pathToFileURL(path.join(proj, 'lib', 'session.js')).href);
+  const chatDir = path.join(tmp, 'chats');
+  const chatCwd = path.join(tmp, 'chat-work');
+  fs.mkdirSync(chatCwd, { recursive: true });
+
+  // where things land
+  check('a bare name goes in the chats directory', sess.resolveSessionPath('refactor', { cwd: chatCwd, dir: chatDir }) === path.join(chatDir, 'refactor.json'), sess.resolveSessionPath('refactor', { cwd: chatCwd, dir: chatDir }));
+  check('a name is slugified', sess.resolveSessionPath('My Big Refactor!', { cwd: chatCwd, dir: chatDir }) === path.join(chatDir, 'my-big-refactor.json'), 'not slugified');
+  check('a path is taken literally', sess.resolveSessionPath('./out/chat.json', { cwd: chatCwd, dir: chatDir }) === path.join(chatCwd, 'out', 'chat.json'), 'wrong path');
+  check('a path without .json gains it', sess.resolveSessionPath('sub/dir/thing', { cwd: chatCwd, dir: chatDir }).endsWith(path.join('sub', 'dir', 'thing.json')), 'no extension');
+  check('no argument names the file from the conversation', /chase-the-bug-\d{4}-\d{2}-\d{2}-\d{4}\.json$/.test(sess.resolveSessionPath('', { cwd: chatCwd, dir: chatDir, title: 'Chase the bug' })), sess.resolveSessionPath('', { cwd: chatCwd, dir: chatDir, title: 'Chase the bug' }));
+  check('an untitled chat still gets a name', /chat-\d{4}-/.test(sess.resolveSessionPath('', { cwd: chatCwd, dir: chatDir, title: '' })), 'no fallback name');
+  check('quotes around the name are dropped', sess.resolveSessionPath('"notes"', { cwd: chatCwd, dir: chatDir }) === path.join(chatDir, 'notes.json'), 'quotes kept');
+
+  // round trip
+  const chatMessages = [
+    { role: 'system', content: 'OLD SYSTEM PROMPT from another machine' },
+    { role: 'user', content: 'find the race condition in the worker pool' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read_file', arguments: '{"path":"pool.js"}' } }] },
+    { role: 'tool', tool_call_id: 'c1', content: '# pool.js — lines 1-2 of 2' },
+    { role: 'assistant', content: 'It is the unguarded counter increment on line 42.' },
+  ];
+  const chatFile = path.join(chatDir, 'race.json');
+  sess.saveSession(chatFile, sess.buildSession({ messages: chatMessages, plan: { mode: 'build', proposed: null, approved: null }, delegation: 'optional', promptStyle: 'full', model: 'some-model', workspace: chatCwd, stats: { calls: 4, promptTokens: 900, completionTokens: 100, compactions: 1, subagentCalls: 2 }, harnessVersion: '1.0.0' }));
+  check('saving creates the directory', fs.existsSync(chatFile), 'no file');
+  check('the file ends with a real newline', fs.readFileSync(chatFile, 'utf8').endsWith('}\n'), JSON.stringify(fs.readFileSync(chatFile, 'utf8').slice(-6)));
+  check('no temp file is left behind', fs.readdirSync(chatDir).every((f) => !f.includes('.tmp-')), fs.readdirSync(chatDir).join(','));
+  const loaded = sess.loadSession(chatFile);
+  check('the format and version are recorded', loaded.format === 'coding-harness-chat' && loaded.version === 2, JSON.stringify([loaded.format, loaded.version]));
+  check('every message round-trips', loaded.messages.length === 5 && loaded.messages[2].tool_calls[0].function.name === 'read_file', JSON.stringify(loaded.messages.length));
+  check('the title comes from the first user message', loaded.title === 'find the race condition in the worker pool', loaded.title);
+  check('the stored system prompt is excluded from the conversation', loaded.conversation.length === 4 && !loaded.conversation.some((m) => m.role === 'system'), JSON.stringify(loaded.conversation.length));
+  check('the counters survive', loaded.stats.calls === 4 && loaded.stats.subagentCalls === 2, JSON.stringify(loaded.stats));
+  check('the workspace and model are recorded', loaded.workspace === chatCwd && loaded.model === 'some-model', JSON.stringify([loaded.workspace, loaded.model]));
+
+  // rejections — a chat file is not just any JSON
+  const badChat = (name, text) => {
+    const target = path.join(chatDir, name);
+    fs.writeFileSync(target, text);
+    try {
+      sess.loadSession(target);
+      return '';
+    } catch (e) {
+      return e.message;
+    }
+  };
+  check('a foreign JSON file is refused', badChat('foreign.json', '{"hello":1}').includes('is not a chat export'), badChat('foreign2.json', '{"hello":1}'));
+  check('an empty chat is refused', badChat('empty.json', JSON.stringify({ format: 'coding-harness-chat', messages: [] })).includes('has no messages'), 'accepted');
+  check('an unknown role is refused', badChat('role.json', JSON.stringify({ format: 'coding-harness-chat', messages: [{ role: 'wizard', content: 'x' }] })).includes('unknown role'), 'accepted');
+  check('broken JSON is refused', badChat('broken.json', '{ nope').includes('not readable JSON'), 'accepted');
+  const missing = sess.resolveLoadPath('ghost', { cwd: chatCwd, dir: chatDir });
+  let missMsg = '';
+  try { sess.loadSession(missing); } catch (e) { missMsg = e.message; }
+  check('a missing chat names every place it looked', missMsg.includes('no such chat') && missMsg.includes(chatDir) && missMsg.includes(chatCwd), missMsg);
+
+  // v1 files (the old /export format) still load
+  const v1File = path.join(chatDir, 'legacy.json');
+  fs.writeFileSync(v1File, JSON.stringify({ format: 'coding-harness-chat', version: 1, exportedAt: '2026-01-01T00:00:00Z', messages: chatMessages }));
+  const v1 = sess.loadSession(v1File);
+  check('a v1 export still loads', v1.version === 1 && v1.conversation.length === 4, JSON.stringify(v1.version));
+  check('a v1 export defaults to build mode', v1.mode === 'build' && v1.plan.approved === null, JSON.stringify(v1.mode));
+
+  // finding a saved chat by name, from either directory
+  fs.writeFileSync(path.join(chatCwd, 'local.json'), fs.readFileSync(chatFile));
+  check('a name resolves inside the chats directory', sess.resolveLoadPath('race', { cwd: chatCwd, dir: chatDir }).found === true, 'not found');
+  check('a name resolves in the workspace too', sess.resolveLoadPath('local', { cwd: chatCwd, dir: chatDir }).file === path.join(chatCwd, 'local.json'), 'not found');
+  check('the workspace wins over the chats directory', sess.resolveLoadPath('local.json', { cwd: chatCwd, dir: chatDir }).file.startsWith(chatCwd), 'wrong precedence');
+
+  // listing
+  const listed = sess.listSessions(chatDir);
+  check('listing skips files that are not chats', listed.every((s) => s.title !== undefined) && !listed.some((s) => s.name === 'foreign'), listed.map((s) => s.name).join(','));
+  check('listing reports turns and a title', listed.find((s) => s.name === 'race')?.turns === 1 && listed.find((s) => s.name === 'race')?.title.startsWith('find the race'), JSON.stringify(listed.find((s) => s.name === 'race')));
+  check('listing an absent directory is empty, not an error', sess.listSessions(path.join(tmp, 'no-such-dir')).length === 0, 'threw');
+
+  // restoring into a live agent: the stored system prompt must NOT come back
+  const chatCfg = loadConfig(writeConfig('cfg-chat.json', { ...baseConfig(1), workspace: chatCwd }));
+  const chatAgent = createAgent({ config: chatCfg.config, builtins: createTools(chatCfg.config), mcp: null });
+  const restoredCount = chatAgent.restore({ conversation: loaded.conversation, stats: loaded.stats });
+  check('restore returns the message count', restoredCount === 4, String(restoredCount));
+  check('the system prompt is rebuilt, not replayed', chatAgent.history[0].role === 'system' && !chatAgent.history[0].content.includes('OLD SYSTEM PROMPT') && chatAgent.history[0].content.includes('# Environment'), chatAgent.history[0].content.slice(0, 120));
+  check('the conversation is restored in order', chatAgent.history[1].content.includes('race condition') && chatAgent.history.at(-1).content.includes('unguarded counter'), 'wrong order');
+  check('a tool call and its result both survive', chatAgent.history[2].tool_calls?.[0]?.id === 'c1' && chatAgent.history[3].role === 'tool', 'tool pair lost');
+  check('the counters continue instead of restarting', chatAgent.stats().calls === 4 && chatAgent.stats().compactions === 1, JSON.stringify(chatAgent.stats().calls));
+  check('restoring twice does not accumulate', chatAgent.restore({ conversation: loaded.conversation }) === 4 && chatAgent.history.length === 5, String(chatAgent.history.length));
+
+  // plan state round-trips
+  const chatPlanCfg = loadConfig(writeConfig('cfg-chat-plan.json', { ...baseConfig(1), workspace: chatCwd }));
+  const chatPlanBuiltins = createTools(chatPlanCfg.config);
+  const chatPlanAgent = createAgent({ config: chatPlanCfg.config, builtins: chatPlanBuiltins, mcp: null });
+  const storedPlan = { title: 'Fix the pool', steps: ['guard the counter'], files: ['pool.js'], verification: 'npm test', notes: '', createdAt: '2026-01-01T00:00:00Z' };
+  chatPlanBuiltins.plan.restore({ mode: 'plan', proposed: storedPlan, approved: null });
+  chatPlanAgent.restore({ conversation: loaded.conversation });
+  check('plan mode is restored', chatPlanAgent.planning === true && chatPlanAgent.history[0].content.includes('# Plan mode'), 'not planning');
+  check('a restored plan is not treated as freshly presented', chatPlanBuiltins.plan.takePresented() === null, 'turn would stop');
+  chatPlanBuiltins.plan.restore({ mode: 'build', proposed: null, approved: storedPlan });
+  chatPlanAgent.restore({ conversation: loaded.conversation });
+  check('an approved plan is pinned back into the prompt', chatPlanAgent.history[0].content.includes('# Approved plan') && chatPlanAgent.history[0].content.includes('Fix the pool'), 'plan missing');
+
+  // end to end: save in one process, load in the next
+  const liveDir = path.join(tmp, 'chat-live');
+  fs.mkdirSync(liveDir, { recursive: true });
+  const liveHome = path.join(tmp, 'chat-home');
+  const liveCfg = writeConfig('cfg-chat-live.json', { ...baseConfig(port), workspace: liveDir });
+  const liveEnv = { ...process.env, HOME: liveHome, USERPROFILE: liveHome };
+  let live = await runWithInput([harness, '--config', liveCfg, '--no-stream'], 'hello\n/save my-session\n/exit\n', { cwd: liveDir, env: liveEnv });
+  check('/save reports where it wrote', live.out.includes('chat saved to') && live.out.includes('my-session.json'), live.out);
+  const savedFile = path.join(liveHome, '.coding-harness', 'chats', 'my-session.json');
+  check('/save writes to the chats directory', fs.existsSync(savedFile), savedFile);
+  const savedJson = JSON.parse(fs.readFileSync(savedFile, 'utf8'));
+  check('/save records the whole exchange', savedJson.messages.length > 2 && savedJson.messages.some((m) => m.role === 'tool'), JSON.stringify(savedJson.messages.length));
+  check('/save records the model and workspace', savedJson.model === 'mock-model' && savedJson.workspace === liveDir, JSON.stringify([savedJson.model, savedJson.workspace]));
+
+  live = await runWithInput([harness, '--config', liveCfg, '--no-stream'], '/chats\n/load my-session\n/usage\n/exit\n', { cwd: liveDir, env: liveEnv });
+  check('/chats lists the saved chat', live.out.includes('my-session') && live.out.includes('1 saved chat(s)'), live.out);
+  check('/load restores it', /chat loaded.*message\(s\)/.test(live.out), live.out);
+  check('/load restores the counters', /session [1-9]\d* call\(s\)/.test(live.out.slice(live.out.indexOf('chat loaded'))), live.out.slice(live.out.indexOf('chat loaded'), live.out.indexOf('chat loaded') + 300));
+  check('/load reports an unknown chat without crashing', (await runWithInput([harness, '--config', liveCfg, '--no-stream'], '/load nope\n/exit\n', { cwd: liveDir, env: liveEnv })).out.includes('no such chat'), 'no error shown');
+  check('/save refuses an empty conversation', (await runWithInput([harness, '--config', liveCfg, '--no-stream'], '/save\n/exit\n', { cwd: liveDir, env: liveEnv })).out.includes('nothing to save yet'), 'saved anyway');
+  check('/load with no argument explains itself', (await runWithInput([harness, '--config', liveCfg, '--no-stream'], '/load\n/exit\n', { cwd: liveDir, env: liveEnv })).out.includes('usage: /load'), 'no usage');
+
+  // --resume
+  live = await runWithInput([harness, '--config', liveCfg, '--no-stream', '--resume', 'my-session'], '/exit\n', { cwd: liveDir, env: liveEnv });
+  check('--resume loads a named chat', live.out.includes('resumed my-session'), live.out);
+  live = await runWithInput([harness, '--config', liveCfg, '--no-stream', '--resume'], '/exit\n', { cwd: liveDir, env: liveEnv });
+  check('--resume with no name takes the most recent', live.out.includes('resumed my-session'), live.out);
+  live = await run(process.execPath, [harness, '--config', liveCfg, '--no-stream', '--resume', 'ghost'], { cwd: liveDir, env: liveEnv });
+  check('--resume on a missing chat fails loudly', live.code === 1 && live.out.includes('--resume:'), `${live.code} ${live.out}`);
+  live = await runWithInput([harness, '--config', liveCfg, '--no-stream'], '/help\n/exit\n', { cwd: liveDir, env: liveEnv });
+  check('/help documents save and load', live.out.includes('/save [name|file]') && live.out.includes('/load <name|file>') && live.out.includes('/chats') && live.out.includes('--resume'), live.out);
+
   /* ---------------- 3b4. config migration (old files learn new keys) ---------------- */
   console.log('\n[config migration]');
   const { DEFAULT_CONFIG } = await import(pathToFileURL(path.join(proj, 'lib', 'config.js')).href);

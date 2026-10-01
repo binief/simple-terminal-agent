@@ -475,7 +475,7 @@ that was never finished is still sent when the input ends (piped scripts, Ctrl+D
 
 ## Session commands
 
-`/help` `/config` `/tools` `/set dir <path>` `/set prompt <full|compact>` `/set gate <enforce|warn|off>` `/set delegation <off|optional|enforced>` `/cwd` `/usage` `/compact` `/reset` (clear conversation) `/export <file>` (save chat) `/import <file>` (load chat) `/clear` (clear screen) `/exit`
+`/help` `/config` `/tools` `/set dir <path>` `/set prompt <full|compact>` `/set gate <enforce|warn|off>` `/set delegation <off|optional|enforced>` `/cwd` `/usage` `/compact` `/reset` (clear conversation) `/save [name]` `/load <name>` `/chats` (see [Saving and loading a chat](#saving-and-loading-a-chat)) `/clear` (clear screen) `/exit`
 
 `/set gate` and `/set delegation` change the config for the running session only (the file is not
 rewritten) and take effect immediately — switching delegation to `enforced` removes `write_file` and
@@ -483,7 +483,67 @@ rewritten) and take effect immediately — switching delegation to `enforced` re
 
 Plan first: `/plan <task>` `/plan show` `/approve [note]` `/plan off` (see [Plan mode](#plan-mode)).
 
-One conversation per run (single session). `/reset` starts fresh context inside the same session.
+One conversation per run (single session). `/reset` starts fresh context inside the same session;
+`/save` and `/load` carry one across runs.
+
+## Saving and loading a chat
+
+A session dies with the process. That is fine for a quick question and annoying after an hour: what
+the model has built up — the files it read, the test output it saw, the three approaches it already
+ruled out — is exactly the context the rest of this harness works to protect, and closing the
+terminal throws all of it away.
+
+```
+/save                 # ~/.coding-harness/chats/find-the-race-condition-2026-10-01-1432.json
+/save my-refactor     # ~/.coding-harness/chats/my-refactor.json
+/save ./notes/bug.json
+/chats                # list what you have saved
+/load my-refactor     # replace the current conversation with that one
+```
+
+```
+  my-refactor        2026-10-01 14:32 · 7 turn(s)   find the race condition in the worker pool
+  ⓘ 1 saved chat(s) in ~/.coding-harness/chats — /load <name>
+```
+
+A bare word is a name in the chats directory; anything that looks like a path (`./x`, `/x`, `~/x`,
+or ending in `.json`) is written where you point it. With no argument the file is named after the
+first thing you asked plus a timestamp, so saving twice does not overwrite.
+
+`--resume [name]` does the same at startup — with no name, the most recent chat:
+
+```bash
+node harness.js --resume              # pick up where you left off
+node harness.js --resume my-refactor
+```
+
+### What is restored, and what is not
+
+The file holds the whole conversation — user turns, assistant replies, tool calls and their results —
+plus the plan state, the delegation mode, the model and workspace it was saved in, and the token
+counters (so `/usage` keeps totalling rather than restarting).
+
+The one thing deliberately *not* restored is the **system prompt**. It is message 0 of every history
+and it describes a moment: this working directory, this git branch, today's date, this mode. Replaying
+a stored one would quietly tell the model it is somewhere it is not. So the file keeps a copy (it is a
+faithful record, and useful when reading an export by hand) and `/load` rebuilds the prompt for the
+environment you are actually in. Everything the conversation learned comes back; nothing it assumed
+about the world does.
+
+Plan mode comes back with it: a chat saved while planning reloads in plan mode with the read-only
+toolset, and an approved plan is pinned back into the system prompt. A restored plan is not treated as
+freshly presented, so the turn loop does not stop as though it had just arrived.
+
+`/load` warns when the chat was saved somewhere else or with a different model, since the conversation
+may refer to files that are not here:
+
+```
+  ● note: saved in /home/me/other-project — the conversation may refer to files that are not here
+  ● note: saved with model gpt-4o-mini, now using qwen2.5-coder
+```
+
+Files are plain JSON with a `format` and `version` field, written atomically. `/export` and `/import`
+are kept as aliases for `/save` and `/load`, and v1 files written by the old `/export` still load.
 
 ## Progress, tokens and context
 
@@ -552,7 +612,8 @@ The harness actively keeps a turn running to completion instead of stopping half
 ## CLI flags
 
 ```
-node harness.js [--config <path>] [--dir <path>] [--init] [--once "<prompt>"] [--plan] [--stream | --no-stream] [--model <name>] [--prompt <full|compact>]
+node harness.js [--config <path>] [--dir <path>] [--init] [--once "<prompt>"] [--plan]
+                [--resume [name]] [--stream | --no-stream] [--model <name>] [--prompt <full|compact>]
 ```
 
 `--dir <path>` starts the session in a different working directory (same as typing `/set dir <path>` first).
@@ -564,6 +625,9 @@ node harness.js [--config <path>] [--dir <path>] [--init] [--once "<prompt>"] [-
 `--plan` starts in plan mode — combined with `--once` it prints a plan for a task and changes nothing
 (`node harness.js --plan --once "add caching to the API client"`).
 
+`--resume [name]` loads a saved chat before the first prompt (no name = the most recent). `--continue`
+is an alias. See [Saving and loading a chat](#saving-and-loading-a-chat).
+
 ## Tests
 
 ```bash
@@ -573,8 +637,9 @@ npm test
 Runs an end-to-end suite against a mock OpenAI server and a mock MCP server (streaming on/off, tool
 round-trips, MCP tools, built-in tool smoke tests, search ignore rules, multiline input rules, plan
 mode: the read-only command rules, the tool gating, and a full plan → `/approve` → implementation run;
-the command gate, `.llmignore`, token calibration, and delegation end to end — a real subagent writing
-a real file, recursion refused, and enforced mode refusing the editors).
+the command gate, `.llmignore`, token calibration, delegation end to end — a real subagent writing
+a real file, recursion refused, and enforced mode refusing the editors — config migration, and chat
+save/load round-tripped through two separate processes).
 
 `docs/late-cli-analysis.md` covers where delegation, the command gate and `.llmignore` came from and
 which of the reference project's ideas were deliberately left out.
