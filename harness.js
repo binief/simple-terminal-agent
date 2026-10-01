@@ -149,6 +149,10 @@ async function main() {
     onLog: (kind, msg) => (kind === 'error' ? ui.printError(msg) : ui.printSystem(msg)),
   });
 
+  // the agent registers its own tools (delegate) during construction, so it is
+  // built before the banner lists what the model will actually be offered
+  const agent = createAgent({ config, builtins, mcp: mcp.size ? mcp : null });
+
   ui.banner({
     version: pkg.version,
     promptStyle: config.promptStyle,
@@ -160,16 +164,16 @@ async function main() {
     contextSize: config.contextSize,
     temperature: config.temperature,
     workspace: builtins.cwd,
-    tools: builtins.listTools().map((t) => t.name),
+    // what the model is actually offered, not everything that exists
+    tools: agent.tools().filter((t) => !mcp.has(t.name)).map((t) => t.name),
     mcp: mcp.size ? mcp.describe() : null,
     planning: builtins.plan.planning,
+    delegation: agent.delegation,
   });
 
   if (!config.openai.apiKey || config.openai.apiKey === 'sk-REPLACE_ME') {
     ui.printSystem('no API key set — fine for local servers that do not need one; otherwise edit the config or set OPENAI_API_KEY');
   }
-
-  const agent = createAgent({ config, builtins, mcp: mcp.size ? mcp : null });
 
   const shutdown = () => {
     mcp.closeAll();
@@ -258,12 +262,16 @@ async function main() {
             const d = desc.split('\n')[0];
             ui.out(`  ${colorFn(name.slice(0, 16).padEnd(16))} ${ui.s.dim(d.length > width ? d.slice(0, width - 1) + '…' : d)}`);
           };
-          // the list mirrors what the model is actually offered, so plan mode shows fewer tools
+          // the list mirrors what the model is actually offered, so plan mode
+          // and enforced delegation show fewer tools
           const offered = new Set(agent.tools().map((t) => t.name));
-          for (const t of builtins.listTools()) line(ui.s.green, t.name, t.description);
+          for (const t of builtins.listTools()) if (offered.has(t.name)) line(ui.s.green, t.name, t.description);
           for (const t of mcp.listTools()) if (offered.has(t.name)) line(ui.s.yellow, t.name, t.description);
           if (agent.planning) {
             ui.printSystem('plan mode: only read-only tools are offered (/approve or /plan off for the rest)');
+          }
+          if (agent.delegation === 'enforced') {
+            ui.printSystem('delegation is enforced: write_file and edit_file belong to the coder subagent, not to this agent');
           }
           break;
         }
@@ -389,6 +397,7 @@ async function main() {
             completionTokens: st.completionTokens,
             avgTokPerSec: st.avgTokPerSec,
             compactions: st.compactions,
+            subagentCalls: st.subagentCalls,
             used: st.used,
             contextSize: st.contextSize,
             estimated: st.estimated,

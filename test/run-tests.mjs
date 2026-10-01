@@ -404,7 +404,8 @@ async function main() {
   /* ---------------- 0c. system prompt: working contract + custom instructions ---------------- */
   console.log('\n[system prompt]');
   const { createAgent, resolveInstructions } = await import(pathToFileURL(path.join(proj, 'lib', 'agent.js')).href);
-  const { buildSystemPrompt, gitInfo, clearGitCache, matchPromptStyle, normalizePromptStyle, PROMPT_STYLES } = await import(pathToFileURL(path.join(proj, 'lib', 'prompt.js')).href);
+  const { buildSystemPrompt, gitInfo, clearGitCache, matchPromptStyle, normalizePromptStyle, staticPrefix, PROMPT_STYLES } = await import(pathToFileURL(path.join(proj, 'lib', 'prompt.js')).href);
+  const { PLAN_MODE_RULES } = await import(pathToFileURL(path.join(proj, 'lib', 'plan.js')).href);
   const promptDir = path.join(tmp, 'prompt');
   fs.mkdirSync(promptDir, { recursive: true });
   const promptCfg = { ...baseConfig(1), workspace: promptDir, streaming: false };
@@ -459,9 +460,32 @@ async function main() {
   check('buildSystemPrompt is deterministic', built === buildSystemPrompt({ cwd: '/w', platform: 'p', date: '2025-01-02', planning: true, blocks: ['BLOCK-ONE'], instructions: 'RULE-LAST' }), 'differs');
   check('buildSystemPrompt marks plan mode in the environment block', /- Mode: plan \(read-only research/.test(built), built.slice(0, 400));
   check('autonomy tells build mode not to hand back a plan', sys.includes('a plan instead of the work'), sys);
-  const planned = buildSystemPrompt({ cwd: '/w', platform: 'p', planning: true });
-  check('autonomy flips in plan mode: the plan is the deliverable', planned.includes('the plan is the deliverable') && !planned.includes('a plan instead of the work'), planned.slice(0, 1200));
+  const planned = buildSystemPrompt({ cwd: '/w', platform: 'p', planning: true, blocks: [PLAN_MODE_RULES] });
+  check('plan mode overrides autonomy from its own block', planned.includes('the plan is the deliverable') && planned.indexOf('# Autonomy') < planned.indexOf('the plan is the deliverable'), planned.slice(0, 1200));
   check('buildSystemPrompt appends blocks before the user instructions', built.indexOf('BLOCK-ONE') < built.indexOf('RULE-LAST') && built.indexOf('# Harness mechanics') < built.indexOf('BLOCK-ONE'), built);
+
+  /* ---------------- 0c-ter. the cached prefix survives the session ---------------- */
+  // Everything a server can cache sits in front of the first volatile token.
+  for (const style of PROMPT_STYLES) {
+    const prefix = staticPrefix(style);
+    const variants = [
+      { cwd: '/w', platform: 'p', date: '2025-01-02', style },
+      { cwd: '/other', platform: 'q', date: '2031-12-31', style, planning: true },
+      { cwd: '/w', platform: 'p', date: '2025-01-02', style, git: 'main (3 uncommitted files)' },
+      { cwd: '/w', platform: 'p', date: '2025-01-02', style, blocks: ['BLOCK'], instructions: 'RULE' },
+    ].map((o) => buildSystemPrompt(o));
+    check(`${style}: every prompt starts with the same static prefix`, variants.every((v) => v.startsWith(prefix)), variants.map((v) => v.slice(0, 80)).join(' | '));
+    check(`${style}: nothing volatile leaks into the prefix`, !/# Environment|Workspace \(cwd\)|- Today:|- Mode:|- Git:/.test(prefix), prefix.slice(-300));
+  }
+  const buildPrompt = buildSystemPrompt({ cwd: '/w', platform: 'p', date: '2025-01-02' });
+  const planPrompt = buildSystemPrompt({ cwd: '/w', platform: 'p', date: '2025-01-02', planning: true, blocks: [PLAN_MODE_RULES] });
+  const shared = (() => {
+    let i = 0;
+    while (i < buildPrompt.length && i < planPrompt.length && buildPrompt[i] === planPrompt[i]) i++;
+    return i;
+  })();
+  check('switching to plan mode keeps the whole rule set cached', shared >= staticPrefix('full').length, `diverges at ${shared} of ${staticPrefix('full').length}`);
+  check('the volatile tail still carries the mode', /- Mode: plan/.test(planPrompt) && /- Mode: build/.test(buildPrompt), planPrompt.slice(shared, shared + 120));
 
   /* ---------------- 0c-bis. the prompt quotes the real tool limits ---------------- */
   const { TOOL_LIMITS } = await import(pathToFileURL(path.join(proj, 'lib', 'tools.js')).href);
@@ -500,7 +524,7 @@ async function main() {
   check('compact still forbids commits and secrets', /Never commit, push or switch branches unless asked/.test(compact) && /Never print secrets/.test(compact), compact);
   check('compact still pins read-before-edit and verbatim old_text', /Read a file before changing it/.test(compact) && /copy old_text verbatim/.test(compact), compact);
   check('compact drops the harness-mechanics section', !compact.includes('# Harness mechanics'), compact);
-  check('compact respects plan mode in the autonomy block', buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'compact', planning: true }).includes('the plan is the deliverable'), 'missing');
+  check('compact keeps one mode-independent autonomy block', compact.includes('Finish the task before yielding') && buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'compact', planning: true }).includes('Finish the task before yielding'), 'autonomy flips by mode');
   check('compact still carries plan blocks and instructions', buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'compact', blocks: ['BLOCK'], instructions: 'RULE' }).includes('BLOCK') === true && buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'compact', instructions: 'RULE' }).includes('RULE'), 'missing');
   check('an unknown style falls back to full', buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'nonsense' }) === full, 'not the full prompt');
   check('style aliases resolve', normalizePromptStyle('SHORT') === 'compact' && normalizePromptStyle('long') === 'full' && normalizePromptStyle(null) === 'full', 'bad aliases');
@@ -549,6 +573,128 @@ async function main() {
   check('config keeps multi-line instructions', cfgIns.instructions === 'line one\nline two', JSON.stringify(cfgIns.instructions));
   check('an empty instructions value becomes null', loadConfig(writeConfig('cfg-ins-empty.json', { ...baseConfig(1), instructions: '  ' })).config.instructions === null, 'not null');
   check('/config view flattens instructions to one line', maskConfig(cfgIns).instructions === 'line one line two', JSON.stringify(maskConfig(cfgIns).instructions));
+
+  /* ---------------- 0e. command gate (shell commands that duplicate a tool) ---------------- */
+  console.log('\n[command gate]');
+  const { gateCommand, gateMessage, normalizeGateMode, GATE_MODES } = await import(pathToFileURL(path.join(proj, 'lib', 'gate.js')).href);
+
+  const gated = (cmd) => gateCommand(cmd);
+  check('grep is sent to search_files', gated('grep -rn needle src/')?.tool === 'search_files', JSON.stringify(gated('grep -rn needle src/')));
+  check('ripgrep and friends too', ['rg x', 'ag x', 'ack x', 'fd x', '/usr/bin/egrep x'].every((c) => gated(c)?.tool === 'search_files'), 'missed one');
+  check('find -name is a search', gated('find . -name "*.js"')?.tool === 'search_files', JSON.stringify(gated('find . -name "*.js"')));
+  check('find -exec is a real command, not a search', gated('find . -name "*.tmp" -delete') === null && gated('find . -name x -exec rm {} ;') === null, 'wrongly gated');
+  check('find without a name filter is untouched', gated('find . -newer x') === null, 'wrongly gated');
+  check('cat of a file is sent to read_file', gated('cat src/app.js')?.tool === 'read_file', JSON.stringify(gated('cat src/app.js')));
+  check('head/tail/less/bat too', ['head -n 5 a.js', 'tail -n 5 a.js', 'less a.js', 'bat a.js'].every((c) => gated(c)?.tool === 'read_file'), 'missed one');
+  check('cat in a pipeline is a computation, not a dump', gated('cat a.js | wc -l')?.tool !== 'read_file', JSON.stringify(gated('cat a.js | wc -l')));
+  check('cat from stdin is not a file read', gated('cat') === null && gated('cat -') === null, 'wrongly gated');
+  check('tail -f is left to the non-interactive rule', gated('tail -f app.log') === null, 'wrongly gated');
+  check('sed -i is sent to edit_file', gated('sed -i s/a/b/ f.js')?.tool === 'edit_file', JSON.stringify(gated('sed -i s/a/b/ f.js')));
+  check('perl -pi is sent to edit_file', gated('perl -pi -e s/a/b/ f.js')?.tool === 'edit_file', JSON.stringify(gated('perl -pi -e s/a/b/ f.js')));
+  check('sed without -i only reads a stream', gated("sed -n '1,5p' f.js") === null, 'wrongly gated');
+  check('every segment of a chain is checked', gated('npm run build && grep -r x .')?.tool === 'search_files', 'chain not scanned');
+  check('an env prefix does not hide the command', gated('FOO=1 grep x .')?.tool === 'search_files', 'prefix hid it');
+  check('builds, tests, git and package managers pass', ['npm test', 'git status', 'make -j4', 'node x.js', 'ls -la', 'echo hi', 'wc -l *.js'].every((c) => gated(c) === null), 'over-eager gate');
+  check('an empty command is not gated', gated('') === null && gated('   ') === null, 'wrongly gated');
+  check('the refusal names the tool to use instead', /search_files/.test(gateMessage(gated('grep x .'))) && /refused/.test(gateMessage(gated('grep x .'))), gateMessage(gated('grep x .')));
+  check('the refusal points at the escape hatch', /commandGate/.test(gateMessage(gated('grep x .'))), gateMessage(gated('grep x .')));
+  check('warn mode phrases it as a note', /^Note:/.test(gateMessage(gated('grep x .'), { blocked: false })), gateMessage(gated('grep x .'), { blocked: false }));
+  check('three gate modes, enforce by default', GATE_MODES.join(',') === 'enforce,warn,off' && normalizeGateMode(undefined) === 'enforce' && normalizeGateMode('OFF') === 'off' && normalizeGateMode('nonsense') === 'enforce', JSON.stringify(GATE_MODES));
+
+  // through run_command, with the config switch
+  const gateDir = path.join(tmp, 'gate');
+  fs.mkdirSync(gateDir, { recursive: true });
+  fs.writeFileSync(path.join(gateDir, 'hay.txt'), 'a needle in here\n');
+  const gateCfg = (mode) => ({ workspace: gateDir, commandTimeout: 15, commandGate: mode });
+  let gateTools = createTools(gateCfg('enforce'));
+  let gr = await gateTools.execute('run_command', { command: 'grep -r needle .' });
+  check('enforce: run_command refuses the grep', gr.startsWith('Error: run_command refused') && gr.includes('search_files'), gr);
+  check('enforce: the command really did not run', !gr.includes('hay.txt:'), gr);
+  gateTools = createTools(gateCfg('warn'));
+  gr = await gateTools.execute('run_command', { command: 'grep -r needle .' });
+  check('warn: the command runs but the note is attached', gr.startsWith('Note:') && gr.includes('exit code: 0'), gr);
+  gateTools = createTools(gateCfg('off'));
+  gr = await gateTools.execute('run_command', { command: 'grep -r needle .' });
+  check('off: nothing is added', !gr.startsWith('Note:') && gr.includes('exit code: 0'), gr);
+  check('the run_command description warns about it', createTools(gateCfg('enforce')).listTools().find((t) => t.name === 'run_command').description.includes('are refused'), 'description silent');
+
+  /* ---------------- 0e-bis. .llmignore (never send this to a model) ---------------- */
+  console.log('\n[.llmignore]');
+  const secretDir = path.join(tmp, 'secrets-proj');
+  fs.mkdirSync(path.join(secretDir, 'sub'), { recursive: true });
+  // "fixtures/" excludes the directory itself, so git (and we) never descend
+  // into it and a negation inside cannot bring anything back. "data/*" matches
+  // the entries instead, which is how a re-include is written.
+  fs.writeFileSync(path.join(secretDir, '.llmignore'), '.env\n*.pem\nfixtures/\ndata/*\n!data/public.json\n');
+  fs.writeFileSync(path.join(secretDir, '.env'), 'API_KEY=supersecret-needle\n');
+  fs.writeFileSync(path.join(secretDir, 'key.pem'), 'PRIVATE-needle\n');
+  fs.writeFileSync(path.join(secretDir, 'app.js'), 'const x = "needle";\n');
+  fs.mkdirSync(path.join(secretDir, 'fixtures'), { recursive: true });
+  fs.writeFileSync(path.join(secretDir, 'fixtures', 'big.json'), '{"needle":1}\n');
+  fs.mkdirSync(path.join(secretDir, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(secretDir, 'data', 'private.json'), '{"needle":3}\n');
+  fs.writeFileSync(path.join(secretDir, 'data', 'public.json'), '{"needle":2}\n');
+  fs.writeFileSync(path.join(secretDir, 'sub', '.llmignore'), 'local.txt\n');
+  fs.writeFileSync(path.join(secretDir, 'sub', 'local.txt'), 'needle-local\n');
+  fs.writeFileSync(path.join(secretDir, 'sub', 'ok.txt'), 'needle-ok\n');
+
+  const secretTools = createTools({ workspace: secretDir, commandTimeout: 15 });
+  let sr = await secretTools.execute('search_files', { pattern: 'needle' });
+  check('search skips .llmignore paths', !sr.includes('.env') && !sr.includes('key.pem') && !sr.includes('big.json'), sr);
+  check('search still finds normal files', sr.includes('app.js') && sr.includes('ok.txt'), sr);
+  check('a nested .llmignore applies to its own directory', !sr.includes('local.txt'), sr);
+  check('an excluded directory is pruned whole', !sr.includes('big.json'), sr);
+  check('"!" re-includes a file its siblings excluded', sr.includes(path.join('data', 'public.json')) && !sr.includes('private.json'), sr);
+  sr = await secretTools.execute('search_files', { pattern: 'needle', include_ignored: true });
+  check('include_ignored does not lift .llmignore', !sr.includes('.env') && !sr.includes('key.pem'), sr);
+  sr = await secretTools.execute('read_file', { path: '.env' });
+  check('read_file refuses an .llmignore path', sr.startsWith('Error:') && sr.includes('.llmignore'), sr);
+  check('the refusal explains itself', /must not be sent to a model/.test(sr), sr);
+  sr = await secretTools.execute('read_file', { path: 'sub/local.txt' });
+  check('read_file honours a nested .llmignore', sr.startsWith('Error:') && sr.includes('.llmignore'), sr);
+  sr = await secretTools.execute('read_file', { path: 'data/public.json' });
+  check('read_file allows a re-included file', sr.includes('"needle":2'), sr);
+  sr = await secretTools.execute('read_file', { path: 'data/private.json' });
+  check('read_file refuses its excluded sibling', sr.startsWith('Error:') && sr.includes('.llmignore'), sr);
+  sr = await secretTools.execute('read_file', { path: 'app.js' });
+  check('read_file is otherwise unaffected', sr.includes('const x'), sr);
+  const plainDir = path.join(tmp, 'no-llmignore');
+  fs.mkdirSync(plainDir, { recursive: true });
+  fs.writeFileSync(path.join(plainDir, '.env'), 'NOT_SECRET=1\n');
+  check(
+    'without an .llmignore nothing changes',
+    (await createTools({ workspace: plainDir, commandTimeout: 15 }).execute('read_file', { path: '.env' })).includes('NOT_SECRET'),
+    'read refused'
+  );
+
+  /* ---------------- 0e-ter. token estimates calibrated against the server ---------------- */
+  console.log('\n[token calibration]');
+  const { estimateTokens, estimatePromptTokens, rawEstimateTokens, calibrateTokens, tokenCalibration, resetTokenCalibration } =
+    await import(pathToFileURL(path.join(proj, 'lib', 'llm.js')).href);
+  resetTokenCalibration();
+  const tkMsgs = (n) => [{ role: 'user', content: 'x'.repeat(n) }];
+  check('uncalibrated, the estimate is the old chars/4 guess', estimateTokens(tkMsgs(4000)) === rawEstimateTokens(tkMsgs(4000)), 'drifted');
+  check('uncalibrated, there is no request overhead', estimatePromptTokens(tkMsgs(4000)) === estimateTokens(tkMsgs(4000)), 'overhead appeared');
+  // a server whose tokenizer charges ~1.5x, plus ~600 tokens of tool schemas
+  for (const chars of [2000, 8000, 20000, 35000, 50000]) {
+    const m = tkMsgs(chars);
+    calibrateTokens(m, Math.round(rawEstimateTokens(m) * 1.5) + 600);
+  }
+  const f = tokenCalibration();
+  check('the scale is recovered from the samples', Math.abs(f.scale - 1.5) < 0.05, JSON.stringify(f));
+  check('the fixed per-request overhead is recovered too', Math.abs(f.offset - 600) < 60, JSON.stringify(f));
+  check('the calibrated estimate tracks the server', Math.abs(estimatePromptTokens(tkMsgs(12000)) - (rawEstimateTokens(tkMsgs(12000)) * 1.5 + 600)) < 80, String(estimatePromptTokens(tkMsgs(12000))));
+  check('subsets carry no request overhead', estimateTokens(tkMsgs(12000)) < estimatePromptTokens(tkMsgs(12000)), 'offset leaked into the subset estimate');
+  check('an empty message list is zero either way', estimateTokens([]) === 0 && estimatePromptTokens([]) === 0, 'not zero');
+  resetTokenCalibration();
+  check('reset returns to the identity fit', tokenCalibration().samples === 0 && estimateTokens(tkMsgs(1000)) === rawEstimateTokens(tkMsgs(1000)), JSON.stringify(tokenCalibration()));
+  // a server that reports a constant (or nonsense) must never shrink the estimate
+  for (let i = 1; i <= 10; i++) calibrateTokens(tkMsgs(i * 4000), 111);
+  check('implausible samples are ignored', tokenCalibration().samples === 0, JSON.stringify(tokenCalibration()));
+  resetTokenCalibration();
+  for (const chars of [2000, 8000, 20000, 35000]) calibrateTokens(tkMsgs(chars), Math.round(rawEstimateTokens(tkMsgs(chars)) * 0.6));
+  check('calibration never revises the estimate downward', estimateTokens(tkMsgs(9000)) >= rawEstimateTokens(tkMsgs(9000)), JSON.stringify(tokenCalibration()));
+  resetTokenCalibration();
 
   /* ---------------- 0f. plan mode (read-only research, then approval) ---------------- */
   console.log('\n[plan mode]');
@@ -750,7 +896,9 @@ async function main() {
   check('shows user message', res.out.includes('You'), res.out);
   check('shows tool write_file', res.out.includes('write_file'), res.out);
   check('shows tool run_command', res.out.includes('run_command'), res.out);
-  check('shows tool result (cat output)', res.out.includes('harness-ok'), res.out);
+  check('shows tool result (the file read back)', res.out.includes('# hello-harness.txt — lines 1-1 of 1'), res.out);
+  check('the model receives the file it wrote', res.out.includes('MOCK-DONE file=harness-ok'), res.out);
+  check('the command gate reaches the model mid-conversation', res.out.includes('gate=refused'), res.out);
   check('shows final assistant reply', res.out.includes('MOCK-DONE'), res.out);
   check('file actually written in workspace', fs.readFileSync(path.join(workB, 'hello-harness.txt'), 'utf8') === 'harness-ok');
   check('shows a progress line while waiting', res.out.includes('thinking…'), res.out);
@@ -916,6 +1064,95 @@ async function main() {
   check('--plan starts the session in plan mode', res.code === 0 && res.out.includes('read-only: research'), res.out);
   check('--plan produces a plan', res.out.includes('Add the probe file'), res.out);
   check('--plan leaves the workspace untouched', !fs.existsSync(path.join(workPlanOnce, 'plan-probe.txt')), 'the workspace was modified');
+
+  /* ---------------- 3b3. delegation (isolated subagent contexts) ---------------- */
+  console.log('\n[delegation]');
+  const {
+    normalizeDelegation,
+    DELEGATION_MODES,
+    SUBAGENTS,
+    SUBAGENT_EXCLUDED,
+    subagentPrompt,
+    subagentBrief,
+    delegationBlock,
+  } = await import(pathToFileURL(path.join(proj, 'lib', 'delegate.js')).href);
+
+  check('three modes, off by default', DELEGATION_MODES.join(',') === 'off,optional,enforced' && normalizeDelegation(undefined) === 'off' && normalizeDelegation('nonsense') === 'off', JSON.stringify(DELEGATION_MODES));
+  check('mode aliases resolve', normalizeDelegation('ON') === 'optional' && normalizeDelegation('required') === 'enforced' && normalizeDelegation(false) === 'off', 'bad aliases');
+  check('config carries the mode through', loadConfig(writeConfig('cfg-del.json', { ...baseConfig(1), delegation: 'enforced' })).config.delegation === 'enforced' && loadConfig(writeConfig('cfg-del2.json', baseConfig(1))).config.delegation === 'off', 'not carried');
+  check('subagentMaxSteps is validated', loadConfig(writeConfig('cfg-del3.json', { ...baseConfig(1), subagentMaxSteps: 0 })).config.subagentMaxSteps === 25 && loadConfig(writeConfig('cfg-del4.json', { ...baseConfig(1), subagentMaxSteps: 7 })).config.subagentMaxSteps === 7, 'not validated');
+  check('subagents cannot delegate or plan', SUBAGENT_EXCLUDED.includes('delegate') && SUBAGENT_EXCLUDED.includes('present_plan'), JSON.stringify(SUBAGENT_EXCLUDED));
+  check('the researcher is read-only and the coder is not', SUBAGENTS.researcher.readOnly === true && SUBAGENTS.coder.readOnly === false, 'wrong flags');
+  const coderSys = subagentPrompt('coder', { cwd: '/w', platform: 'p', date: '2025-01-02' });
+  const researchSys = subagentPrompt('researcher', { cwd: '/w', platform: 'p', date: '2025-01-02' });
+  check('each subagent prompt states its report format', /# Your report/.test(coderSys) && /# Your report/.test(researchSys), coderSys.slice(0, 200));
+  check('the coder is told its context is discarded', /context is discarded/.test(coderSys) && /sees nothing else/.test(coderSys), coderSys);
+  check('the researcher is told not to design the change', /Do not design the change/.test(researchSys), researchSys);
+  check('subagent prompts stay small', coderSys.length < 2600 && researchSys.length < 2600, `coder ${coderSys.length} / researcher ${researchSys.length}`);
+  check('an unknown subagent type is rejected', (() => { try { subagentPrompt('wizard', { cwd: '/w', platform: 'p' }); return false; } catch { return true; } })(), 'accepted');
+  const brief = subagentBrief({ goal: 'G', files: ['a.js', 'b.js'], context: 'C' });
+  check('the brief carries goal, files and context', /# Task\nG/.test(brief) && brief.includes('- a.js') && brief.includes('C'), brief);
+  check('the brief tells it not to trust the file list blindly', /Verify them yourself/.test(brief), brief);
+  check('enforced mode says the editors are gone', /write_file and edit_file are not available to you/.test(delegationBlock('enforced')), delegationBlock('enforced'));
+  check('optional mode keeps it a judgement call', /Do the small and cheap things yourself/.test(delegationBlock('optional')), delegationBlock('optional'));
+
+  // end to end: the subagent's work never enters the caller's transcript
+  const delDir = path.join(tmp, 'delegate-work');
+  fs.mkdirSync(delDir, { recursive: true });
+  const cfgDel = writeConfig('cfg-delegate.json', { ...baseConfig(port), workspace: delDir, delegation: 'optional' });
+  let dres = await run(process.execPath, [harness, '--config', cfgDel, '--no-stream', '--once', 'DELEGATE-ME please'], { cwd: delDir });
+  check('delegate runs and the caller sees the report', dres.out.includes('MOCK-DONE delegated=report-seen'), dres.out);
+  check('the subagent actually changed the workspace', fs.existsSync(path.join(delDir, 'delegated.txt')) && fs.readFileSync(path.join(delDir, 'delegated.txt'), 'utf8').trim() === 'written-by-subagent', 'file missing');
+  check('a subagent cannot spawn a subagent', dres.out.includes('Recursion: refused'), dres.out);
+  check('the run is visible while it happens', dres.out.includes('coder subagent'), dres.out);
+  check('the handover is accounted for', /subagent done — \d+ step\(s\)/.test(dres.out), dres.out);
+  check('the discarded context is reported to the user', /tokens discarded/.test(dres.out), dres.out);
+  check('the report reaches the model with its provenance', dres.out.includes('head=yes'), dres.out);
+
+  // the researcher really is read-only
+  dres = await run(process.execPath, [harness, '--config', cfgDel, '--no-stream', '--once', 'RESEARCH-ME please'], { cwd: delDir });
+  check('a researcher cannot write files', dres.out.includes('write=refused'), dres.out);
+  check('a researcher cannot run a mutating command', dres.out.includes('command=refused'), dres.out);
+  check('the researcher still reports back', dres.out.includes('MOCK-DONE researched='), dres.out);
+  check('the researcher left nothing behind', !fs.existsSync(path.join(delDir, 'research-probe.txt')), 'file created');
+
+  // delegation off: the tool is not offered at all
+  const cfgNoDel = writeConfig('cfg-nodelegate.json', { ...baseConfig(port), workspace: delDir });
+  const res0 = await runWithInput([harness, '--config', cfgNoDel, '--no-stream'], '/tools\n/exit\n', { cwd: delDir });
+  dres = res0;
+  const listsDelegate = (out) => /^\s{2}delegate\s{2,}Run part of this task/m.test(out);
+  check('delegation off: no delegate tool', !listsDelegate(dres.out), dres.out);
+  dres = await runWithInput([harness, '--config', cfgDel, '--no-stream'], '/tools\n/exit\n', { cwd: delDir });
+  check('delegation on: the tool is listed', listsDelegate(dres.out), dres.out);
+  check('delegation on: the banner advertises the mode', /^\s{2}delegate\s{2,}optional/m.test(dres.out), dres.out);
+  check('delegation off: the banner stays quiet', !/^\s{2}delegate\s{2,}(optional|enforced)/m.test(res0.out), res0.out);
+
+  // enforced: the main agent physically loses the editors
+  const enfDir = path.join(tmp, 'delegate-enforced');
+  fs.mkdirSync(enfDir, { recursive: true });
+  const cfgEnf = writeConfig('cfg-enforced.json', { ...baseConfig(port), workspace: enfDir, delegation: 'enforced' });
+  dres = await runWithInput([harness, '--config', cfgEnf, '--no-stream'], '/tools\n/exit\n', { cwd: enfDir });
+  check('enforced: the tool list still shows the readers', dres.out.includes('read_file') && dres.out.includes('search_files'), dres.out);
+  // /tools mirrors what the model is offered, so the editors must be absent from the listing
+  check('enforced: /tools hides the editors', !/^\s{2}write_file\s{2,}Create or overwrite/m.test(dres.out), dres.out);
+  check('enforced: /tools explains where the editors went', dres.out.includes('belong to the coder subagent'), dres.out);
+  check('enforced: the banner advertises the mode', /^\s{2}delegate\s{2,}enforced/m.test(dres.out), dres.out);
+  dres = await run(process.execPath, [harness, '--config', cfgEnf, '--no-stream', '--once', 'ENFORCED-ME please'], { cwd: enfDir });
+  check('enforced: a write_file call from memory is refused', dres.out.includes('MOCK-DONE enforced=refused'), dres.out);
+  check('enforced: nothing was written', !fs.existsSync(path.join(enfDir, 'forbidden.txt')), 'file created');
+
+  // the system prompt tells the model which regime it is in
+  const delCfgObj = loadConfig(cfgDel).config;
+  const delAgent = createAgent({ config: delCfgObj, builtins: createTools(delCfgObj), mcp: null });
+  check('optional mode is described in the system prompt', delAgent.history[0].content.includes('# Delegation') && !delAgent.history[0].content.includes('# Delegation (enforced)'), 'missing block');
+  check('the delegation block sits after the environment', delAgent.history[0].content.indexOf('# Environment') < delAgent.history[0].content.indexOf('# Delegation'), 'prefix polluted');
+  const enfCfgObj = loadConfig(cfgEnf).config;
+  const enfAgent = createAgent({ config: enfCfgObj, builtins: createTools(enfCfgObj), mcp: null });
+  check('enforced mode is described in the system prompt', enfAgent.history[0].content.includes('# Delegation (enforced)'), 'missing block');
+  check('enforced: the editors are not offered to the model', !enfAgent.tools().some((t) => ['write_file', 'edit_file'].includes(t.name)) && enfAgent.tools().some((t) => t.name === 'delegate'), enfAgent.tools().map((t) => t.name).join(','));
+  const offCfgObj = loadConfig(cfgNoDel).config;
+  const offAgent = createAgent({ config: offCfgObj, builtins: createTools(offCfgObj), mcp: null });
+  check('off: no delegation block and the editors are back', !offAgent.history[0].content.includes('# Delegation') && offAgent.tools().some((t) => t.name === 'write_file'), 'wrong tools');
 
   /* ---------------- 3c. automatic compaction ---------------- */
   console.log('\n[auto-compaction]');
