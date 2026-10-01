@@ -18,6 +18,11 @@ node harness.js             # start chatting
 Everything lives in one JSON file in the user's home directory: `~/.coding-harness/config.json`
 (override the path with `--config <path>`).
 
+An existing config file is **upgraded in place** on startup: keys added by a newer version are
+appended at their defaults, your values are never touched, and keys the harness does not recognise
+are kept. The banner names what it added (`config  …/config.json  (added commandGate, delegation,
+subagentMaxSteps)`) so a new setting does not stay invisible just because your file predates it.
+
 ```json
 {
   "openai": {
@@ -470,7 +475,11 @@ that was never finished is still sent when the input ends (piped scripts, Ctrl+D
 
 ## Session commands
 
-`/help` `/config` `/tools` `/set dir <path>` `/set prompt <full|compact>` `/cwd` `/usage` `/compact` `/reset` (clear conversation) `/export <file>` (save chat) `/import <file>` (load chat) `/clear` (clear screen) `/exit`
+`/help` `/config` `/tools` `/set dir <path>` `/set prompt <full|compact>` `/set gate <enforce|warn|off>` `/set delegation <off|optional|enforced>` `/cwd` `/usage` `/compact` `/reset` (clear conversation) `/export <file>` (save chat) `/import <file>` (load chat) `/clear` (clear screen) `/exit`
+
+`/set gate` and `/set delegation` change the config for the running session only (the file is not
+rewritten) and take effect immediately — switching delegation to `enforced` removes `write_file` and
+`edit_file` from the model's tool list mid-conversation, and the model is told why.
 
 Plan first: `/plan <task>` `/plan show` `/approve [note]` `/plan off` (see [Plan mode](#plan-mode)).
 

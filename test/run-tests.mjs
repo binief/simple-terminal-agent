@@ -1154,6 +1154,51 @@ async function main() {
   const offAgent = createAgent({ config: offCfgObj, builtins: createTools(offCfgObj), mcp: null });
   check('off: no delegation block and the editors are back', !offAgent.history[0].content.includes('# Delegation') && offAgent.tools().some((t) => t.name === 'write_file'), 'wrong tools');
 
+  // switching mid-session: the tool list and the system prompt both have to follow
+  check('setDelegation reports the new mode', offAgent.setDelegation('enforced') === 'enforced' && offAgent.delegation === 'enforced', offAgent.delegation);
+  check('switching on registers the delegate tool', offAgent.tools().some((t) => t.name === 'delegate'), offAgent.tools().map((t) => t.name).join(','));
+  check('switching to enforced removes the editors', !offAgent.tools().some((t) => ['write_file', 'edit_file'].includes(t.name)), offAgent.tools().map((t) => t.name).join(','));
+  check('switching rebuilds the system prompt', offAgent.history[0].content.includes('# Delegation (enforced)'), 'block missing');
+  // a note is only worth injecting into a conversation in progress (same rule as /set dir)
+  check('a fresh conversation gets no switch note', offAgent.history.length === 1, JSON.stringify(offAgent.history.length));
+  offAgent.history.push({ role: 'user', content: 'start a conversation' });
+  offAgent.setDelegation('off');
+  check('an in-flight conversation is told about the switch', String(offAgent.history.at(-1).content).includes('Delegation is off'), JSON.stringify(offAgent.history.at(-1)));
+  offAgent.setDelegation('enforced');
+  offAgent.setDelegation('optional');
+  check('optional restores the editors and keeps delegate', offAgent.tools().some((t) => t.name === 'write_file') && offAgent.tools().some((t) => t.name === 'delegate'), offAgent.tools().map((t) => t.name).join(','));
+  offAgent.setDelegation('off');
+  check('switching off hides the delegate tool again', !offAgent.tools().some((t) => t.name === 'delegate'), offAgent.tools().map((t) => t.name).join(','));
+  check('switching off restores the editors', offAgent.tools().some((t) => t.name === 'write_file'), 'editors missing');
+  check('switching off drops the delegation block', !offAgent.history[0].content.includes('# Delegation'), 'block still there');
+  check('an unknown mode is not silently accepted as a new mode', offAgent.setDelegation('off') === 'off', 'changed');
+  // registering twice would throw; make sure the on/off cycle is repeatable
+  offAgent.setDelegation('optional');
+  offAgent.setDelegation('off');
+  offAgent.setDelegation('enforced');
+  check('the on/off cycle is repeatable', offAgent.delegation === 'enforced' && offAgent.tools().some((t) => t.name === 'delegate'), 'tool lost');
+
+  // /set gate and /set delegation from the prompt
+  const setRes = await runWithInput(
+    [harness, '--config', cfgNoDel, '--no-stream'],
+    '/set gate\n/set gate warn\n/set gate nonsense\n/set delegation\n/set delegation enforced\n/tools\n/set delegation off\n/tools\n/exit\n',
+    { cwd: delDir }
+  );
+  check('/set gate with no value reports the mode', setRes.out.includes('command gate: enforce (one of enforce, warn, off)'), setRes.out);
+  check('/set gate switches the mode', setRes.out.includes('command gate: warn'), setRes.out);
+  check('/set gate rejects an unknown mode', setRes.out.includes('unknown gate mode "nonsense"'), setRes.out);
+  check('/set delegation with no value reports the mode', setRes.out.includes('delegation: off (one of off, optional, enforced)'), setRes.out);
+  check('/set delegation enforced takes effect', setRes.out.includes('write_file and edit_file now belong to the coder subagent'), setRes.out);
+  const afterEnforced = setRes.out.slice(setRes.out.indexOf('now belong to the coder subagent'));
+  const afterOff = afterEnforced.slice(afterEnforced.indexOf('the delegate tool is hidden again'));
+  check('/tools follows the switch to enforced', /^\s{2}delegate\s/m.test(afterEnforced) && !/^\s{2}write_file\s/m.test(afterEnforced.slice(0, afterEnforced.indexOf('hidden again'))), afterEnforced.slice(0, 400));
+  check('/tools follows the switch back to off', /^\s{2}write_file\s/m.test(afterOff) && !/^\s{2}delegate\s/m.test(afterOff), afterOff.slice(0, 400));
+  const helpRes = await runWithInput([harness, '--config', cfgNoDel, '--no-stream'], '/help\n/exit\n', { cwd: delDir });
+  check('/help documents /set gate', helpRes.out.includes('/set gate <mode>') && helpRes.out.includes('enforce (default), warn, off'), helpRes.out);
+  check('/help documents /set delegation', helpRes.out.includes('/set delegation') && helpRes.out.includes('off (default), optional, enforced'), helpRes.out);
+  check('/help points at the config file and .llmignore', helpRes.out.includes('subagentMaxSteps') && helpRes.out.includes('.llmignore'), helpRes.out);
+  check('/help keeps its description column aligned', [...helpRes.out.matchAll(/^ {4}\/set \S+.*$/gm)].every((m) => / {2}\S/.test(m[0].slice(19))), helpRes.out);
+
   /* ---------------- 3c. automatic compaction ---------------- */
   console.log('\n[auto-compaction]');
   // createAgent was imported with the system-prompt section above
@@ -1241,6 +1286,73 @@ async function main() {
   check('the refusal is reported honestly', captured.includes('would not free anything') && !captured.includes('compacted conversation'), captured.slice(0, 300));
   check('the raw history survives a refused compaction', JSON.stringify(agentNoGain.history) === historyBefore, 'history was replaced');
   check('a refused compaction is not counted', agentNoGain.stats().compactions === 0, JSON.stringify(agentNoGain.stats().compactions));
+
+  /* ---------------- 3b4. config migration (old files learn new keys) ---------------- */
+  console.log('\n[config migration]');
+  const { DEFAULT_CONFIG } = await import(pathToFileURL(path.join(proj, 'lib', 'config.js')).href);
+
+  // a config written before these keys existed: values kept, keys added
+  const oldPath = path.join(tmp, 'cfg-old.json');
+  fs.writeFileSync(
+    oldPath,
+    JSON.stringify(
+      {
+        _readme: 'stale text from an older version',
+        openai: { baseURL: 'http://127.0.0.1:1/v1', apiKey: 'sk-mine', model: 'my-model' },
+        contextSize: 32000,
+        temperature: 0.7,
+        myOwnNote: 'please keep me',
+        mcp: { servers: {} },
+      },
+      null,
+      2
+    )
+  );
+  const migrated = loadConfig(oldPath);
+  const onDisk = JSON.parse(fs.readFileSync(oldPath, 'utf8'));
+  check('migration reports the keys it added', migrated.added.includes('delegation') && migrated.added.includes('commandGate') && migrated.added.includes('subagentMaxSteps'), JSON.stringify(migrated.added));
+  check('the new keys are written to the file', onDisk.delegation === 'off' && onDisk.commandGate === 'enforce' && onDisk.subagentMaxSteps === 25, JSON.stringify(onDisk));
+  check('migration never changes an existing value', onDisk.contextSize === 32000 && onDisk.temperature === 0.7 && onDisk.openai.apiKey === 'sk-mine' && onDisk.openai.model === 'my-model', JSON.stringify(onDisk));
+  check('migration keeps keys it does not know about', onDisk.myOwnNote === 'please keep me', JSON.stringify(onDisk));
+  check('migration refreshes the stale _readme', onDisk._readme === DEFAULT_CONFIG._readme, String(onDisk._readme).slice(0, 60));
+  check('migrated keys land in the documented order', Object.keys(onDisk).indexOf('delegation') > Object.keys(onDisk).indexOf('commandGate') && Object.keys(onDisk).indexOf('myOwnNote') === Object.keys(onDisk).length - 1, Object.keys(onDisk).join(','));
+  check('the migrated file still loads to the same values', migrated.config.contextSize === 32000 && migrated.config.delegation === 'off', JSON.stringify(migrated.config.contextSize));
+
+  // a second load has nothing to do: no rewrite, nothing reported
+  const beforeMtime = fs.statSync(oldPath).mtimeMs;
+  const beforeText = fs.readFileSync(oldPath, 'utf8');
+  await new Promise((r) => setTimeout(r, 15));
+  const again = loadConfig(oldPath);
+  check('a current config is not reported as migrated', again.added.length === 0, JSON.stringify(again.added));
+  check('a current config file is not rewritten', fs.statSync(oldPath).mtimeMs === beforeMtime && fs.readFileSync(oldPath, 'utf8') === beforeText, 'file touched');
+
+  // a freshly created config is already current
+  const freshPath = path.join(tmp, 'cfg-fresh-migrate.json');
+  const fresh = loadConfig(freshPath);
+  check('a created config reports no migration', fresh.created === true && fresh.added.length === 0, JSON.stringify(fresh.added));
+  check('a created config already has the new keys', JSON.parse(fs.readFileSync(freshPath, 'utf8')).delegation === 'off', 'missing');
+
+  // broken JSON is still a hard error, not a silent rewrite
+  const brokenPath = path.join(tmp, 'cfg-broken.json');
+  fs.writeFileSync(brokenPath, '{ not json');
+  let brokeMsg = '';
+  try {
+    loadConfig(brokenPath);
+  } catch (e) {
+    brokeMsg = e.message;
+  }
+  check('an unparseable config still fails loudly', brokeMsg.includes('failed to parse'), brokeMsg);
+  check('an unparseable config is left untouched', fs.readFileSync(brokenPath, 'utf8') === '{ not json', 'file was rewritten');
+
+  // the banner tells the user, so the new keys are discoverable
+  const migPath = path.join(tmp, 'cfg-banner-migrate.json');
+  // complete except for the three keys this release added — the realistic upgrade
+  const { commandGate, delegation: _d, subagentMaxSteps, ...noNewKeys } = { ...DEFAULT_CONFIG, ...baseConfig(port), workspace: delDir };
+  fs.writeFileSync(migPath, JSON.stringify(noNewKeys, null, 2));
+  const migRes = await runWithInput([harness, '--config', migPath, '--no-stream'], '/exit\n', { cwd: delDir });
+  check('the banner names the keys that were added', migRes.out.includes('added commandGate, delegation, subagentMaxSteps'), migRes.out.slice(0, 400));
+  const migRes2 = await runWithInput([harness, '--config', migPath, '--no-stream'], '/exit\n', { cwd: delDir });
+  check('the banner stays quiet on the next run', !migRes2.out.includes('added commandGate'), migRes2.out.slice(0, 400));
 
   /* ---------------- 3d. cut-off recovery (truncation, step limit, retries) ---------------- */
   console.log('\n[cut-off recovery]');

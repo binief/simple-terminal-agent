@@ -13,6 +13,8 @@ import { connectMcpServers } from './lib/mcp.js';
 import { createAgent } from './lib/agent.js';
 import { createInputReader } from './lib/input.js';
 import { matchPromptStyle, PROMPT_STYLES } from './lib/prompt.js';
+import { GATE_MODES } from './lib/gate.js';
+import { DELEGATION_MODES, normalizeDelegation } from './lib/delegate.js';
 import * as ui from './lib/ui.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -25,6 +27,8 @@ const HELP = `
     /tools             list available tools
     /set dir <path>    change the working directory (file tools + commands run there)
     /set prompt <s>    system prompt style: full (default) or compact (~790 vs ~2.2k tokens)
+    /set gate <mode>   run_command gate: enforce (default), warn, off — redirects grep/cat/sed -i
+    /set delegation    subagent delegation: off (default), optional, enforced
     /cwd               show the current working directory
     /usage             token usage, speed and context fill for this session
     /compact           summarize the conversation to free context (also automatic)
@@ -43,6 +47,10 @@ const HELP = `
     Shift+Enter / Alt+Enter  same, in terminals that report them as ESC+CR
     pasting several lines    becomes one draft
     plain Enter              sends the whole draft (Ctrl+C discards it)
+
+  Config file (all of the above persist there, plus contextSize, maxSteps, searchIgnore,
+  subagentMaxSteps, instructions, mcp.servers, …) — /config shows the effective values.
+  A .llmignore file in the workspace hides paths from read_file and search_files entirely.
 
   Anything else is sent to the model as a chat message.
   CLI flags: --config <path>  --dir <path>  --once "<prompt>"  --plan  --stream | --no-stream  --model <name>  --prompt <full|compact>  --init
@@ -109,12 +117,12 @@ async function main() {
   }
 
   const configPath = opts.config ? path.resolve(opts.config) : DEFAULT_CONFIG_PATH;
-  let config, created;
+  let config, created, added;
   try {
     if (opts.promptStyle && !matchPromptStyle(opts.promptStyle)) {
       throw new Error(`--prompt: unknown style "${opts.promptStyle}" — use ${PROMPT_STYLES.join(' or ')}`);
     }
-    ({ config, created } = loadConfig(configPath, {
+    ({ config, created, added } = loadConfig(configPath, {
       streaming: opts.streaming,
       model: opts.model,
       promptStyle: opts.promptStyle ? matchPromptStyle(opts.promptStyle) : null,
@@ -127,6 +135,8 @@ async function main() {
   if (opts.init) {
     ui.out(`config ${created ? 'created' : 'already exists'} at ${configPath}`);
     if (created) ui.out('edit openai.baseURL / openai.apiKey / openai.model, then run: node harness.js');
+    // an existing file is brought up to date rather than left behind
+    if (added?.length) ui.out(`added missing key(s) at their defaults: ${added.join(', ')}`);
     return;
   }
 
@@ -169,6 +179,7 @@ async function main() {
     mcp: mcp.size ? mcp.describe() : null,
     planning: builtins.plan.planning,
     delegation: agent.delegation,
+    configAdded: added,
   });
 
   if (!config.openai.apiKey || config.openai.apiKey === 'sk-REPLACE_ME') {
@@ -295,8 +306,42 @@ async function main() {
             ui.printSystem(`system prompt style: ${style}`);
             break;
           }
+          if (key === 'gate' || key === 'commandgate') {
+            if (!value) {
+              ui.printSystem(`command gate: ${config.commandGate} (one of ${GATE_MODES.join(', ')})`);
+              break;
+            }
+            const mode = value.toLowerCase();
+            if (!GATE_MODES.includes(mode)) {
+              ui.printError(`unknown gate mode "${value}" — use ${GATE_MODES.join(', ')}`);
+              break;
+            }
+            // run_command reads config.commandGate on every call, so this needs no rebuild
+            config.commandGate = mode;
+            ui.printSystem(
+              `command gate: ${mode}${mode === 'off' ? ' — grep/cat/sed -i now run as typed' : mode === 'warn' ? ' — allowed, with a note' : ' — grep/cat/sed -i are redirected to the built-in tools'}`
+            );
+            break;
+          }
+          if (key === 'delegation' || key === 'delegate') {
+            if (!value) {
+              ui.printSystem(`delegation: ${agent.delegation} (one of ${DELEGATION_MODES.join(', ')})`);
+              break;
+            }
+            const mode = normalizeDelegation(value);
+            // normalizeDelegation falls back to "off", so reject a typo rather than silently disabling
+            if (!DELEGATION_MODES.includes(value.toLowerCase()) && mode === 'off' && value.toLowerCase() !== 'off') {
+              ui.printError(`unknown delegation mode "${value}" — use ${DELEGATION_MODES.join(', ')}`);
+              break;
+            }
+            const now = agent.setDelegation(mode);
+            ui.printSystem(
+              `delegation: ${now}${now === 'enforced' ? ' — write_file and edit_file now belong to the coder subagent' : now === 'optional' ? ' — the delegate tool is available' : ' — the delegate tool is hidden again'}`
+            );
+            break;
+          }
           if (key !== 'dir') {
-            ui.printError('usage: /set dir <path>   or   /set prompt <full|compact>');
+            ui.printError('usage: /set dir <path> | /set prompt <full|compact> | /set gate <enforce|warn|off> | /set delegation <off|optional|enforced>');
             break;
           }
           if (!value) {
