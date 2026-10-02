@@ -18,6 +18,11 @@ node harness.js             # start chatting
 Everything lives in one JSON file in the user's home directory: `~/.coding-harness/config.json`
 (override the path with `--config <path>`).
 
+An existing config file is **upgraded in place** on startup: keys added by a newer version are
+appended at their defaults, your values are never touched, and keys the harness does not recognise
+are kept. The banner names what it added (`config  …/config.json  (added commandGate, delegation,
+subagentMaxSteps)`) so a new setting does not stay invisible just because your file predates it.
+
 ```json
 {
   "openai": {
@@ -41,6 +46,9 @@ Everything lives in one JSON file in the user's home directory: `~/.coding-harne
   "planMode": false,
   "planAllowCommands": [],
   "planAllowTools": [],
+  "commandGate": "enforce",
+  "delegation": "off",
+  "subagentMaxSteps": 25,
   "mcp": {
     "servers": {}
   }
@@ -68,11 +76,14 @@ Everything lives in one JSON file in the user's home directory: `~/.coding-harne
 | `planMode` | `true` = start every session in plan mode (read-only research, see below). Default `false`. Also `--plan`. |
 | `planAllowCommands` | Extra commands `run_command` may run in plan mode: `["make"]` allows the command, `["npm test"]` allows exactly that prefix. Default `[]`. |
 | `planAllowTools` | MCP tools that stay available in plan mode (they are hidden by default because an MCP server can write anywhere): `["mcp_docs_search"]`. Default `[]`. |
+| `commandGate` | What to do when `run_command` is handed a job a built-in tool does better (`grep`, `cat`, `sed -i`, …): `enforce` (default — refuse and name the tool), `warn` (run it, prepend a note), `off`. See [The command gate](#the-command-gate). |
+| `delegation` | Subagent delegation: `off` (default — no `delegate` tool, the session behaves exactly as before), `optional` (the tool exists, the model chooses), `enforced` (the main agent loses `write_file`/`edit_file` and must delegate every edit). See [Delegation](#delegation-subagents). |
+| `subagentMaxSteps` | Max tool round-trips a single subagent may take before it has to report back. Default 25. |
 | `mcp.servers` | Named MCP servers (see below). |
 
 Env var overrides: `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL`,
 `HARNESS_STREAMING`, `HARNESS_CONTEXT_SIZE`, `HARNESS_TEMPERATURE`, `HARNESS_MAX_STEPS`,
-`HARNESS_PLAN_MODE`, `HARNESS_PROMPT_STYLE`.
+`HARNESS_PLAN_MODE`, `HARNESS_PROMPT_STYLE`, `HARNESS_COMMAND_GATE`, `HARNESS_DELEGATION`.
 
 ## Built-in coding tools
 
@@ -85,6 +96,7 @@ Env var overrides: `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL`,
 | `search_files` | Recursive regex content search (skips dependencies, build output, caches, `.gitignore` matches and binary files — see below) |
 | `run_command` | Run a shell command in the workspace, returns stdout/stderr/exit code |
 | `present_plan` | Plan mode only: hand a titled, numbered plan to the user for approval (see [Plan mode](#plan-mode)) |
+| `delegate` | Only when `delegation` is on: run part of the task in a subagent with its own throwaway context (see [Delegation](#delegation-subagents)) |
 
 **Line endings are OS-aware.** Files are read and normalised to `\n`, so a CRLF (Windows) file matches
 the `old_text` you copied out of `read_file`, and it is written back with its own CRLF endings intact.
@@ -120,6 +132,61 @@ relative to the workspace, `!` re-includes:
 ```json
 { "searchIgnore": ["vendor-cache/", "*.snap", "!src/generated"] }
 ```
+
+### `.llmignore` — a hard boundary
+
+`.gitignore` answers "is this source?". It is the wrong question for a coding agent: `.env`,
+`secrets/`, a customer CSV and a 40 MB fixture are all things you do not want *sent to a model*,
+and some of them are checked in.
+
+Drop a `.llmignore` next to your `.gitignore` — **same syntax**, different meaning:
+
+```gitignore
+.env*
+secrets/
+fixtures/*.csv
+!fixtures/sample-small.csv
+```
+
+Unlike `searchIgnore` and `.gitignore`, this one is not a preference the model can argue with:
+
+- `search_files` never walks those paths, **`include_ignored: true` included**.
+- `read_file` refuses them outright and says which `.llmignore` made the call.
+- Nested `.llmignore` files apply to their own subtree, and `!` re-includes work the same way they
+  do in git (a rule can only re-include something a `dir/*` rule excluded — a pruned `dir/` stays pruned).
+
+It is a context filter, not a security boundary: `run_command` still runs whatever you let the model
+run, so `cat .env` is governed by the command gate below, not by this file.
+
+## The command gate
+
+A model that has `run_command` will reach for `grep -r`, `cat`, `find -name` and `sed -i` out of
+habit — they are what it saw in its training data. Each one is a bad trade in a harness:
+`grep -r` dumps an unbounded, unranked wall of matched lines into the context (no `node_modules`
+pruning, no binary skipping, no line cap); `cat` loses the line numbers `edit_file` needs; `sed -i`
+edits blind, with no proof the target text was even there.
+
+So `run_command` reads the command first and refuses the ones a built-in does better:
+
+| The model types | The gate suggests |
+| --- | --- |
+| `grep`, `rg`, `ag`, `ack`, `fd`, `egrep` | `search_files` |
+| `find . -name "*.ts"` (any name/path filter) | `search_files` |
+| `cat f.js`, `head`, `tail`, `less`, `bat` on a file | `read_file` |
+| `sed -i`, `perl -pi` | `edit_file` |
+
+The refusal names the replacement tool, so the model simply retries correctly — in practice it
+costs one wasted step the first time and none afterwards.
+
+It reads the command properly rather than matching a substring: every segment of a `&&` / `|` chain
+is checked, a `FOO=1 grep …` env prefix does not hide anything, and the shapes that have no built-in
+equivalent are deliberately allowed — bare `cat`/`cat -` (stdin), `cat x | wc -l` (counting, not
+reading), `tail -f` (following a log), `sed -n '1,5p'` (printing, not editing), and `find` with
+`-exec`/`-delete` (doing work, not searching). `npm test`, `git status`, `make`, `node`, `ls` and
+friends are never touched.
+
+`"commandGate": "warn"` runs the command anyway and prepends a one-line note instead — useful while
+you are judging whether the gate is right for your model. `"off"` disables it.
 
 ## Work method (the system prompt)
 
@@ -270,6 +337,80 @@ conversation and the plan together.
 If the model describes its approach in prose instead of calling `present_plan`, `/approve` accepts that
 description — you read it, so it counts.
 
+## Delegation (subagents)
+
+> Off by default. Set `"delegation": "optional"` or `"enforced"` to turn it on.
+
+The scarce resource in a long session is not tokens per second, it is **the context window**. And
+most of what fills it is work the model does not need to remember: the four greps that found nothing,
+the 300-line file it read to check one function signature, the test run that failed on a typo. By the
+time the interesting decision arrives, the window is full of rubble — and model accuracy degrades
+long before the window is technically full.
+
+`delegate` moves that work somewhere else:
+
+```
+delegate({
+  agent: "coder",                  // or "researcher"
+  goal:  "Add a --json flag to the report command that prints …",
+  files: ["src/report.ts", "test/report.test.ts"],
+  context: "Flags are parsed in src/cli.ts with the `arg` helper."
+})
+```
+
+A second agent starts with an **empty** conversation, its own system prompt and this brief. It reads,
+searches, edits and runs tests for up to `subagentMaxSteps` round-trips, then writes one report. That
+report is the only thing that comes back. Everything else — every file it read, every command it ran,
+every attempt that failed — is discarded with its context.
+
+```
+  ⟐ coder subagent · Add a --json flag to the report command
+    ✓ subagent done — 11 step(s), 18.4k tokens discarded
+```
+
+Eighteen thousand tokens of rubble that never touched your window; a 40-line report that did.
+
+### The two subagents
+
+| | `coder` | `researcher` |
+| --- | --- | --- |
+| Tools | read, search, list, **write, edit**, run_command | read, search, list, run_command |
+| For | one self-contained change, verified | one question answered from the code |
+| Reports | what changed, how it was verified, what surprised it | the answer, the files and line numbers behind it |
+
+The researcher physically cannot write — `write_file` and `edit_file` are not in its registry, so
+"please don't edit anything" is not a promise the prompt has to extract. It is also told not to design
+the change: that is the caller's job, and the caller has the context for it.
+
+### The two modes
+
+**`optional`** — the `delegate` tool is offered alongside everything else and the model chooses. The
+prompt tells it to do the small, cheap things itself and delegate the noisy ones.
+
+**`enforced`** — the main agent's `write_file` and `edit_file` are **unregistered**. It can read,
+search and run commands to decide and to verify, but every actual edit goes through a coder subagent.
+This is the strict orchestrator shape: the main context holds the plan, the decisions and the
+verification, and never the mechanics.
+
+Enforcement is structural rather than textual in both directions. A subagent has no `delegate` tool,
+so the hierarchy is flat and cannot recurse; the main agent in enforced mode has no editors, so it
+cannot "just quickly fix" anything. A model that calls a tool it used to have gets a plain refusal
+naming the agent the tool belongs to, and carries on.
+
+### When not to use it
+
+A brief is expensive — writing one for someone who has never seen the repository costs more tokens
+than a two-line edit saves. Delegation pays off when the work is *noisy*: a change that needs ten
+files read to make three lines of edit, a test suite that has to be run four times, a question whose
+answer is one sentence and whose research is twenty greps. For a short session that fits comfortably
+in the window, leave it `off`.
+
+`/usage` reports subagent calls separately, so you can see what the arrangement is actually costing:
+
+```
+  ⓘ session 14 call(s) (31 in subagents) · 48.2k in · 7.1k out · 55.3k tokens
+```
+
 ## MCP servers (optional)
 
 Any [Model Context Protocol](https://modelcontextprotocol.io) stdio or Streamable HTTP server can be plugged in via config. Its tools become `mcp_<server>_<tool>` and are offered to the model next to the built-ins.
@@ -334,11 +475,75 @@ that was never finished is still sent when the input ends (piped scripts, Ctrl+D
 
 ## Session commands
 
-`/help` `/config` `/tools` `/set dir <path>` `/set prompt <full|compact>` `/cwd` `/usage` `/compact` `/reset` (clear conversation) `/export <file>` (save chat) `/import <file>` (load chat) `/clear` (clear screen) `/exit`
+`/help` `/config` `/tools` `/set dir <path>` `/set prompt <full|compact>` `/set gate <enforce|warn|off>` `/set delegation <off|optional|enforced>` `/cwd` `/usage` `/compact` `/reset` (clear conversation) `/save [name]` `/load <name>` `/chats` (see [Saving and loading a chat](#saving-and-loading-a-chat)) `/clear` (clear screen) `/exit`
+
+`/set gate` and `/set delegation` change the config for the running session only (the file is not
+rewritten) and take effect immediately — switching delegation to `enforced` removes `write_file` and
+`edit_file` from the model's tool list mid-conversation, and the model is told why.
 
 Plan first: `/plan <task>` `/plan show` `/approve [note]` `/plan off` (see [Plan mode](#plan-mode)).
 
-One conversation per run (single session). `/reset` starts fresh context inside the same session.
+One conversation per run (single session). `/reset` starts fresh context inside the same session;
+`/save` and `/load` carry one across runs.
+
+## Saving and loading a chat
+
+A session dies with the process. That is fine for a quick question and annoying after an hour: what
+the model has built up — the files it read, the test output it saw, the three approaches it already
+ruled out — is exactly the context the rest of this harness works to protect, and closing the
+terminal throws all of it away.
+
+```
+/save                 # ~/.coding-harness/chats/find-the-race-condition-2026-10-01-1432.json
+/save my-refactor     # ~/.coding-harness/chats/my-refactor.json
+/save ./notes/bug.json
+/chats                # list what you have saved
+/load my-refactor     # replace the current conversation with that one
+```
+
+```
+  my-refactor        2026-10-01 14:32 · 7 turn(s)   find the race condition in the worker pool
+  ⓘ 1 saved chat(s) in ~/.coding-harness/chats — /load <name>
+```
+
+A bare word is a name in the chats directory; anything that looks like a path (`./x`, `/x`, `~/x`,
+or ending in `.json`) is written where you point it. With no argument the file is named after the
+first thing you asked plus a timestamp, so saving twice does not overwrite.
+
+`--resume [name]` does the same at startup — with no name, the most recent chat:
+
+```bash
+node harness.js --resume              # pick up where you left off
+node harness.js --resume my-refactor
+```
+
+### What is restored, and what is not
+
+The file holds the whole conversation — user turns, assistant replies, tool calls and their results —
+plus the plan state, the delegation mode, the model and workspace it was saved in, and the token
+counters (so `/usage` keeps totalling rather than restarting).
+
+The one thing deliberately *not* restored is the **system prompt**. It is message 0 of every history
+and it describes a moment: this working directory, this git branch, today's date, this mode. Replaying
+a stored one would quietly tell the model it is somewhere it is not. So the file keeps a copy (it is a
+faithful record, and useful when reading an export by hand) and `/load` rebuilds the prompt for the
+environment you are actually in. Everything the conversation learned comes back; nothing it assumed
+about the world does.
+
+Plan mode comes back with it: a chat saved while planning reloads in plan mode with the read-only
+toolset, and an approved plan is pinned back into the system prompt. A restored plan is not treated as
+freshly presented, so the turn loop does not stop as though it had just arrived.
+
+`/load` warns when the chat was saved somewhere else or with a different model, since the conversation
+may refer to files that are not here:
+
+```
+  ● note: saved in /home/me/other-project — the conversation may refer to files that are not here
+  ● note: saved with model gpt-4o-mini, now using qwen2.5-coder
+```
+
+Files are plain JSON with a `format` and `version` field, written atomically. `/export` and `/import`
+are kept as aliases for `/save` and `/load`, and v1 files written by the old `/export` still load.
 
 ## Progress, tokens and context
 
@@ -407,7 +612,8 @@ The harness actively keeps a turn running to completion instead of stopping half
 ## CLI flags
 
 ```
-node harness.js [--config <path>] [--dir <path>] [--init] [--once "<prompt>"] [--plan] [--stream | --no-stream] [--model <name>] [--prompt <full|compact>]
+node harness.js [--config <path>] [--dir <path>] [--init] [--once "<prompt>"] [--plan]
+                [--resume [name]] [--stream | --no-stream] [--model <name>] [--prompt <full|compact>]
 ```
 
 `--dir <path>` starts the session in a different working directory (same as typing `/set dir <path>` first).
@@ -419,6 +625,9 @@ node harness.js [--config <path>] [--dir <path>] [--init] [--once "<prompt>"] [-
 `--plan` starts in plan mode — combined with `--once` it prints a plan for a task and changes nothing
 (`node harness.js --plan --once "add caching to the API client"`).
 
+`--resume [name]` loads a saved chat before the first prompt (no name = the most recent). `--continue`
+is an alias. See [Saving and loading a chat](#saving-and-loading-a-chat).
+
 ## Tests
 
 ```bash
@@ -426,5 +635,11 @@ npm test
 ```
 
 Runs an end-to-end suite against a mock OpenAI server and a mock MCP server (streaming on/off, tool
-round-trips, MCP tools, built-in tool smoke tests, search ignore rules, multiline input rules, and plan
-mode: the read-only command rules, the tool gating, and a full plan → `/approve` → implementation run).
+round-trips, MCP tools, built-in tool smoke tests, search ignore rules, multiline input rules, plan
+mode: the read-only command rules, the tool gating, and a full plan → `/approve` → implementation run;
+the command gate, `.llmignore`, token calibration, delegation end to end — a real subagent writing
+a real file, recursion refused, and enforced mode refusing the editors — config migration, and chat
+save/load round-tripped through two separate processes).
+
+`docs/late-cli-analysis.md` covers where delegation, the command gate and `.llmignore` came from and
+which of the reference project's ideas were deliberately left out.
