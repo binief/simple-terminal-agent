@@ -7,6 +7,12 @@
                         then a complete reply once the [continue] nudge arrives
    - "TRUNCATE-TOOL" -> tool call whose arguments were cut off mid-JSON
                         (finish_reason "length"), then the complete call, then final
+   - "OVERSIZE-TOOL" -> server answers 500 "Failed to parse tool call arguments as JSON"
+                        (llama.cpp, a write_file that ran past max_tokens) until the
+                        harness sends the recovery nudge; then a small write_file and a
+                        final reply reporting how many requests it took
+   - "OVERSIZE-ALWAYS" -> the same 500 on every request, nudge or not — the harness must
+                        give up after a bounded number of attempts
    - "LOOP-FOREVER"  -> tool call on every reply (never finishes) — step-limit tests
    - "RETRY-ME"      -> server answers 503 once, then a plain final reply
    - "ADD2"          -> tool_call mcp_fake_add {a:2,b:40}, then final "MOCK-DONE <tool result>"
@@ -16,9 +22,32 @@
 import http from 'node:http';
 
 import { COMPACT_TAG, CONTINUE_TAG } from '../lib/agent.js';
+import { OVERSIZED_TOOL_CALL_TAG } from '../lib/llm.js';
 import { APPROVED_TAG } from '../lib/plan.js';
 
 const isWin = process.platform === 'win32';
+
+/* How many OVERSIZE-TOOL requests each session has sent (reported back to the
+ * test, so a blind retry of the rejected request shows up as a higher count).
+ * Keyed on the system prompt: one server run serves several test sessions. */
+const oversizeCounts = new Map();
+let oversizeRequests = 0;
+
+/* What llama.cpp answers when generation hit max_tokens inside a tool call's
+ * arguments: a 500 whose message carries the parse error and then echoes the
+ * whole broken blob after "last read:". */
+function oversizeErrorBody() {
+  const echoed = `'"<div class=\\"container-fluid onboard-wrapper\\">${'\\n  <div class=\\"row\\"></div>'.repeat(200)}`;
+  return JSON.stringify({
+    error: {
+      code: 500,
+      message:
+        'Failed to parse tool call arguments as JSON: [json.exception.parse_error.101] parse error at line 1, ' +
+        `column 15045: syntax error while parsing value - invalid string: missing closing quote; last read: ${echoed}`,
+      type: 'server_error',
+    },
+  });
+}
 
 function plan(messages) {
   const toolMsgs = messages.filter((m) => m.role === 'tool');
@@ -106,6 +135,18 @@ function plan(messages) {
       };
     }
     return { text: 'MOCK-DONE tool-recovered' };
+  }
+
+  // the server rejected an oversized tool call: after the recovery nudge the
+  // model writes the file in one small piece and reports what it was told
+  if (userText.includes('OVERSIZE-TOOL')) {
+    if (toolMsgs.length === 0) {
+      return {
+        tool: { id: 'call_o1', name: 'write_file', arguments: JSON.stringify({ path: 'oversize.txt', content: 'first-section' }) },
+      };
+    }
+    const split = /write a long file in sections|one edit_file per section|first section only/i.test(userText);
+    return { text: `MOCK-DONE oversize requests=${oversizeRequests} split=${split ? 'yes' : 'no'}` };
   }
 
   // never finishes: one tool call per reply, forever — for step-limit tests
@@ -323,6 +364,27 @@ const server = http.createServer((req, res) => {
       res.writeHead(503, { 'retry-after': '0' });
       res.end('transient server error');
       return;
+    }
+    if (userText.includes('OVERSIZE-TOOL') || userText.includes('OVERSIZE-ALWAYS')) {
+      const key = (body.messages || []).filter((m) => m.role === 'system').map((m) => m.content).join('|');
+      oversizeRequests = (oversizeCounts.get(key) || 0) + 1;
+      oversizeCounts.set(key, oversizeRequests);
+      // Every attempt fails the same way until the harness stops re-sending the
+      // same request and tells the model to make the call smaller. OVERSIZE-ALWAYS
+      // never recovers: the harness must give up after a bounded number of tries.
+      if (userText.includes('OVERSIZE-ALWAYS') || !userText.includes(OVERSIZED_TOOL_CALL_TAG)) {
+        const payload = oversizeErrorBody();
+        if (body.stream) {
+          // streamed shape: the error arrives as an SSE event, not as a status
+          res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+          res.write(`data: ${payload}\n\n`);
+          res.end();
+        } else {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(payload);
+        }
+        return;
+      }
     }
     const decision = plan(body.messages || []);
     if (body.stream) sseReply(res, decision);

@@ -1559,6 +1559,72 @@ async function main() {
   );
   check('transient API errors are retried', res.code === 0 && res.out.includes('MOCK-DONE retried-ok'), res.out);
 
+  /* --- a 500 that is really the server rejecting the model's own tool call --- */
+  const { classifyApiError, serverErrorSummary, oversizedToolCallNudge, TOOL_CALL_PARSE_ERROR, OVERSIZED_TOOL_CALL_TAG } =
+    await import(pathToFileURL(path.join(proj, 'lib', 'llm.js')).href);
+
+  const llamaBody = JSON.stringify({
+    error: {
+      code: 500,
+      message:
+        'Failed to parse tool call arguments as JSON: [json.exception.parse_error.101] parse error at line 1, column 15045: ' +
+        'syntax error while parsing value - invalid string: missing closing quote; last read: \'"<div class=\\"container-fluid\\">' +
+        'x'.repeat(5000),
+      type: 'server_error',
+    },
+  });
+  check('llama.cpp tool-call parse failures are classified', classifyApiError(500, llamaBody) === TOOL_CALL_PARSE_ERROR, String(classifyApiError(500, llamaBody)));
+  check('a plain 5xx stays transient', classifyApiError(503, 'upstream connect error') === null, 'misclassified');
+  check('a 400 about our own request body stays transient', classifyApiError(400, 'invalid request: unexpected end of JSON input') === null, 'misclassified');
+  check('an unterminated tool call without a status is classified', classifyApiError(0, 'tool_calls: unterminated string') === TOOL_CALL_PARSE_ERROR, 'missed');
+  const summary = serverErrorSummary(llamaBody);
+  check('the error summary keeps the useful sentence', summary.startsWith('Failed to parse tool call arguments as JSON'), summary);
+  check('the error summary drops the echoed model output', !summary.includes('container-fluid') && summary.length <= 241, `${summary.length} chars: ${summary.slice(0, 120)}`);
+  const nudge = oversizedToolCallNudge(4096);
+  check('the recovery nudge is tagged', nudge.includes(OVERSIZED_TOOL_CALL_TAG), nudge);
+  check('the recovery nudge quotes the reply limit', nudge.includes('4096-token') && nudge.includes('12k characters'), nudge);
+  check('the recovery nudge says how to split the work', /write_file with the first section only/.test(nudge) && /one edit_file per following section/.test(nudge), nudge);
+
+  // end to end: one failed request, the nudge, then the work gets done
+  const workO = path.join(tmp, 'workO');
+  fs.mkdirSync(workO, { recursive: true });
+  res = await run(
+    process.execPath,
+    [harness, '--config', writeConfig('cfg-oversize.json', { ...baseConfig(port), workspace: workO }), '--no-stream', '--once', 'please OVERSIZE-TOOL the file'],
+    { cwd: workO }
+  );
+  check('an oversized tool call is not retried blindly', res.out.includes('requests=3'), res.out.slice(0, 1200));
+  check('the turn recovers instead of dying', res.code === 0 && res.out.includes('MOCK-DONE oversize'), res.out.slice(0, 1200));
+  check('the model is told to split the call up', res.out.includes('split=yes'), res.out.slice(0, 1200));
+  check('the rejected call is explained to the user', res.out.includes('cut off before its arguments were complete JSON'), res.out.slice(0, 1200));
+  check('the echoed model output is not dumped in the terminal', !res.out.includes('container-fluid'), res.out.slice(0, 600));
+  check('the recovered write actually happened', fs.readFileSync(path.join(workO, 'oversize.txt'), 'utf8') === 'first-section', 'wrong content');
+
+  // the same rejection delivered inside an SSE stream
+  const workP = path.join(tmp, 'workP');
+  fs.mkdirSync(workP, { recursive: true });
+  res = await run(
+    process.execPath,
+    [harness, '--config', writeConfig('cfg-oversize-stream.json', { ...baseConfig(port), streaming: true, workspace: workP }), '--once', 'please OVERSIZE-TOOL the file'],
+    { cwd: workP }
+  );
+  check('streaming: a rejected tool call recovers too', res.code === 0 && res.out.includes('MOCK-DONE oversize'), res.out.slice(0, 1200));
+  check('streaming: the rejection is not retried blindly', res.out.includes('requests=3'), res.out.slice(0, 1200));
+
+  // a model that keeps producing the same oversized call: bounded, and the
+  // message says which knob to turn
+  const workQ = path.join(tmp, 'workQ');
+  fs.mkdirSync(workQ, { recursive: true });
+  res = await run(
+    process.execPath,
+    [harness, '--config', writeConfig('cfg-oversize-stuck.json', { ...baseConfig(port), workspace: workQ }), '--no-stream', '--once', 'please OVERSIZE-ALWAYS here'],
+    { cwd: workQ }
+  );
+  const rejections = (res.out.match(/cut off before its arguments were complete JSON/g) || []).length;
+  check('a model stuck on oversized calls gives up after 3 tries', rejections === 4, `${rejections} rejections: ${res.out.slice(0, 600)}`);
+  check('giving up points at the maxTokens config key', res.out.includes('3 times in a row') && res.out.includes('maxTokens'), res.out.slice(0, 800));
+  check('the session survives a model stuck on oversized calls', res.code === 0 && res.out.includes('History is intact'), res.out.slice(0, 400));
+
   /* ---------------- 4. CLI plumbing ---------------- */
   console.log('\n[cli]');
   const workD = path.join(tmp, 'workD');
