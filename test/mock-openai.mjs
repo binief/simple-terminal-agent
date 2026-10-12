@@ -119,6 +119,80 @@ function plan(messages) {
     return { text: 'MOCK-DONE retried-ok' };
   }
 
+  // --- delegation ---------------------------------------------------------
+  // A subagent runs in its own conversation, so it is recognised by its system
+  // prompt rather than by the user text. Each one first reaches for a tool it
+  // must not have, to prove the registry is pruned and not merely asked nicely.
+  if (systemText.includes('coding subagent')) {
+    if (toolMsgs.length === 0) {
+      return {
+        tool: { id: 'call_s1', name: 'write_file', arguments: JSON.stringify({ path: 'delegated.txt', content: 'written-by-subagent' }) },
+      };
+    }
+    if (toolMsgs.length === 1) {
+      return { tool: { id: 'call_s2', name: 'delegate', arguments: JSON.stringify({ agent: 'coder', goal: 'recurse please' }) } };
+    }
+    return { text: `SUBAGENT-REPORT Done: wrote delegated.txt. Recursion: ${/not available to this agent/.test(lastTool) ? 'refused' : 'allowed'}.` };
+  }
+  if (systemText.includes('research subagent')) {
+    if (toolMsgs.length === 0) {
+      return { tool: { id: 'call_r1', name: 'write_file', arguments: JSON.stringify({ path: 'research-probe.txt', content: 'nope' }) } };
+    }
+    if (toolMsgs.length === 1) {
+      return {
+        tool: { id: 'call_r2', name: 'run_command', arguments: JSON.stringify({ command: isWin ? 'del nothing.txt' : 'rm -f research-probe.txt' }) },
+      };
+    }
+    const refusedWrite = /not available to this agent/.test(String(toolMsgs[0].content));
+    const refusedCmd = /read-only/.test(lastTool);
+    return { text: `RESEARCH-REPORT Answer: write=${refusedWrite ? 'refused' : 'allowed'} command=${refusedCmd ? 'refused' : 'allowed'}` };
+  }
+
+  if (userText.includes('DELEGATE-ME')) {
+    if (toolMsgs.length === 0) {
+      return {
+        tool: {
+          id: 'call_d1',
+          name: 'delegate',
+          arguments: JSON.stringify({
+            agent: 'coder',
+            goal: 'Create delegated.txt containing written-by-subagent.',
+            files: ['delegated.txt'],
+            context: 'Nothing exists yet.',
+          }),
+        },
+      };
+    }
+    return {
+      text:
+        `MOCK-DONE delegated=${/SUBAGENT-REPORT/.test(lastTool) ? 'report-seen' : 'report-missing'}` +
+        ` head=${/subagent finished: \d+ step\(s\)/.test(lastTool) ? 'yes' : 'no'}`,
+    };
+  }
+
+  if (userText.includes('RESEARCH-ME')) {
+    if (toolMsgs.length === 0) {
+      return { tool: { id: 'call_d2', name: 'delegate', arguments: JSON.stringify({ agent: 'researcher', goal: 'Find out what is writable from here.' }) } };
+    }
+    return { text: `MOCK-DONE researched=${/RESEARCH-REPORT/.test(lastTool) ? lastTool.split('RESEARCH-REPORT ')[1].trim() : 'report-missing'}` };
+  }
+
+  // enforced delegation: the main agent has no write_file and must be refused
+  if (userText.includes('ENFORCED-ME')) {
+    if (toolMsgs.length === 0) {
+      return { tool: { id: 'call_x1', name: 'write_file', arguments: JSON.stringify({ path: 'forbidden.txt', content: 'x' }) } };
+    }
+    return { text: `MOCK-DONE enforced=${/not available to this agent/.test(lastTool) ? 'refused' : 'allowed'}` };
+  }
+
+  // the command gate: a model that greps through the shell is pointed at search_files
+  if (userText.includes('GATE-ME')) {
+    if (toolMsgs.length === 0) {
+      return { tool: { id: 'call_g1', name: 'run_command', arguments: JSON.stringify({ command: 'grep -r needle .' }) } };
+    }
+    return { text: `MOCK-DONE gate=${/search_files/.test(lastTool) ? 'redirected' : 'ran'}` };
+  }
+
   if (userText.includes('ADD2')) {
     if (toolMsgs.length === 0) {
       return { tool: { id: 'call_m', name: 'mcp_fake_add', arguments: JSON.stringify({ a: 2, b: 40 }) } };
@@ -136,16 +210,20 @@ function plan(messages) {
     };
   }
   if (toolMsgs.length === 1) {
+    return { tool: { id: 'call_2', name: 'read_file', arguments: JSON.stringify({ path: 'hello-harness.txt' }) } };
+  }
+  if (toolMsgs.length === 2) {
+    // the model still reaches for the shell to re-check it — the gate refuses
     return {
       tool: {
-        id: 'call_2',
+        id: 'call_3',
         name: 'run_command',
         arguments: JSON.stringify({ command: isWin ? 'type hello-harness.txt' : 'cat hello-harness.txt' }),
       },
     };
   }
-  const stdoutPart = /--- stdout ---\n([\s\S]*?)\n--- stderr ---/.exec(lastTool);
-  return { text: `MOCK-DONE file=${(stdoutPart ? stdoutPart[1] : lastTool).trim() || ''}` };
+  const body = String(toolMsgs[1]?.content ?? '').split('\n').slice(1).join('\n');
+  return { text: `MOCK-DONE file=${body.trim()} gate=${/refused/.test(lastTool) ? 'refused' : 'ran'}` };
 }
 
 function jsonReply(res, decision, body) {
