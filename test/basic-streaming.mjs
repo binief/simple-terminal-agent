@@ -51,7 +51,7 @@ async function session(handler, configOptions = {}, { env = {} } = {}) {
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
     const config = path.join(dir, 'config.json');
-    fs.writeFileSync(config, JSON.stringify({ ...configOptions, workspace: dir, openai: {
+    fs.writeFileSync(config, JSON.stringify({ planDir: path.join(dir, '.plans'), ...configOptions, workspace: dir, openai: {
       baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: '', model: 'mock',
     } }));
     child = spawn(process.execPath, [basic, '--config', config, '--once', 'inspect'], {
@@ -116,6 +116,7 @@ async function interactive(handler, configOptions = {}) {
       await handler({ body, res, step: requests.length, dir });
     } catch (e) {
       serverError = e;
+      if (process.env.DEBUG_TESTS) console.error('handler error:', e);
       res.destroy();
     }
   });
@@ -131,7 +132,7 @@ async function interactive(handler, configOptions = {}) {
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
     const config = path.join(dir, 'config.json');
-    fs.writeFileSync(config, JSON.stringify({ ...configOptions, workspace: dir, openai: {
+    fs.writeFileSync(config, JSON.stringify({ planDir: path.join(dir, '.plans'), ...configOptions, workspace: dir, openai: {
       baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: '', model: 'mock',
     } }));
     child = spawn(process.execPath, [basic, '--config', config], { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -452,4 +453,198 @@ test('colour follows NO_COLOR, FORCE_COLOR and the TTY check', () => {
   assert.equal(styledIn({ FORCE_COLOR: '1' }), '\x1b[36mx\x1b[0m', 'FORCE_COLOR=1 colours piped output');
   assert.equal(styledIn({ FORCE_COLOR: '1', NO_COLOR: '1' }), 'x', 'NO_COLOR wins over FORCE_COLOR');
   assert.equal(styledIn({ FORCE_COLOR: '0' }), 'x', 'FORCE_COLOR=0 means off');
+});
+
+/* ------------------------------------------------------------------ */
+/* Mode restrictions, plan persistence, compact display, compact mode  */
+/* ------------------------------------------------------------------ */
+
+const call = (id, name, args, index = 0) => ({ index, id, type: 'function', function: { name, arguments: JSON.stringify(args) } });
+
+test('PLAN mode refuses project writes and shell writes, allows the plan dir; IMPLEMENT runs from the saved plan file', async () => {
+  let planDir;
+  const result = await session(({ res, step, body, dir }) => {
+    planDir = path.join(dir, '.plans');
+    startSse(res);
+    if (step === 1) {
+      // Tool descriptions carry the plan-mode rules.
+      const tools = Object.fromEntries(body.tools.map((t) => [t.function.name, t.function.description]));
+      assert.match(tools.write_file, /PLAN mode: only paths under .*\.plans/);
+      assert.match(tools.run_command, /PLAN mode: read-only commands only/);
+      assert.match(body.messages[0].content, /READ-ONLY in this mode/);
+      res.end(frame({ tool_calls: [
+        call('w', 'write_file', { path: 'component.ts', content: 'export const changed = true;' }, 0),
+        call('e', 'edit_file', { path: 'fixture.txt', old_text: 'héllo', new_text: 'bye' }, 1),
+        call('c', 'run_command', { command: 'echo pwned > fixture.txt' }, 2),
+        call('ok-cmd', 'run_command', { command: 'ls' }, 3),
+        call('notes', 'write_file', { path: path.join(planDir, 'notes.md'), content: 'context: fixture.txt holds a greeting' }, 4),
+      ] }, 'tool_calls'));
+    } else if (step === 2) {
+      const results = Object.fromEntries(body.messages.filter((m) => m.role === 'tool').map((m) => [m.tool_call_id, m.content]));
+      assert.match(results.w, /^error: PLAN mode is read-only: .*component\.ts was not written/);
+      assert.match(results.e, /^error: PLAN mode is read-only/);
+      assert.match(results.c, /^error: PLAN mode is read-only: `echo pwned > fixture\.txt` was not run \(it redirects output/);
+      assert.match(results['ok-cmd'], /^exit 0\n[\s\S]*fixture\.txt/);
+      assert.match(results.notes, /^wrote .*notes\.md/);
+      assert.equal(fs.existsSync(path.join(dir, 'component.ts')), false, 'plan mode must not create project files');
+      assert.equal(fs.readFileSync(path.join(dir, 'fixture.txt'), 'utf8'), 'héllo 🌍', 'plan mode must not modify project files');
+      assert.equal(fs.readFileSync(path.join(planDir, 'notes.md'), 'utf8'), 'context: fixture.txt holds a greeting');
+      res.end(frame({ content: 'IMPLEMENT PROMPT\n---\nGoal: add component.ts exporting changed = true.\n---' }, 'stop'));
+    } else if (step === 3) {
+      // Implement mode: the user prompt is the plan file, and tools are unrestricted again.
+      assert.equal(body.messages.length, 1);
+      assert.equal(body.messages[0].role, 'user');
+      assert.match(body.messages[0].content, /^IMPLEMENT mode\. The plan below was written in PLAN mode and saved at (.*plan-[\dT-]+\.md)/);
+      const file = body.messages[0].content.match(/saved at (\S+\.md)/)[1];
+      assert.ok(file.startsWith(planDir), file);
+      assert.equal(fs.readFileSync(file, 'utf8'), 'Goal: add component.ts exporting changed = true.\n');
+      assert.match(body.messages[0].content, /\n\nGoal: add component\.ts exporting changed = true\.$/);
+      const tools = Object.fromEntries(body.tools.map((t) => [t.function.name, t.function.description]));
+      assert.doesNotMatch(tools.write_file, /PLAN mode/);
+      res.end(frame({ tool_calls: [
+        call('w2', 'write_file', { path: 'component.ts', content: 'export const changed = true;' }, 0),
+        call('c2', 'run_command', { command: 'echo built > build.log' }, 1),
+      ] }, 'tool_calls'));
+    } else {
+      assert.equal(step, 4);
+      assert.equal(fs.readFileSync(path.join(dir, 'component.ts'), 'utf8'), 'export const changed = true;');
+      assert.equal(fs.readFileSync(path.join(dir, 'build.log'), 'utf8').trim(), 'built');
+      res.end(frame({ content: 'IMPLEMENTED' }, 'stop'));
+    }
+  });
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.requests.length, 4);
+  assert.match(result.stdout, /saved plan → \S+plan-[\dT-]+\.md/);
+  assert.match(result.stdout, /\[implement\] plan: \S+\.md/);
+  assert.match(result.stdout, /⊘ \[tool result\] write_file · blocked/);
+  assert.match(result.stdout, /✓ \[tool result\] run_command · ok/);
+  assert.match(result.stdout, /\[done\] 2 steps · 5 tool calls \(1 file write, 1 command, 3 blocked by PLAN mode\)/);
+  assert.match(result.stdout, /\[done\] 2 steps · 2 tool calls \(1 file write, 1 command\)/);
+});
+
+test('/implement accepts a plan file path or ad-hoc text, and /prompt shows the saved plan', async () => {
+  const live = await interactive(({ res, step, body, dir }) => {
+    startSse(res);
+    if (step === 1) {
+      assert.match(body.messages[0].content, /^IMPLEMENT mode\./);
+      assert.match(body.messages[0].content, /saved at \S*basic-handwritten-\d+\.md;/);
+      assert.match(body.messages[0].content, /\n\nHand-written plan\.$/);
+      res.end(frame({ content: 'FROM-FILE' }, 'stop'));
+    } else if (step === 2) {
+      assert.match(body.messages[0].content, /\n\nad hoc instructions$/);
+      const file = body.messages[0].content.match(/saved at (\S+\.md)/)[1];
+      assert.ok(file.startsWith(path.join(dir, '.plans')), file);
+      res.end(frame({ content: 'FROM-TEXT' }, 'stop'));
+    }
+  });
+  live.send('/prompt');
+  await live.waitNew('(no plan saved yet)');
+  live.send('/implement');
+  await live.waitNew('no plan saved yet — stay in /plan');
+  const handwritten = path.join(os.tmpdir(), `basic-handwritten-${process.pid}.md`);
+  fs.writeFileSync(handwritten, 'Hand-written plan.\n');
+  try {
+    live.send(`/implement ${handwritten}`);
+    await live.waitNew('FROM-FILE');
+    await live.waitNew('back to plan');
+    live.send('/implement ad hoc instructions');
+    await live.waitNew('FROM-TEXT');
+    live.send('/prompt');
+    await live.waitNew('plan file: '); // /prompt follows whichever plan ran last
+    await live.waitNew('ad hoc instructions');
+    const result = await live.finish();
+    assert.equal(result.code, 0, result.stdout);
+    assert.equal(result.requests.length, 2);
+  } finally {
+    fs.rmSync(handwritten, { force: true });
+  }
+});
+
+test('tool arguments and results are shown compactly; the model still gets everything', async () => {
+  const big = Array.from({ length: 60 }, (_, i) => `line ${i + 1} ${'x'.repeat(200)}`).join('\n');
+  const result = await session(({ res, step, body, dir }) => {
+    startSse(res);
+    if (step === 1) {
+      fs.writeFileSync(path.join(dir, 'big.txt'), big);
+      res.end(frame({ content: plan }, 'stop'));
+    } else if (step === 2) {
+      res.end(frame({ tool_calls: [
+        call('r', 'read_file', { path: 'big.txt' }, 0),
+        call('w', 'write_file', { path: 'copy.txt', content: big }, 1),
+      ] }, 'tool_calls'));
+    } else {
+      assert.equal(step, 3);
+      const read = body.messages.find((m) => m.tool_call_id === 'r').content;
+      assert.equal(read.split('\n').length, 61, 'the model receives the whole file');
+      assert.match(read, /line 60 x{200}/);
+      res.end(frame({ content: 'COMPACT-DONE' }, 'stop'));
+    }
+  });
+  assert.equal(result.code, 0, result.stderr);
+  const out = result.stdout;
+  // Arguments: long strings are summarized, not dumped.
+  assert.match(out, /\{"path":"copy\.txt","content":"line 1 xxxx[^"]*… \(\d+ chars, 60 lines\)"\}/);
+  assert.doesNotMatch(out, /x{200}/, 'no 200-char line reaches the console');
+  // Results: a few lines plus a count of what was left out.
+  assert.match(out, /✓ \[tool result\] read_file · ok · [\d.]+s · 61 lines/);
+  assert.match(out, /… \+53 more lines \(\d+ chars; the model gets the full result, \/verbose shows it\)/);
+  assert.equal(out.split('line 1 ').length - 1, 2, 'first line shown once per preview (read + args)');
+  assert.equal(out.includes('line 60'), false);
+  assert.match(out, /· composing tool call(s)? read_file, write_file…/);
+});
+
+test('/verbose shows full tool arguments and results', async () => {
+  const live = await interactive(({ res, step }) => {
+    startSse(res);
+    if (step === 1) res.end(frame({ tool_calls: [call('r', 'read_file', { path: 'fixture.txt', max_lines: 5 })] }, 'tool_calls'));
+    else res.end(frame({ content: 'VERBOSE-DONE' }, 'stop'));
+  });
+  live.send('/verbose');
+  await live.waitNew('tool output: verbose');
+  live.send('/implement read the fixture');
+  await live.waitNew('VERBOSE-DONE');
+  const result = await live.finish();
+  assert.equal(result.code, 0, result.stdout);
+  assert.match(result.stdout, /\{"path":"fixture\.txt","max_lines":5\}/);
+  assert.match(result.stdout, /\[tool result\] read_file · ok · [\d.]+s · 2 lines\nfile .*fixture\.txt \(1 lines\)\n   1\|héllo 🌍/);
+});
+
+test('compact mode trims older tool results from requests above 90% and asks for /compact, without touching history', async () => {
+  const huge = `${'payload '.repeat(900)}END-OF-PAYLOAD`; // ~1.8k tokens: enough to cross 90% of 2000 on its own
+  const result = await session(({ res, step, body, dir }) => {
+    startSse(res);
+    if (step === 1) {
+      fs.writeFileSync(path.join(dir, 'huge.txt'), huge);
+      res.end(frame({ content: plan }, 'stop'));
+    } else if (step === 2) {
+      res.end(frame({ reasoning_content: 'read it', tool_calls: [call('big', 'read_file', { path: 'huge.txt' })] }, 'tool_calls'));
+    } else if (step === 3) {
+      // Compact mode switched on before this request: the only tool result is
+      // in the latest step, so it gets the generous cut.
+      const tool = body.messages.find((m) => m.tool_call_id === 'big');
+      assert.ok(tool.content.length < 2300, `latest-step result trimmed: ${tool.content.length}`);
+      assert.match(tool.content, /…\[compact mode: \d+ more chars of this tool result were trimmed/);
+      assert.equal(body.messages[1].reasoning_content, 'read it', 'latest step keeps its reasoning');
+      res.end(frame({ tool_calls: [call('small', 'read_file', { path: 'fixture.txt' })] }, 'tool_calls'));
+    } else {
+      assert.equal(step, 4);
+      // Now the big result is an older step: stub size, reasoning dropped,
+      // while the latest step's result travels untouched.
+      const big = body.messages.find((m) => m.tool_call_id === 'big');
+      assert.ok(big.content.length < 500, `older result cut to a stub: ${big.content.length}`);
+      assert.doesNotMatch(big.content, /END-OF-PAYLOAD/);
+      assert.equal(body.messages[1].reasoning_content, undefined, 'older reasoning dropped from the request');
+      assert.match(body.messages.find((m) => m.tool_call_id === 'small').content, /héllo 🌍/);
+      assert.equal(body.messages[0].role, 'user'); // the task itself is never trimmed
+      assert.match(body.messages[0].content, /Inspect the fixture\./);
+      res.end(frame({ content: 'STILL-WORKING' }, 'stop'));
+    }
+  }, { contextSize: 2000 });
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.requests.length, 4);
+  assert.match(result.stdout, /\[context\] ~[\d.]+k? of 2\.0k tokens \(\d+%\) — compact mode on: older tool results and reasoning are trimmed from each request \(this one ~[\d.]+k?\)\. Please run \/compact to summarize the conversation and free space for good\./);
+  assert.match(result.stdout, /· compact mode: request trimmed ~[\d.]+k? → ~[\d.]+k? tokens/);
+  assert.match(result.stdout, /STILL-WORKING/);
+  // History is intact: step 4 saw the full "small" result, and the nudge is printed once per crossing.
+  assert.equal(result.stdout.split('compact mode on').length - 1, 1);
 });
