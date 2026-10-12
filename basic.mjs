@@ -17,7 +17,13 @@
  * Context
  *   Once the conversation is estimated at >= 90% of contextSize, compact mode
  *   switches on: every request is sent with older tool results and reasoning
- *   trimmed, and the user is told to run /compact for a real summary.
+ *   trimmed, and the user is told to run /compact for a real summary. /reset is
+ *   the blunt version of the same idea: it drops the conversation outright.
+ *
+ * Ctrl+C
+ *   Interrupts the running execution (the model request and any command a tool
+ *   started) and returns to the prompt with the history intact. A second Ctrl+C
+ *   within a couple of seconds — or a Ctrl+C while the agent is idle — exits.
  *
  * Config (optional JSON, --config path or BASIC_CONFIG):
  *   { openai: { baseURL, apiKey, model }, maxTokens: 4096, contextSize: 64000,
@@ -67,6 +73,95 @@ let verbose = process.env.BASIC_VERBOSE === '1';
 function emptyMcp() {
   return { listTools: () => [], has: () => false, call: async () => '', closeAll() {} };
 }
+
+/* ------------------------------- interrupt ------------------------------- */
+
+/* Ctrl+C must stop the work, not the session. Every unit of work (a turn, a
+ * compaction) registers itself in activeExecution, so the signal handler has
+ * something concrete to abort: the AbortController cancels the in-flight HTTP
+ * request, and the children set lets it stop a command the tools started.
+ *
+ * Ctrl+C reaches us by one of two routes, depending on how the CLI was started:
+ *   - on a TTY, readline holds stdin in raw mode and emits 'SIGINT' itself;
+ *   - with piped stdin (or from `kill -INT` / --once mode), the signal arrives
+ *     at the process instead.
+ * Exactly one of the two fires per keypress, so both are wired to onInterrupt. */
+const SECOND_INTERRUPT_MS = 2000;
+/** The running execution ({ controller, children }), or null while idle. */
+let activeExecution = null;
+/** True when the execution that just ended was stopped by Ctrl+C. */
+let interrupted = false;
+let lastInterruptAt = 0;
+
+/** Start an interruptible unit of work and return its handle. */
+function beginExecution() {
+  interrupted = false;
+  const execution = { controller: new AbortController(), children: new Set() };
+  activeExecution = execution;
+  return execution;
+}
+
+/** Retire a handle; nothing it started outlives it. */
+function endExecution(execution) {
+  if (activeExecution === execution) activeExecution = null;
+  for (const child of execution.children) killChild(child);
+  execution.children.clear();
+}
+
+/** Abort the in-flight request and stop the commands the tools started. */
+function cancelExecution(execution) {
+  interrupted = true;
+  execution.controller.abort();
+  for (const child of execution.children) killChild(child);
+}
+
+/** Best-effort stop for one command, its process group included on POSIX. */
+function killChild(child) {
+  try { child.kill('SIGTERM'); } catch { /* already gone */ }
+  if (process.platform !== 'win32' && child.pid) {
+    // runShell puts each command in its own process group, so this reaches
+    // pipes and `a && b` children that the shell itself would leave behind.
+    try { process.kill(-child.pid, 'SIGTERM'); } catch { /* not a group leader */ }
+  }
+}
+
+function abortError() {
+  return Object.assign(new Error('interrupted by Ctrl+C'), { name: 'AbortError' });
+}
+
+/** Rejects as soon as `signal` aborts — for work that cannot be cancelled itself. */
+function abortRace(signal) {
+  const pending = new Promise((_, reject) => {
+    if (signal.aborted) reject(abortError());
+    else signal.addEventListener('abort', () => reject(abortError()), { once: true });
+  });
+  // A race that was already won must not leave an unhandled rejection behind.
+  pending.catch(() => {});
+  return pending;
+}
+
+/** Ctrl+C: stop what is running, or leave when there is nothing to stop. */
+function onInterrupt() {
+  const now = Date.now();
+  const secondPress = now - lastInterruptAt < SECOND_INTERRUPT_MS;
+  lastInterruptAt = now;
+  const execution = activeExecution;
+  if (!execution) { // idle: Ctrl+C is just another way to quit
+    console.log(`\n${s.dim('interrupted — exiting')}`);
+    process.exit(0);
+  }
+  if (secondPress) { // the first press is still winding down: stop waiting and go
+    console.log(`\n${tag('interrupt', s.red)} second Ctrl+C — exiting`);
+    process.exit(130);
+  }
+  cancelExecution(execution);
+  console.log(
+    `\n${tag('interrupt', s.yellow)} stopping the current execution ` +
+    `${s.dim('(the request and any command it started) — press Ctrl+C again to quit')}`
+  );
+}
+
+process.on('SIGINT', onInterrupt); // piped stdin, `kill -INT`, --once mode
 
 /* ----------------------------- files / shell ----------------------------- */
 
@@ -198,8 +293,22 @@ function runShell(command, timeoutSec) {
       cwd: workspace,
       env: process.env,
       windowsHide: true,
+      // POSIX: give the command its own process group, so an interrupt can stop
+      // the whole thing (pipes, `a && b`) instead of only the shell around it.
+      detached: !isWin,
     });
     let out = '';
+    let settled = false;
+    // Registered with the execution that owns this command: Ctrl+C kills it.
+    const execution = activeExecution;
+    execution?.children.add(child);
+    const finish = (text) => {
+      if (settled) return; // timeout and close can both fire; only the first counts
+      settled = true;
+      clearTimeout(t);
+      execution?.children.delete(child);
+      resolve(text);
+    };
     const add = (d) => {
       out += d;
       if (out.length > 80_000) out = out.slice(-80_000);
@@ -207,16 +316,17 @@ function runShell(command, timeoutSec) {
     child.stdout.on('data', add);
     child.stderr.on('data', add);
     const t = setTimeout(() => {
-      child.kill();
-      resolve(`(timeout ${timeoutSec}s)\n${out}`);
+      killChild(child); // the whole command, not just the shell around it
+      finish(`(timeout ${timeoutSec}s)\n${out}`);
     }, timeoutSec * 1000);
     child.on('close', (code) => {
-      clearTimeout(t);
-      resolve(`exit ${code}\n${out}`.trimEnd());
+      // A signal kill is what an interrupt looks like here; say so, because
+      // `exit null` alone would read like a crash.
+      const stopped = execution?.controller.signal.aborted;
+      finish(`${stopped ? '(interrupted) ' : ''}exit ${code}\n${out}`.trimEnd());
     });
     child.on('error', (e) => {
-      clearTimeout(t);
-      resolve(`error: ${e.message}`);
+      finish(`error: ${e.message}`);
     });
   });
 }
@@ -377,7 +487,12 @@ async function connectMcp(servers, log = console.error) {
     async call(n, args) {
       const e = registry.get(n);
       if (!e) throw new Error(`unknown mcp tool ${n}`);
-      const res = await e.client.request('tools/call', { name: e.name, arguments: args || {} }, 120000);
+      const work = e.client.request('tools/call', { name: e.name, arguments: args || {} }, 120000);
+      work.catch(() => {}); // a late result or timeout must not surface as unhandled
+      // An MCP request cannot be cancelled in flight, so Ctrl+C stops waiting on
+      // it instead; the tool keeps running server-side.
+      const signal = activeExecution?.controller.signal;
+      const res = signal ? await Promise.race([work, abortRace(signal)]) : await work;
       const text = (res?.content || []).map((c) => (c.type === 'text' ? c.text : JSON.stringify(c))).join('\n');
       return res?.isError ? `Error: ${text}` : (text || '(no content)');
     },
@@ -712,6 +827,8 @@ async function chat(messages, { tools = true, temperature = 0.2, replyLimit = ma
   // Shown from the moment the request goes out until the first token lands,
   // so a slow model never looks like a hung prompt.
   const waiting = quiet ? { stop() {} } : spinner('thinking…');
+  // Ctrl+C aborts the request through the execution that owns this turn.
+  const signal = activeExecution?.controller.signal;
   let res;
   try {
     res = await fetch(`${OPENAI.baseURL}/chat/completions`, {
@@ -721,6 +838,7 @@ async function chat(messages, { tools = true, temperature = 0.2, replyLimit = ma
         ...(OPENAI.apiKey ? { Authorization: `Bearer ${OPENAI.apiKey}` } : {}),
       },
       body: JSON.stringify(body),
+      ...(signal ? { signal } : {}),
     });
   } catch (e) {
     waiting.stop();
@@ -776,70 +894,91 @@ async function loop(messages, { maxSteps = 40, tools = true } = {}) {
   let replyLimit = maxTokens;
   const startedAt = Date.now();
   const stats = { steps: 0, calls: 0, writes: 0, commands: 0, blocked: 0, failed: 0 };
-  for (let i = 0; i < maxSteps; i++) {
-    stats.steps = i + 1;
-    noteContext(messages); // nudge before the request, never while a tool runs
-    let msg;
-    for (let retries = 0; ; retries++) {
-      try {
-        msg = await chat(messages, { tools, replyLimit });
-        break;
-      } catch (e) {
-        if (e.kind !== TOOL_CALL_PARSE_ERROR) throw e;
-        if (retries >= MAX_TOOL_CALL_RETRIES) {
-          throw new Error(`Tool call still invalid after ${MAX_TOOL_CALL_RETRIES} smaller-output retries. Stop and request smaller, targeted edits; check the server output limit and config maxTokens. ${e.message}`);
+  // The turn registers itself, so Ctrl+C can abort its request and kill any
+  // command a tool starts; endExecution() retires the handle either way.
+  const execution = beginExecution();
+  const aborted = () => execution.controller.signal.aborted;
+  try {
+    for (let i = 0; i < maxSteps; i++) {
+      if (aborted()) break; // Ctrl+C between steps: do not start another one
+      stats.steps = i + 1;
+      noteContext(messages); // nudge before the request, never while a tool runs
+      let msg;
+      for (let retries = 0; ; retries++) {
+        try {
+          msg = await chat(messages, { tools, replyLimit });
+          break;
+        } catch (e) {
+          if (aborted()) break; // interrupted: the turn ends here, without a retry
+          if (e.kind !== TOOL_CALL_PARSE_ERROR) throw e;
+          if (retries >= MAX_TOOL_CALL_RETRIES) {
+            throw new Error(`Tool call still invalid after ${MAX_TOOL_CALL_RETRIES} smaller-output retries. Stop and request smaller, targeted edits; check the server output limit and config maxTokens. ${e.message}`);
+          }
+          replyLimit = smallerReplyTokenLimit(replyLimit);
+          console.error(`${tag(`retry ${retries + 1}/${MAX_TOOL_CALL_RETRIES}`, s.yellow)} ${e.message}\n${s.dim(`Requesting one smaller tool call (max ${replyLimit} tokens); no tools from the rejected reply ran.`)}`);
+          messages.push({ role: 'user', content: toolCallRecovery(replyLimit) });
         }
-        replyLimit = smallerReplyTokenLimit(replyLimit);
-        console.error(`${tag(`retry ${retries + 1}/${MAX_TOOL_CALL_RETRIES}`, s.yellow)} ${e.message}\n${s.dim(`Requesting one smaller tool call (max ${replyLimit} tokens); no tools from the rejected reply ran.`)}`);
-        messages.push({ role: 'user', content: toolCallRecovery(replyLimit) });
       }
+      if (aborted()) break; // a reply cut short by Ctrl+C never enters the history
+      messages.push(msg);
+      noteContext(messages); // the reply itself can be what pushed us over the line
+      const calls = msg.tool_calls || [];
+      if (!calls.length) {
+        console.log(turnSummary(stats, startedAt));
+        return msg.content || '';
+      }
+      for (const [k, c] of calls.entries()) {
+        const name = c.function.name;
+        const mutating = MUTATING_TOOLS.has(name);
+        const paint = mutating ? s.yellow : s.cyan;
+        // Header: what is about to run, how far along the turn is, compact arguments.
+        console.log(
+          `\n${paint('⚙')} ${tag(name === 'read_file' ? 'read' : 'tool', paint)} ${s.bold(name)} ` +
+          `${s.dim(`· step ${i + 1}/${maxSteps} · call ${k + 1}/${calls.length}${mode === 'plan' && mutating ? ' · plan mode: project read-only' : ''}`)}\n` +
+          `  ${s.dim(summarizeArgs(c.function.arguments))}`
+        );
+        const running = spinner(`running ${name}…`);
+        let result;
+        try {
+          // Every call in the batch still gets a result, so the history never
+          // keeps an assistant tool_calls message with missing answers; a call
+          // an interrupt stopped before it ran simply answers with an error.
+          if (aborted()) throw abortError();
+          const args = JSON.parse(c.function.arguments || '{}');
+          result = await runTool(name, args);
+        } catch (e) { result = `error: ${e.message}`; }
+        finally { running.stop(); }
+        const full = String(result);
+        const content = full.slice(0, 20000);
+        const failed = content.startsWith('error:');
+        const blocked = failed && content.includes(PLAN_READ_ONLY);
+        stats.calls++;
+        if (blocked) stats.blocked++;
+        else if (failed) stats.failed++;
+        else if (name === 'run_command') stats.commands++;
+        else if (mutating) stats.writes++;
+        const lines = content ? content.split('\n').length : 0;
+        const mark = blocked ? s.yellow('⊘') : failed ? s.red('✗') : s.green('✓');
+        const status = blocked ? 'blocked' : failed ? 'failed' : 'ok';
+        console.log(
+          `${mark} ${tag('tool result', failed ? s.red : s.green)} ${s.bold(name)} ` +
+          `${s.dim(`· ${status} · ${fmtDuration(running.elapsedMs())} · ${lines} line${lines === 1 ? '' : 's'}`)}\n` +
+          previewResult(content, { truncatedFrom: full.length > content.length ? full.length : 0 })
+        );
+        messages.push({ role: 'tool', tool_call_id: c.id, content });
+      }
+      if (aborted()) break; // the interrupt already stopped this batch: end the turn
     }
-    messages.push(msg);
-    noteContext(messages); // the reply itself can be what pushed us over the line
-    const calls = msg.tool_calls || [];
-    if (!calls.length) {
+    if (aborted()) {
+      console.log(`\n${tag('interrupt', s.yellow)} ${s.dim('turn stopped — history is intact')}`);
       console.log(turnSummary(stats, startedAt));
-      return msg.content || '';
+      return '(stopped: interrupted)';
     }
-    for (const [k, c] of calls.entries()) {
-      const name = c.function.name;
-      const mutating = MUTATING_TOOLS.has(name);
-      const paint = mutating ? s.yellow : s.cyan;
-      // Header: what is about to run, how far along the turn is, compact arguments.
-      console.log(
-        `\n${paint('⚙')} ${tag(name === 'read_file' ? 'read' : 'tool', paint)} ${s.bold(name)} ` +
-        `${s.dim(`· step ${i + 1}/${maxSteps} · call ${k + 1}/${calls.length}${mode === 'plan' && mutating ? ' · plan mode: project read-only' : ''}`)}\n` +
-        `  ${s.dim(summarizeArgs(c.function.arguments))}`
-      );
-      const running = spinner(`running ${name}…`);
-      let result;
-      try {
-        const args = JSON.parse(c.function.arguments || '{}');
-        result = await runTool(name, args);
-      } catch (e) { result = `error: ${e.message}`; }
-      finally { running.stop(); }
-      const full = String(result);
-      const content = full.slice(0, 20000);
-      const failed = content.startsWith('error:');
-      const blocked = failed && content.includes(PLAN_READ_ONLY);
-      stats.calls++;
-      if (blocked) stats.blocked++;
-      else if (failed) stats.failed++;
-      else if (name === 'run_command') stats.commands++;
-      else if (mutating) stats.writes++;
-      const lines = content ? content.split('\n').length : 0;
-      const mark = blocked ? s.yellow('⊘') : failed ? s.red('✗') : s.green('✓');
-      const status = blocked ? 'blocked' : failed ? 'failed' : 'ok';
-      console.log(
-        `${mark} ${tag('tool result', failed ? s.red : s.green)} ${s.bold(name)} ` +
-        `${s.dim(`· ${status} · ${fmtDuration(running.elapsedMs())} · ${lines} line${lines === 1 ? '' : 's'}`)}\n` +
-        previewResult(content, { truncatedFrom: full.length > content.length ? full.length : 0 })
-      );
-      messages.push({ role: 'tool', tool_call_id: c.id, content });
-    }
+    console.log(`${s.dim('(stopped: max steps)')}\n${turnSummary(stats, startedAt)}`);
+    return '(stopped: max steps)';
+  } finally {
+    endExecution(execution);
   }
-  console.log(`${s.dim('(stopped: max steps)')}\n${turnSummary(stats, startedAt)}`);
-  return '(stopped: max steps)';
 }
 
 const COMPACT_PROMPT = `[compaction request]
@@ -879,6 +1018,7 @@ async function compactHistory(history) {
   const before = estimatePromptTokens(history);
   const [systemMsg, ...rest] = history;
   const tail = compactTail(rest);
+  const execution = beginExecution(); // a compaction is a request of its own: Ctrl+C stops it
   const spin = spinner('compacting conversation…');
   let summary = '';
   try {
@@ -886,8 +1026,14 @@ async function compactHistory(history) {
     summary = String(msg.content || '').trim();
   } catch (e) {
     spin.stop();
+    if (execution.controller.signal.aborted) {
+      console.log(`${tag('compact', s.yellow)} compaction interrupted — history kept as is`);
+      return null;
+    }
     console.log(`${tag('compact', s.red)} compaction failed: ${e.message} — history kept as is`);
     return null;
+  } finally {
+    endExecution(execution);
   }
   spin.stop();
   if (!summary) {
@@ -946,7 +1092,7 @@ async function planTurn(history, userText) {
   const text = await loop(history, { tools: true });
   const prompt = extractImplementPrompt(text);
   const planFile = prompt ? savePlan(prompt) : null;
-  return { text, prompt, planFile };
+  return { text, prompt, planFile, interrupted }; // interrupted: Ctrl+C stopped the turn
 }
 
 async function implementTurn(planFile) {
@@ -1011,9 +1157,17 @@ const HELP = `basic.mjs — plan then implement.
   /implement [file]  run the last saved plan (or the given plan file / ad-hoc text)
   /prompt            print the last saved plan and its path
   /compact           summarize the conversation to free context
+  /reset             clear the conversation (same session, fresh context)
   /verbose           toggle full tool arguments/results (default: compact preview)
   /tools             list tools
   /quit
+
+Ctrl+C stops the running execution — the model request and any command a tool
+started — and returns to the prompt with the history intact. Pressing it again
+within two seconds, or while the agent is idle, exits.
+/reset drops the whole conversation (the system prompt is rebuilt and the plan
+pointer is forgotten; the saved plan file stays on disk), so the next request
+starts from an empty context.
 
 Everything goes through plan, then implement.
 PLAN mode is analysis only — the project is read-only. write_file/edit_file
@@ -1077,6 +1231,22 @@ async function main() {
       if (freed) console.log(`${tag('compact', s.cyan)} conversation: ${fmtTokens(freed.before)} → ${fmtTokens(freed.after)} tokens`);
       return;
     }
+    if (t === '/reset') {
+      // Fresh context in the same session: the system prompt is rebuilt and the
+      // whole history is dropped. The plan pointer goes too (a fresh context
+      // implies a fresh plan) — the saved plan file itself stays on disk.
+      const dropped = planHistory.length - 1;
+      planHistory.length = 0;
+      planHistory.push({ role: 'system', content: planSystem() });
+      contextWarned = false; // the new history decides whether compact mode is on
+      compactMode = false;
+      lastPlanFile = null;
+      console.log(
+        `${tag('reset', s.cyan)} conversation cleared — ${dropped} message${dropped === 1 ? '' : 's'} dropped. ` +
+        `${s.dim('The next request starts fresh.')}`
+      );
+      return;
+    }
     if (t === '/plan' || t.startsWith('/plan ')) {
       mode = 'plan';
       const rest = t.slice(5).trim();
@@ -1110,7 +1280,13 @@ async function main() {
   }
 
   if (opts.once) {
-    const { planFile } = await planTurn(planHistory, opts.once);
+    const { planFile, interrupted: stopped } = await planTurn(planHistory, opts.once);
+    if (stopped) { // Ctrl+C: there is no plan to implement, so just leave
+      console.error(s.dim('interrupted'));
+      mcp.closeAll();
+      process.exitCode = 130;
+      return;
+    }
     if (!planFile) {
       console.error(s.red('plan did not produce IMPLEMENT PROMPT'));
       process.exitCode = 1;
@@ -1122,18 +1298,23 @@ async function main() {
     console.log(`\n${tag('implement', s.cyan)} ${s.dim(`plan: ${planFile}`)}\n`);
     await implementTurn(planFile);
     mcp.closeAll();
+    if (interrupted) process.exitCode = 130; // Ctrl+C stopped the implement turn
     return;
   }
 
   console.log(`${s.bold('basic.mjs')}  ${s.dim(`model=${OPENAI.model}  dir=${workspace}  mode=plan`)}`);
   console.log(s.dim(`plan mode is read-only; plans are saved under ${planDir}`));
-  console.log(`${s.dim('describe the task. agent plans, then')} ${s.cyan('/implement')}${s.dim('.')}\n`);
+  console.log(`${s.dim('describe the task. agent plans, then')} ${s.cyan('/implement')}${s.dim('.')}`);
+  console.log(`${s.dim('Ctrl+C stops the running turn (press twice to quit);')} ${s.cyan('/reset')} ${s.dim('clears the context.')}\n`);
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const ask = () => rl.question(`${s.cyan(`${mode}>`)} `, async (line) => {
     try { await handle(line); }
     catch (e) { console.error(s.red(e.message)); }
     ask();
   });
+  // On a TTY, readline keeps stdin raw and reports Ctrl+C itself; the process
+  // handler covers the non-TTY and --once cases. Both land in onInterrupt.
+  rl.on('SIGINT', onInterrupt);
   rl.on('close', () => { mcp.closeAll(); process.exit(0); });
   ask();
 }

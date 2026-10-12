@@ -145,18 +145,24 @@ async function interactive(handler, configOptions = {}) {
     await cleanup();
     throw e;
   }
+  // Memoized, so a test can finish() from a finally block as well as from the
+  // happy path: a child left behind would keep the test runner alive for good.
+  let finished = null;
+  const finish = () => (finished ??= (async () => {
+    child.stdin.end(); // the CLI is idle by now, so it sees EOF and exits
+    const timeout = setTimeout(() => child.kill(), 5000);
+    const [code] = await once(child, 'close').finally(() => clearTimeout(timeout));
+    await cleanup();
+    if (serverError) throw serverError;
+    return { code, stdout, requests };
+  })());
   return {
     send,
     waitNew,
     requests,
-    async finish() {
-      child.stdin.end(); // the CLI is idle by now, so it sees EOF and exits
-      const timeout = setTimeout(() => child.kill(), 5000);
-      const [code] = await once(child, 'close').finally(() => clearTimeout(timeout));
-      await cleanup();
-      if (serverError) throw serverError;
-      return { code, stdout, requests };
-    },
+    /** Signal the CLI: 'SIGINT' is what Ctrl+C turns into for a piped stdin. */
+    kill: (signal = 'SIGINT') => child.kill(signal),
+    finish,
   };
 }
 
@@ -647,4 +653,155 @@ test('compact mode trims older tool results from requests above 90% and asks for
   assert.match(result.stdout, /STILL-WORKING/);
   // History is intact: step 4 saw the full "small" result, and the nudge is printed once per crossing.
   assert.equal(result.stdout.split('compact mode on').length - 1, 1);
+});
+
+/* ------------------------------------------------------------------ */
+/* Ctrl+C interrupts and /reset                                        */
+/* ------------------------------------------------------------------ */
+
+test('/reset clears the conversation, so the next request starts fresh', async () => {
+  const live = await interactive(({ res, step, body }) => {
+    startSse(res);
+    if (step === 2) {
+      // After /reset the history holds nothing but the system prompt and the
+      // new user message — the earlier turns are gone, not just trimmed.
+      assert.equal(body.messages.length, 2);
+      assert.equal(body.messages[0].role, 'system');
+      assert.equal(body.messages[1].content, 'second question');
+    }
+    res.end(frame({ content: `REPLY-${step}` }, 'stop') + 'data: [DONE]\r\n\r\n');
+  });
+
+  let result = null;
+  try {
+    live.send('/plan first question');
+    await live.waitNew('REPLY-1');
+    live.send('/reset');
+    await live.waitNew('conversation cleared');
+    live.send('/plan second question');
+    await live.waitNew('REPLY-2');
+    result = await live.finish();
+  } finally {
+    if (!result) await live.finish().catch(() => {}); // a failed assertion must not leak the CLI
+  }
+  assert.equal(result.code, 0, result.stdout);
+  assert.match(result.stdout, /\[reset\] conversation cleared — 2 messages dropped\. The next request starts fresh\./);
+  assert.equal(result.requests.length, 2, '/reset must not talk to the model');
+});
+
+test('Ctrl+C stops an in-flight request without ending the session', async () => {
+  const live = await interactive(({ res, step, body }) => {
+    startSse(res);
+    if (step === 1) {
+      res.write(frame({ content: 'STREAMING-BEFORE-INTERRUPT' }));
+      return; // never finish: the test interrupts this request instead
+    }
+    // The cut-short reply never entered the history, and the turn that owned
+    // it did not ask again — only the new user message is here.
+    assert.equal(body.messages.length, 3);
+    assert.equal(body.messages.at(-1).content, 'after interrupt');
+    assert.equal(body.messages.some((m) => m.role === 'assistant'), false, JSON.stringify(body.messages));
+    res.end(frame({ content: 'REPLY-AFTER-INTERRUPT' }, 'stop') + 'data: [DONE]\r\n\r\n');
+  });
+
+  let result = null;
+  try {
+    live.send('/plan slow question');
+    await live.waitNew('STREAMING-BEFORE-INTERRUPT'); // the request is in flight
+    live.kill('SIGINT'); // Ctrl+C
+    await live.waitNew('stopping the current execution');
+    await live.waitNew('turn stopped — history is intact');
+    live.send('/plan after interrupt'); // the session survived and still works
+    await live.waitNew('REPLY-AFTER-INTERRUPT');
+
+    live.kill('SIGINT'); // nothing is running now: Ctrl+C leaves the prompt
+    await live.waitNew('interrupted — exiting');
+    result = await live.finish();
+  } finally {
+    if (!result) await live.finish().catch(() => {}); // a failed assertion must not leak the CLI
+  }
+  assert.equal(result.code, 0, result.stdout);
+  assert.equal(result.requests.length, 2);
+});
+
+test('Ctrl+C kills the command a tool started and ends the turn', async () => {
+  const live = await interactive(({ res, step, body }) => {
+    startSse(res);
+    if (step === 1) {
+      res.end(frame({ tool_calls: [call('sleep', 'run_command', { command: 'sleep 30', timeout_sec: 60 })] }, 'tool_calls'));
+      return;
+    }
+    // The turn ended after the interrupted batch instead of asking again, and
+    // the killed command answered with a result the model can read. The
+    // history here is: system, user, assistant, tool, and the new user turn.
+    assert.equal(body.messages.length, 5);
+    assert.equal(body.messages.filter((m) => m.role === 'assistant').length, 1);
+    assert.equal(body.messages.at(-1).content, 'after the kill');
+    const killed = body.messages.find((m) => m.tool_call_id === 'sleep');
+    assert.equal(killed.role, 'tool');
+    assert.equal(killed.content, '(interrupted) exit null');
+    res.end(frame({ content: 'REPLY-AFTER-KILL' }, 'stop') + 'data: [DONE]\r\n\r\n');
+  });
+
+  let result = null;
+  try {
+    live.send('/plan run a slow command');
+    await live.waitNew('· running run_command…'); // the command is running
+    live.kill('SIGINT'); // Ctrl+C
+    await live.waitNew('stopping the current execution');
+    await live.waitNew('turn stopped — history is intact');
+    live.send('/plan after the kill');
+    await live.waitNew('REPLY-AFTER-KILL');
+    result = await live.finish();
+  } finally {
+    if (!result) await live.finish().catch(() => {}); // a failed assertion must not leak the CLI
+  }
+  assert.equal(result.code, 0, result.stdout);
+  assert.equal(result.requests.length, 2, 'the interrupted turn sent no further request');
+  assert.match(result.stdout, /\(interrupted\) exit null/);
+});
+
+test('--once exits 130 when Ctrl+C stops the run', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'basic-once-interrupt-'));
+  const server = createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.write(frame({ content: 'STILL-REQUESTING' })); // hold the stream open
+  });
+  let child;
+  try {
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const config = path.join(dir, 'config.json');
+    fs.writeFileSync(config, JSON.stringify({ planDir: path.join(dir, '.plans'), workspace: dir, openai: {
+      baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: '', model: 'mock',
+    } }));
+    child = spawn(process.execPath, [basic, '--config', config, '--once', 'slow task'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`no reply in flight:\n${stdout}${stderr}`)), 5000);
+      const check = () => {
+        if (!stdout.includes('STILL-REQUESTING')) return;
+        clearTimeout(timer);
+        child.stdout.removeListener('data', check);
+        resolve();
+      };
+      child.stdout.on('data', check);
+    });
+    child.kill('SIGINT'); // a TTY would deliver the same thing as Ctrl+C
+    const timeout = setTimeout(() => child.kill(), 5000);
+    const [code] = await once(child, 'close').finally(() => clearTimeout(timeout));
+    assert.equal(code, 130, `${stdout}\n${stderr}`);
+    assert.match(stdout, /stopping the current execution/);
+    assert.match(stderr, /interrupted/);
+  } finally {
+    child?.kill();
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
