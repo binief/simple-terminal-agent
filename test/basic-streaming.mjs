@@ -134,6 +134,10 @@ test('live reasoning/text, fragmented parallel tools, results and history', asyn
   for (const text of ['[thinking]', '[response]', '[read] read_file', '[tool] unknown_tool', '[tool result] read_file', 'héllo 🌍', 'error:']) {
     assert.ok(result.stdout.includes(text), result.stdout);
   }
+  // Piped output gets one non-animated progress line per wait, not a frame stream.
+  assert.ok(result.stdout.includes('· thinking…'), result.stdout);
+  assert.ok(result.stdout.includes('· running read_file…'), result.stdout);
+  assert.doesNotMatch(result.stdout, /\x1b\[K/, 'no terminal redraws when stdout is a pipe');
 });
 
 test('JSON-only compatible servers still display reasoning and responses once', async () => {

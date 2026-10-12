@@ -22,6 +22,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { spawn } from 'node:child_process';
 import { classifyApiError, serverErrorSummary, smallerReplyTokenLimit, TOOL_CALL_PARSE_ERROR } from './lib/llm.js';
+import { spinner } from './lib/ui.js';
 
 const OPENAI = {
   baseURL: (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, ''),
@@ -412,17 +413,23 @@ For existing files, use targeted edit_file calls rather than rewriting the whole
 Return valid JSON with properly escaped strings and closing quotes/braces. Do not repeat the oversized call.`;
 }
 
-async function readChatResponse(res) {
+// waiting = the "still working" indicator to clear as soon as anything prints,
+// so the spinner never fights the streamed text for the same terminal row.
+async function readChatResponse(res, waiting) {
   const output = consoleStream();
   const show = (delta) => {
+    const thinking = delta.reasoning_content || delta.reasoning || '';
+    const content = delta.content || '';
+    if (thinking || content) waiting.stop();
     // Only display reasoning explicitly supplied by the provider.
-    output.write('thinking', delta.reasoning_content || delta.reasoning || '');
-    output.write('response', delta.content || '');
+    output.write('thinking', thinking);
+    output.write('response', content);
   };
   try {
     // Some OpenAI-compatible servers ignore stream: true and return JSON.
     if (!(res.headers.get('content-type') || '').includes('text/event-stream')) {
       const json = await res.json();
+      waiting.stop();
       if (json.error) throw llmError(json.error);
       const msg = json.choices?.[0]?.message;
       if (!msg) throw new Error('LLM returned no message');
@@ -466,7 +473,10 @@ async function readChatResponse(res) {
       msg.tool_calls = [...calls.entries()].sort(([a], [b]) => a - b).map(([, call]) => call);
     }
     return validateToolCalls(msg);
-  } finally { output.end(); }
+  } finally {
+    waiting.stop(); // e.g. error paths and replies with no visible text
+    output.end();
+  }
 }
 
 async function chat(messages, { tools = true, temperature = 0.2, replyLimit = maxTokens } = {}) {
@@ -481,16 +491,28 @@ async function chat(messages, { tools = true, temperature = 0.2, replyLimit = ma
     const t = openaiTools();
     if (t.length) body.tools = t;
   }
-  const res = await fetch(`${OPENAI.baseURL}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(OPENAI.apiKey ? { Authorization: `Bearer ${OPENAI.apiKey}` } : {}),
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw llmError(await res.text(), res.status);
-  return await readChatResponse(res);
+  // Shown from the moment the request goes out until the first token lands,
+  // so a slow model never looks like a hung prompt.
+  const waiting = spinner('thinking…');
+  let res;
+  try {
+    res = await fetch(`${OPENAI.baseURL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(OPENAI.apiKey ? { Authorization: `Bearer ${OPENAI.apiKey}` } : {}),
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    waiting.stop();
+    throw e;
+  }
+  if (!res.ok) {
+    waiting.stop();
+    throw llmError(await res.text(), res.status);
+  }
+  return await readChatResponse(res, waiting);
 }
 
 async function runTool(name, args) {
@@ -536,11 +558,13 @@ async function loop(messages, { maxSteps = 40, tools = true } = {}) {
     for (const c of calls) {
       const name = c.function.name;
       console.log(`\n[${name === 'read_file' ? 'read' : 'tool'}] ${name}\n${c.function.arguments || '{}'}`);
+      const running = spinner(`running ${name}…`);
       let result;
       try {
         const args = JSON.parse(c.function.arguments || '{}');
         result = await runTool(name, args);
       } catch (e) { result = `error: ${e.message}`; }
+      finally { running.stop(); }
       const content = String(result).slice(0, 20000);
       console.log(`[tool result] ${name}\n${content}`);
       if (String(result).length > content.length) console.log('(result truncated to 20000 chars)');
@@ -612,6 +636,8 @@ Everything goes through plan, then implement.
 Plan writes an IMPLEMENT PROMPT. Implement uses only that as the user prompt.
 Responses stream live. Console labels: [response], [thinking] (when supplied by
 the API), [read]/[tool] with arguments, and [tool result] (up to 20000 chars).
+While work is in progress a live line (thinking…, running <tool>…) shows elapsed
+time; it is erased as soon as the next output starts.
 Config maxTokens sets the reply budget (default 4096, minimum 256).
 Invalid tool-call JSON is retried up to 3 times with smaller-call instructions.`;
 
