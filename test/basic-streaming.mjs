@@ -76,6 +76,88 @@ async function session(handler, configOptions = {}) {
   }
 }
 
+/**
+ * Like session(), but keeps the child's stdin open so slash commands can be
+ * driven one at a time — the CLI reads lines only while it is idle, so the
+ * test must wait for a reply before sending the next command.
+ */
+async function interactive(handler, configOptions = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'basic-interactive-'));
+  fs.writeFileSync(path.join(dir, 'fixture.txt'), 'héllo 🌍');
+  const requests = [];
+  let stdout = '';
+  let cursor = 0;
+  let serverError;
+  const waiters = [];
+  const settle = () => {
+    for (let i = waiters.length - 1; i >= 0; i--) if (waiters[i]()) waiters.splice(i, 1);
+  };
+  /** Wait for text printed *after* the last settled marker, then move past it. */
+  const waitNew = (text, ms = 5000) => {
+    const hit = () => {
+      const at = stdout.indexOf(text, cursor);
+      if (at < 0) return false;
+      cursor = at + text.length;
+      return true;
+    };
+    if (hit()) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`No output ${JSON.stringify(text)} in:\n${stdout}`)), ms);
+      waiters.push(() => (hit() ? (clearTimeout(timer), resolve(), true) : false));
+    });
+  };
+  const server = createServer(async (req, res) => {
+    try {
+      let raw = '';
+      for await (const chunk of req) raw += chunk;
+      const body = JSON.parse(raw);
+      requests.push(body);
+      await handler({ body, res, step: requests.length, dir });
+    } catch (e) {
+      serverError = e;
+      res.destroy();
+    }
+  });
+  let child;
+  const send = (line) => child.stdin.write(`${line}\n`);
+  const cleanup = async () => {
+    child?.kill();
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(dir, { recursive: true, force: true });
+  };
+  try {
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const config = path.join(dir, 'config.json');
+    fs.writeFileSync(config, JSON.stringify({ ...configOptions, workspace: dir, openai: {
+      baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: '', model: 'mock',
+    } }));
+    child = spawn(process.execPath, [basic, '--config', config], { stdio: ['pipe', 'pipe', 'pipe'] });
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (data) => { stdout += data; settle(); });
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (data) => { stdout += data; settle(); });
+    await waitNew('mode=plan');
+  } catch (e) {
+    await cleanup();
+    throw e;
+  }
+  return {
+    send,
+    waitNew,
+    requests,
+    async finish() {
+      child.stdin.end(); // the CLI is idle by now, so it sees EOF and exits
+      const timeout = setTimeout(() => child.kill(), 5000);
+      const [code] = await once(child, 'close').finally(() => clearTimeout(timeout));
+      await cleanup();
+      if (serverError) throw serverError;
+      return { code, stdout, requests };
+    },
+  };
+}
+
 // Split every byte, including UTF-8 characters and CRLF separators.
 async function bytes(res, text) {
   for (const byte of Buffer.from(text)) {
@@ -262,4 +344,59 @@ test('section edits preserve literal dollar sequences', async () => {
     }
   });
   assert.equal(result.code, 0, result.stderr);
+});
+
+test('contextSize drives a /compact nudge once the window is nearly full', async () => {
+  const result = await session(({ res, step }) => {
+    // A plan big enough to fill most of a 2k-token window (also the implement
+    // prompt, so the nudge can be observed in both modes).
+    const content = step === 1 ? `IMPLEMENT PROMPT\n---\n${'filler '.repeat(1400)}\n---` : 'done';
+    startSse(res);
+    res.end(frame({ content }, 'stop') + 'data: [DONE]\r\n\r\n');
+  }, { contextSize: 2000 });
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /\[context\] ~[\d.]+k? of 2\.0k tokens \(\d+%\)/);
+  assert.match(result.stdout, /run \/compact to summarize/);
+});
+
+test('context config below the floor is rejected', async () => {
+  const result = await session(({ res }) => res.end('{}'), { contextSize: 100 });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /contextSize must be an integer >= 2000/);
+});
+
+test('/compact summarizes the conversation, keeps the tail and drops the originals', async () => {
+  const big = `OLD ${'history '.repeat(1200)}`;
+  const live = await interactive(({ res, step }) => {
+    startSse(res);
+    if (step === 1) {
+      res.end(frame({ content: `IMPLEMENT PROMPT\n---\n${big}\n---` }, 'stop') + 'data: [DONE]\r\n\r\n');
+    } else if (step === 2) {
+      res.end(frame({ content: 'REPLY-TWO' }, 'stop') + 'data: [DONE]\r\n\r\n');
+    } else if (step === 3) {
+      res.end(frame({ content: 'SUMMARY: inspected the fixture; nothing pending.' }, 'stop') + 'data: [DONE]\r\n\r\n');
+    } else {
+      res.end(frame({ content: 'REPLY-AFTER' }, 'stop') + 'data: [DONE]\r\n\r\n');
+    }
+  }, { contextSize: 2000 });
+
+  live.send('/plan inspect the fixture');
+  await live.waitNew(big.slice(0, 8)); // the reply with the oversized history lands
+  await live.waitNew('[context]'); // 90% nudge printed right after that reply
+  live.send('/plan second question');
+  await live.waitNew('REPLY-TWO');
+  live.send('/compact');
+  await live.waitNew('[compact] conversation:'); // the summary itself is never echoed
+  live.send('/plan after compact');
+  await live.waitNew('REPLY-AFTER');
+
+  const result = await live.finish();
+  assert.equal(result.code, 0, result.stdout);
+  assert.match(result.stdout, /\[compact\] conversation: [\d.]+k? → [\d.]+k? tokens/);
+  const compactRequest = result.requests[2];
+  assert.match(compactRequest.messages.at(-1).content, /\[compaction request\]/);
+  const after = result.requests[3];
+  assert.match(after.messages[1].content, /Earlier in this session \(compacted summary/);
+  assert.match(after.messages[1].content, /SUMMARY: inspected the fixture/);
+  assert.equal(JSON.stringify(after).includes('history history'), false, 'the old messages were dropped');
 });
