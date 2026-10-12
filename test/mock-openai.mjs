@@ -49,7 +49,7 @@ function oversizeErrorBody() {
   });
 }
 
-function plan(messages) {
+function plan(messages, maxTokens = null) {
   const toolMsgs = messages.filter((m) => m.role === 'tool');
   const userText = messages.filter((m) => m.role === 'user').map((m) => m.content).join(' ');
   const lastTool = toolMsgs.length ? String(toolMsgs[toolMsgs.length - 1].content) : '';
@@ -146,7 +146,7 @@ function plan(messages) {
       };
     }
     const split = /write a long file in sections|one edit_file per section|first section only/i.test(userText);
-    return { text: `MOCK-DONE oversize requests=${oversizeRequests} split=${split ? 'yes' : 'no'}` };
+    return { text: `MOCK-DONE oversize requests=${oversizeRequests} split=${split ? 'yes' : 'no'} maxTokens=${maxTokens}` };
   }
 
   // never finishes: one tool call per reply, forever — for step-limit tests
@@ -166,14 +166,17 @@ function plan(messages) {
   // must not have, to prove the registry is pruned and not merely asked nicely.
   if (systemText.includes('coding subagent')) {
     if (toolMsgs.length === 0) {
+      const file = userText.includes('OVERSIZE-SUBAGENT') ? 'delegated-oversize.txt' : 'delegated.txt';
       return {
-        tool: { id: 'call_s1', name: 'write_file', arguments: JSON.stringify({ path: 'delegated.txt', content: 'written-by-subagent' }) },
+        tool: { id: 'call_s1', name: 'write_file', arguments: JSON.stringify({ path: file, content: 'written-by-subagent' }) },
       };
     }
     if (toolMsgs.length === 1) {
       return { tool: { id: 'call_s2', name: 'delegate', arguments: JSON.stringify({ agent: 'coder', goal: 'recurse please' }) } };
     }
-    return { text: `SUBAGENT-REPORT Done: wrote delegated.txt. Recursion: ${/not available to this agent/.test(lastTool) ? 'refused' : 'allowed'}.` };
+    const file = userText.includes('OVERSIZE-SUBAGENT') ? 'delegated-oversize.txt' : 'delegated.txt';
+    const cap = userText.includes('OVERSIZE-SUBAGENT') ? ` output-cap=${maxTokens}` : '';
+    return { text: `SUBAGENT-REPORT Done: wrote ${file}. Recursion: ${/not available to this agent/.test(lastTool) ? 'refused' : 'allowed'}.${cap}` };
   }
   if (systemText.includes('research subagent')) {
     if (toolMsgs.length === 0) {
@@ -187,6 +190,24 @@ function plan(messages) {
     const refusedWrite = /not available to this agent/.test(String(toolMsgs[0].content));
     const refusedCmd = /read-only/.test(lastTool);
     return { text: `RESEARCH-REPORT Answer: write=${refusedWrite ? 'refused' : 'allowed'} command=${refusedCmd ? 'refused' : 'allowed'}` };
+  }
+
+  if (userText.includes('DELEGATE-OVERSIZE')) {
+    if (toolMsgs.length === 0) {
+      return {
+        tool: {
+          id: 'call_do',
+          name: 'delegate',
+          arguments: JSON.stringify({
+            agent: 'coder',
+            goal: 'Create delegated-oversize.txt containing the recovery probe. OVERSIZE-SUBAGENT.',
+            files: ['delegated-oversize.txt'],
+          }),
+        },
+      };
+    }
+    const cap = /output-cap=([0-9]+)/.exec(lastTool)?.[1];
+    return { text: `MOCK-DONE oversized-subagent=${cap === '512' ? 'recovered' : 'not-recovered'}` };
   }
 
   if (userText.includes('DELEGATE-ME')) {
@@ -365,14 +386,18 @@ const server = http.createServer((req, res) => {
       res.end('transient server error');
       return;
     }
-    if (userText.includes('OVERSIZE-TOOL') || userText.includes('OVERSIZE-ALWAYS')) {
+    if (userText.includes('OVERSIZE-TOOL') || userText.includes('OVERSIZE-ALWAYS') || userText.includes('OVERSIZE-SUBAGENT')) {
       const key = (body.messages || []).filter((m) => m.role === 'system').map((m) => m.content).join('|');
       oversizeRequests = (oversizeCounts.get(key) || 0) + 1;
       oversizeCounts.set(key, oversizeRequests);
-      // Every attempt fails the same way until the harness stops re-sending the
-      // same request and tells the model to make the call smaller. OVERSIZE-ALWAYS
-      // never recovers: the harness must give up after a bounded number of tries.
-      if (userText.includes('OVERSIZE-ALWAYS') || !userText.includes(OVERSIZED_TOOL_CALL_TAG)) {
+      const subagent = userText.includes('OVERSIZE-SUBAGENT');
+      // The subagent case only recovers once the retry cap is below the threshold.
+      // OVERSIZE-ALWAYS never recovers; the harness must stop after a bounded run.
+      if (
+        userText.includes('OVERSIZE-ALWAYS') ||
+        !userText.includes(OVERSIZED_TOOL_CALL_TAG) ||
+        (subagent && Number(body.max_tokens) > 512)
+      ) {
         const payload = oversizeErrorBody();
         if (body.stream) {
           // streamed shape: the error arrives as an SSE event, not as a status
@@ -386,7 +411,7 @@ const server = http.createServer((req, res) => {
         return;
       }
     }
-    const decision = plan(body.messages || []);
+    const decision = plan(body.messages || [], body.max_tokens);
     if (body.stream) sseReply(res, decision);
     else jsonReply(res, decision, body);
   });

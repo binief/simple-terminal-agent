@@ -607,8 +607,10 @@ The harness actively keeps a turn running to completion instead of stopping half
   ran past `max_tokens`. That is a 5xx, but it is not transient: re-sending the identical request spends
   another full generation on the identical broken reply. The harness classifies it, skips the retries,
   prints the server's first sentence (not the kilobytes of your own file it echoes back) and tells the
-  model to split the work — `write_file` for the first section, then one `edit_file` per section after
-  it. The turn continues; after three such rejections in a row it stops and points at `"maxTokens"`.
+  model to split the work — `write_file` for the first section, then one `edit_file` in each separate
+  reply after it (dependent section writes are never batched). Each retry also lowers that turn's reply
+  token cap, so the model has less room to regenerate the same oversized call. The turn gets three
+  automatic retries; if the fourth reply is rejected too, it stops and points at `"maxTokens"`.
 - **The step limit warns before it bites.** A turn is capped at `maxSteps` model replies (default 50 —
   previously a hardcoded 25). Three steps before the limit the model is told to wrap the task up or say
   what remains; if the limit is still reached, the message points at the `"maxSteps"` config key. Raise

@@ -434,6 +434,7 @@ async function main() {
   check('tools: locate then window instead of whole files', /Locate, then window/.test(sys) && /never scroll a large file into context/.test(sys), sys);
   check('tools: old_text copied verbatim from read_file', /Copy old_text verbatim from read_file/.test(sys), sys);
   check('tools: never rewrite an unread file', /a deliberate full rewrite of a file you have read/.test(sys), sys);
+  check('tools: long writes use separate replies instead of batching', /one edit_file per section in separate replies/.test(sys) && /Never batch dependent section writes/.test(sys), sys);
   check('tools: no acting on truncated output', /never edit around a marker/.test(sys), sys);
   check('tools: no loops — the tool result is the confirmation', /never re-run a command that already succeeded/.test(sys), sys);
   check('run_command: non-interactive, non-paginated, OS-aware', /Non-interactive only/.test(sys) && /--no-pager/.test(sys) && /no bash-isms under Windows cmd\.exe/.test(sys), sys);
@@ -523,6 +524,7 @@ async function main() {
   check('compact still forbids unverified success', /Never claim unverified success/.test(compact), compact);
   check('compact still forbids commits and secrets', /Never commit, push or switch branches unless asked/.test(compact) && /Never print secrets/.test(compact), compact);
   check('compact still pins read-before-edit and verbatim old_text', /Read a file before changing it/.test(compact) && /copy old_text verbatim/.test(compact), compact);
+  check('compact writes large files one section per reply', /one edit_file section per separate reply/.test(compact) && /never batch section writes/.test(compact), compact);
   check('compact drops the harness-mechanics section', !compact.includes('# Harness mechanics'), compact);
   check('compact keeps one mode-independent autonomy block', compact.includes('Finish the task before yielding') && buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'compact', planning: true }).includes('Finish the task before yielding'), 'autonomy flips by mode');
   check('compact still carries plan blocks and instructions', buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'compact', blocks: ['BLOCK'], instructions: 'RULE' }).includes('BLOCK') === true && buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'compact', instructions: 'RULE' }).includes('RULE'), 'missing');
@@ -1087,6 +1089,7 @@ async function main() {
   const researchSys = subagentPrompt('researcher', { cwd: '/w', platform: 'p', date: '2025-01-02' });
   check('each subagent prompt states its report format', /# Your report/.test(coderSys) && /# Your report/.test(researchSys), coderSys.slice(0, 200));
   check('the coder is told its context is discarded', /context is discarded/.test(coderSys) && /sees nothing else/.test(coderSys), coderSys);
+  check('the coder sends large writes one section per reply', /one section in one reply/.test(coderSys) && /wait for its result before the next/.test(coderSys), coderSys);
   check('the researcher is told not to design the change', /Do not design the change/.test(researchSys), researchSys);
   check('subagent prompts stay small', coderSys.length < 2600 && researchSys.length < 2600, `coder ${coderSys.length} / researcher ${researchSys.length}`);
   check('an unknown subagent type is rejected', (() => { try { subagentPrompt('wizard', { cwd: '/w', platform: 'p' }); return false; } catch { return true; } })(), 'accepted');
@@ -1108,6 +1111,25 @@ async function main() {
   check('the handover is accounted for', /subagent done — \d+ step\(s\)/.test(dres.out), dres.out);
   check('the discarded context is reported to the user', /tokens discarded/.test(dres.out), dres.out);
   check('the report reaches the model with its provenance', dres.out.includes('head=yes'), dres.out);
+
+  const delOversizeDir = path.join(tmp, 'delegate-oversize-work');
+  fs.mkdirSync(delOversizeDir, { recursive: true });
+  const cfgDelOversize = writeConfig('cfg-delegate-oversize.json', {
+    ...baseConfig(port),
+    workspace: delOversizeDir,
+    delegation: 'optional',
+  });
+  dres = await run(
+    process.execPath,
+    [harness, '--config', cfgDelOversize, '--no-stream', '--once', 'DELEGATE-OVERSIZE please'],
+    { cwd: delOversizeDir }
+  );
+  check('a delegated oversized write retries with a smaller cap', dres.code === 0 && dres.out.includes('oversized-subagent=recovered'), dres.out);
+  check(
+    'the subagent completes its write after reducing the cap',
+    fs.readFileSync(path.join(delOversizeDir, 'delegated-oversize.txt'), 'utf8') === 'written-by-subagent',
+    'wrong content'
+  );
 
   // the researcher really is read-only
   dres = await run(process.execPath, [harness, '--config', cfgDel, '--no-stream', '--once', 'RESEARCH-ME please'], { cwd: delDir });
@@ -1560,8 +1582,14 @@ async function main() {
   check('transient API errors are retried', res.code === 0 && res.out.includes('MOCK-DONE retried-ok'), res.out);
 
   /* --- a 500 that is really the server rejecting the model's own tool call --- */
-  const { classifyApiError, serverErrorSummary, oversizedToolCallNudge, TOOL_CALL_PARSE_ERROR, OVERSIZED_TOOL_CALL_TAG } =
-    await import(pathToFileURL(path.join(proj, 'lib', 'llm.js')).href);
+  const {
+    classifyApiError,
+    serverErrorSummary,
+    oversizedToolCallNudge,
+    smallerReplyTokenLimit,
+    TOOL_CALL_PARSE_ERROR,
+    OVERSIZED_TOOL_CALL_TAG,
+  } = await import(pathToFileURL(path.join(proj, 'lib', 'llm.js')).href);
 
   const llamaBody = JSON.stringify({
     error: {
@@ -1584,6 +1612,9 @@ async function main() {
   check('the recovery nudge is tagged', nudge.includes(OVERSIZED_TOOL_CALL_TAG), nudge);
   check('the recovery nudge quotes the reply limit', nudge.includes('4096-token') && nudge.includes('12k characters'), nudge);
   check('the recovery nudge says how to split the work', /write_file with the first section only/.test(nudge) && /one edit_file per following section/.test(nudge), nudge);
+  check('the recovery nudge says to use a separate reply for each section', /in a separate reply/.test(nudge) && /Do not batch section writes/.test(nudge), nudge);
+  check('an oversized reply retry halves its token cap', smallerReplyTokenLimit(4096) === 2048 && smallerReplyTokenLimit(1024) === 512, 'wrong reduction');
+  check('an oversized reply cap bottoms out at 256 tokens', smallerReplyTokenLimit(512) === 256 && smallerReplyTokenLimit(256) === 256, 'wrong floor');
 
   // end to end: one failed request, the nudge, then the work gets done
   const workO = path.join(tmp, 'workO');
@@ -1596,7 +1627,9 @@ async function main() {
   check('an oversized tool call is not retried blindly', res.out.includes('requests=3'), res.out.slice(0, 1200));
   check('the turn recovers instead of dying', res.code === 0 && res.out.includes('MOCK-DONE oversize'), res.out.slice(0, 1200));
   check('the model is told to split the call up', res.out.includes('split=yes'), res.out.slice(0, 1200));
+  check('the retry uses a smaller output-token cap', res.out.includes('maxTokens=512'), res.out.slice(0, 1200));
   check('the rejected call is explained to the user', res.out.includes('cut off before its arguments were complete JSON'), res.out.slice(0, 1200));
+  check('the user is told the retry budget', res.out.includes('next reply: at most 512 tokens'), res.out.slice(0, 1200));
   check('the echoed model output is not dumped in the terminal', !res.out.includes('container-fluid'), res.out.slice(0, 600));
   check('the recovered write actually happened', fs.readFileSync(path.join(workO, 'oversize.txt'), 'utf8') === 'first-section', 'wrong content');
 
@@ -1621,8 +1654,8 @@ async function main() {
     { cwd: workQ }
   );
   const rejections = (res.out.match(/cut off before its arguments were complete JSON/g) || []).length;
-  check('a model stuck on oversized calls gives up after 3 tries', rejections === 4, `${rejections} rejections: ${res.out.slice(0, 600)}`);
-  check('giving up points at the maxTokens config key', res.out.includes('3 times in a row') && res.out.includes('maxTokens'), res.out.slice(0, 800));
+  check('a model stuck on oversized calls gets 3 retries then gives up', rejections === 4, `${rejections} rejections: ${res.out.slice(0, 600)}`);
+  check('giving up reports the retry count and maxTokens config key', res.out.includes('after 3 smaller-output retries') && res.out.includes('maxTokens'), res.out.slice(0, 800));
   check('the session survives a model stuck on oversized calls', res.code === 0 && res.out.includes('History is intact'), res.out.slice(0, 400));
 
   /* ---------------- 4. CLI plumbing ---------------- */
