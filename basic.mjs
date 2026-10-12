@@ -11,7 +11,8 @@
  *   implement — runs that prompt with tools. No extra system prompt.
  *
  * Config (optional JSON, --config path or BASIC_CONFIG):
- *   { openai: { baseURL, apiKey, model }, maxTokens: 4096, workspace, mcp: { servers: {
+ *   { openai: { baseURL, apiKey, model }, maxTokens: 4096, contextSize: 64000,
+ *     workspace, mcp: { servers: {
  *       name: { command, args?, env? }           // stdio
  *       name: { type: "http", url, headers? }    // HTTP
  *   } } }
@@ -21,7 +22,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 import { spawn } from 'node:child_process';
-import { classifyApiError, serverErrorSummary, smallerReplyTokenLimit, TOOL_CALL_PARSE_ERROR } from './lib/llm.js';
+import { calibrateTokens, classifyApiError, estimatePromptTokens, serverErrorSummary, smallerReplyTokenLimit, TOOL_CALL_PARSE_ERROR } from './lib/llm.js';
+import { s, spinner } from './lib/ui.js';
 
 const OPENAI = {
   baseURL: (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, ''),
@@ -30,7 +32,11 @@ const OPENAI = {
 };
 
 let maxTokens = 4096;
+let contextSize = 64000;
 const MAX_TOOL_CALL_RETRIES = 3;
+/** Estimated request size (as % of contextSize) that earns a "run /compact" nudge. */
+const COMPACT_AT_PERCENT = 90;
+let contextWarned = false;
 
 let workspace = process.cwd();
 let mcp = emptyMcp();
@@ -329,19 +335,58 @@ function openaiTools() {
   return list;
 }
 
+function fmtTokens(n) {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}
+
+/**
+ * How full the context window would be for the request we are about to send.
+ * Estimates are calibrated against the prompt_tokens servers report, so the
+ * number tracks the real tokenizer instead of raw chars/4.
+ */
+function contextUsage(messages) {
+  const used = estimatePromptTokens(messages);
+  return { used, percent: Math.round((used / Math.max(1, contextSize)) * 100) };
+}
+
+/** Tell the user to compact before an oversized request, once per crossing. */
+function noteContext(messages) {
+  const { used, percent } = contextUsage(messages);
+  if (percent < COMPACT_AT_PERCENT) { contextWarned = false; return; }
+  if (contextWarned) return;
+  contextWarned = true;
+  console.log(
+    `\n${tag('context', s.yellow)} ~${fmtTokens(used)} of ${fmtTokens(contextSize)} tokens ` +
+    `${s.bold(`(${percent}%)`)} — run ${s.cyan('/compact')} to summarize the conversation and ` +
+    'free space, or the request may be rejected.'
+  );
+}
+
 // Keep labels on their own lines while writing tokens immediately.
+// One colour per label, so a long transcript stays scannable: reasoning is
+// dim, the answer is plain, tools are cyan (yellow when they change files).
+// lib/ui.js turns every one of these into a no-op when colours are off.
+const tag = (text, paint = s.bold) => paint(`[${text}]`);
+const SECTIONS = {
+  thinking: { tag: tag('thinking', s.magenta), text: s.dim },
+  response: { tag: tag('response', s.green), text: (t) => t },
+};
+/** Tools that write — the colour warns before the arguments scroll past. */
+const MUTATING_TOOLS = new Set(['write_file', 'edit_file', 'run_shell']);
+
 function consoleStream() {
   let section = null;
   let newline = true;
   return {
     write(label, text) {
       if (!text) return;
+      const style = SECTIONS[label];
       if (section !== label) {
         if (!newline) process.stdout.write('\n');
-        process.stdout.write(`[${label}]\n`);
+        process.stdout.write(`${style?.tag || tag(label)}\n`);
         section = label;
       }
-      process.stdout.write(text);
+      process.stdout.write(style?.text ? style.text(text) : text);
       newline = text.endsWith('\n');
     },
     end() { if (!newline) process.stdout.write('\n'); },
@@ -412,17 +457,27 @@ For existing files, use targeted edit_file calls rather than rewriting the whole
 Return valid JSON with properly escaped strings and closing quotes/braces. Do not repeat the oversized call.`;
 }
 
-async function readChatResponse(res) {
-  const output = consoleStream();
+// waiting = the "still working" indicator to clear as soon as anything prints,
+// so the spinner never fights the streamed text for the same terminal row.
+// quiet = no streaming to the console (internal requests such as /compact).
+async function readChatResponse(res, waiting, { quiet = false, sent = [] } = {}) {
+  const output = quiet ? { write() {}, end() {} } : consoleStream();
+  // Feed the server's own prompt_tokens back into the estimator when offered.
+  const calibrate = (usage) => { if (usage?.prompt_tokens) calibrateTokens(sent, usage.prompt_tokens); };
   const show = (delta) => {
+    const thinking = delta.reasoning_content || delta.reasoning || '';
+    const content = delta.content || '';
+    if (thinking || content) waiting.stop();
     // Only display reasoning explicitly supplied by the provider.
-    output.write('thinking', delta.reasoning_content || delta.reasoning || '');
-    output.write('response', delta.content || '');
+    output.write('thinking', thinking);
+    output.write('response', content);
   };
   try {
     // Some OpenAI-compatible servers ignore stream: true and return JSON.
     if (!(res.headers.get('content-type') || '').includes('text/event-stream')) {
       const json = await res.json();
+      waiting.stop();
+      calibrate(json.usage);
       if (json.error) throw llmError(json.error);
       const msg = json.choices?.[0]?.message;
       if (!msg) throw new Error('LLM returned no message');
@@ -440,6 +495,7 @@ async function readChatResponse(res) {
       if (data.trim() === '[DONE]') { finished = true; break; }
       const chunk = JSON.parse(data);
       if (chunk.error) throw llmError(chunk.error);
+      calibrate(chunk.usage);
       const choice = chunk.choices?.find((c) => c.index === 0 || c.index === undefined);
       if (!choice) continue; // e.g. usage-only chunks
       const delta = choice.delta || {};
@@ -466,10 +522,13 @@ async function readChatResponse(res) {
       msg.tool_calls = [...calls.entries()].sort(([a], [b]) => a - b).map(([, call]) => call);
     }
     return validateToolCalls(msg);
-  } finally { output.end(); }
+  } finally {
+    waiting.stop(); // e.g. error paths and replies with no visible text
+    output.end();
+  }
 }
 
-async function chat(messages, { tools = true, temperature = 0.2, replyLimit = maxTokens } = {}) {
+async function chat(messages, { tools = true, temperature = 0.2, replyLimit = maxTokens, quiet = false } = {}) {
   const body = {
     model: OPENAI.model,
     messages,
@@ -481,16 +540,28 @@ async function chat(messages, { tools = true, temperature = 0.2, replyLimit = ma
     const t = openaiTools();
     if (t.length) body.tools = t;
   }
-  const res = await fetch(`${OPENAI.baseURL}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(OPENAI.apiKey ? { Authorization: `Bearer ${OPENAI.apiKey}` } : {}),
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw llmError(await res.text(), res.status);
-  return await readChatResponse(res);
+  // Shown from the moment the request goes out until the first token lands,
+  // so a slow model never looks like a hung prompt.
+  const waiting = quiet ? { stop() {} } : spinner('thinking…');
+  let res;
+  try {
+    res = await fetch(`${OPENAI.baseURL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(OPENAI.apiKey ? { Authorization: `Bearer ${OPENAI.apiKey}` } : {}),
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    waiting.stop();
+    throw e;
+  }
+  if (!res.ok) {
+    waiting.stop();
+    throw llmError(await res.text(), res.status);
+  }
+  return await readChatResponse(res, waiting, { quiet, sent: messages });
 }
 
 async function runTool(name, args) {
@@ -515,6 +586,7 @@ No other work. No tools needed unless you must inspect the workspace to plan.`;
 async function loop(messages, { maxSteps = 40, tools = true } = {}) {
   let replyLimit = maxTokens;
   for (let i = 0; i < maxSteps; i++) {
+    noteContext(messages); // nudge before the request, never while a tool runs
     let msg;
     for (let retries = 0; ; retries++) {
       try {
@@ -526,29 +598,97 @@ async function loop(messages, { maxSteps = 40, tools = true } = {}) {
           throw new Error(`Tool call still invalid after ${MAX_TOOL_CALL_RETRIES} smaller-output retries. Stop and request smaller, targeted edits; check the server output limit and config maxTokens. ${e.message}`);
         }
         replyLimit = smallerReplyTokenLimit(replyLimit);
-        console.error(`[retry ${retries + 1}/${MAX_TOOL_CALL_RETRIES}] ${e.message}\nRequesting one smaller tool call (max ${replyLimit} tokens); no tools from the rejected reply ran.`);
+        console.error(`${tag(`retry ${retries + 1}/${MAX_TOOL_CALL_RETRIES}`, s.yellow)} ${e.message}\n${s.dim(`Requesting one smaller tool call (max ${replyLimit} tokens); no tools from the rejected reply ran.`)}`);
         messages.push({ role: 'user', content: toolCallRecovery(replyLimit) });
       }
     }
     messages.push(msg);
+    noteContext(messages); // the reply itself can be what pushed us over the line
     const calls = msg.tool_calls || [];
     if (!calls.length) return msg.content || '';
     for (const c of calls) {
       const name = c.function.name;
-      console.log(`\n[${name === 'read_file' ? 'read' : 'tool'}] ${name}\n${c.function.arguments || '{}'}`);
+      const paint = MUTATING_TOOLS.has(name) ? s.yellow : s.cyan;
+      console.log(`\n${tag(name === 'read_file' ? 'read' : 'tool', paint)} ${s.bold(name)}\n${s.dim(c.function.arguments || '{}')}`);
+      const running = spinner(`running ${name}…`);
       let result;
       try {
         const args = JSON.parse(c.function.arguments || '{}');
         result = await runTool(name, args);
       } catch (e) { result = `error: ${e.message}`; }
+      finally { running.stop(); }
       const content = String(result).slice(0, 20000);
-      console.log(`[tool result] ${name}\n${content}`);
-      if (String(result).length > content.length) console.log('(result truncated to 20000 chars)');
+      console.log(`${tag('tool result', content.startsWith('error:') ? s.red : s.green)} ${s.bold(name)}\n${content}`);
+      if (String(result).length > content.length) console.log(s.dim('(result truncated to 20000 chars)'));
       messages.push({ role: 'tool', tool_call_id: c.id, content });
     }
   }
-  console.log('(stopped: max steps)');
+  console.log(s.dim('(stopped: max steps)'));
   return '(stopped: max steps)';
+}
+
+const COMPACT_PROMPT = `[compaction request]
+Summarize this session so work can continue without the earlier messages.
+Include:
+- The user's current request (verbatim if it is short).
+- Every file inspected or changed, and what changed.
+- Commands run and their results, especially failures.
+- Decisions, constraints, and anything still pending.
+Be concise and factual, short bullet points, no preamble. Do not call tools.`;
+
+const COMPACT_SUMMARY_PREFIX =
+  'Earlier in this session (compacted summary — the raw messages were dropped to free context):';
+
+/** Trailing messages that can be replayed verbatim after a compaction. */
+function compactTail(messages, keep = 2) {
+  const tail = [];
+  for (let i = messages.length - 1; i >= 0 && tail.length < keep; i--) {
+    const m = messages[i];
+    // Never orphan an assistant tool_calls message from its tool results.
+    if (m.role === 'tool' || (m.role === 'assistant' && m.tool_calls)) break;
+    tail.unshift(m);
+  }
+  return tail;
+}
+
+/**
+ * Replace a conversation with a model-written summary plus the freshest
+ * messages. Mutates history in place; returns token counts, or null when
+ * nothing was freed (the caller keeps the original messages).
+ */
+async function compactHistory(history) {
+  if (history.length <= 2) {
+    console.log(s.dim('nothing to compact yet — the conversation is still empty'));
+    return null;
+  }
+  const before = estimatePromptTokens(history);
+  const [systemMsg, ...rest] = history;
+  const tail = compactTail(rest);
+  const spin = spinner('compacting conversation…');
+  let summary = '';
+  try {
+    const msg = await chat([...history, { role: 'user', content: COMPACT_PROMPT }], { tools: false, quiet: true });
+    summary = String(msg.content || '').trim();
+  } catch (e) {
+    spin.stop();
+    console.log(`${tag('compact', s.red)} compaction failed: ${e.message} — history kept as is`);
+    return null;
+  }
+  spin.stop();
+  if (!summary) {
+    console.log(s.dim('compaction produced an empty summary — history kept as is'));
+    return null;
+  }
+  const rebuilt = [systemMsg, { role: 'user', content: `${COMPACT_SUMMARY_PREFIX}\n${summary}` }, ...tail];
+  const after = estimatePromptTokens(rebuilt);
+  if (after >= before) {
+    console.log(s.dim(`compacting would not free anything (${fmtTokens(before)} → ${fmtTokens(after)}) — history kept as is`));
+    return null;
+  }
+  history.length = 0;
+  history.push(...rebuilt);
+  contextWarned = false;
+  return { before, after };
 }
 
 function extractImplementPrompt(text) {
@@ -582,6 +722,12 @@ function loadConfig(p) {
     }
     maxTokens = cfg.maxTokens;
   }
+  if (cfg.contextSize !== undefined) {
+    if (!Number.isInteger(cfg.contextSize) || cfg.contextSize < 2000) {
+      throw new Error('config contextSize must be an integer >= 2000');
+    }
+    contextSize = cfg.contextSize;
+  }
   return cfg;
 }
 
@@ -605,6 +751,7 @@ const HELP = `basic.mjs — plan then implement.
   /plan [text]     plan mode (default). extra text is context.
   /implement       run last IMPLEMENT PROMPT
   /prompt          print last IMPLEMENT PROMPT
+  /compact         summarize the conversation to free context
   /tools           list tools
   /quit
 
@@ -612,7 +759,17 @@ Everything goes through plan, then implement.
 Plan writes an IMPLEMENT PROMPT. Implement uses only that as the user prompt.
 Responses stream live. Console labels: [response], [thinking] (when supplied by
 the API), [read]/[tool] with arguments, and [tool result] (up to 20000 chars).
+Labels are coloured on a terminal — [thinking] is dim, reads are cyan, tools that
+write files are yellow, failed tool results are red. NO_COLOR turns this off;
+FORCE_COLOR=1 turns it on for piped output too.
+While work is in progress a live line (thinking…, running <tool>…) shows elapsed
+time; it is erased as soon as the next output starts.
 Config maxTokens sets the reply budget (default 4096, minimum 256).
+Config contextSize sets the model's context window (default 64000, minimum 2000).
+It drives the size estimate shown when the conversation reaches 90% full, which
+suggests /compact before the server starts rejecting requests.
+/compact asks the model to summarize the conversation, then keeps the summary
+and the newest messages — the originals are dropped, so run it deliberately.
 Invalid tool-call JSON is retried up to 3 times with smaller-call instructions.`;
 
 async function main() {
@@ -636,58 +793,63 @@ async function main() {
       return;
     }
     if (t === '/prompt') {
-      console.log(lastPrompt || '(none yet)');
+      console.log(lastPrompt || s.dim('(none yet)'));
+      return;
+    }
+    if (t === '/compact') {
+      const freed = await compactHistory(planHistory);
+      if (freed) console.log(`${tag('compact', s.cyan)} conversation: ${fmtTokens(freed.before)} → ${fmtTokens(freed.after)} tokens`);
       return;
     }
     if (t === '/plan' || t.startsWith('/plan ')) {
       mode = 'plan';
       const rest = t.slice(5).trim();
-      console.log('[plan]');
+      console.log(tag('plan', s.magenta));
       if (!rest) return;
       const { prompt } = await planTurn(planHistory, rest);
       if (prompt) lastPrompt = prompt;
-      if (prompt) console.log('\n(saved IMPLEMENT PROMPT — /implement to run)');
+      if (prompt) console.log(`\n${s.green('saved IMPLEMENT PROMPT')} — ${s.dim('/implement to run')}`);
       return;
     }
     if (t === '/implement' || t.startsWith('/implement ')) {
       const extra = t.slice(10).trim();
       const prompt = extra || lastPrompt;
-      if (!prompt) { console.log('no IMPLEMENT PROMPT yet — stay in /plan'); return; }
+      if (!prompt) { console.log(s.dim('no IMPLEMENT PROMPT yet — stay in /plan')); return; }
       mode = 'implement';
-      console.log('[implement]');
+      console.log(tag('implement', s.cyan));
       await implementTurn(prompt);
       mode = 'plan';
-      console.log('[plan] back to plan');
+      console.log(`${tag('plan', s.magenta)} ${s.dim('back to plan')}`);
       return;
     }
     if (mode === 'plan') {
       const { prompt } = await planTurn(planHistory, t);
       if (prompt) lastPrompt = prompt;
-      if (prompt) console.log('\n(saved IMPLEMENT PROMPT — /implement to run)');
+      if (prompt) console.log(`\n${s.green('saved IMPLEMENT PROMPT')} — ${s.dim('/implement to run')}`);
     }
   }
 
   if (opts.once) {
     const { prompt } = await planTurn(planHistory, opts.once);
     if (!prompt) {
-      console.error('plan did not produce IMPLEMENT PROMPT');
+      console.error(s.red('plan did not produce IMPLEMENT PROMPT'));
       process.exitCode = 1;
       mcp.closeAll();
       return;
     }
     lastPrompt = prompt;
-    console.log('\n[implement]\n');
+    console.log(`\n${tag('implement', s.cyan)}\n`);
     await implementTurn(prompt);
     mcp.closeAll();
     return;
   }
 
-  console.log(`basic.mjs  model=${OPENAI.model}  dir=${workspace}  mode=plan`);
-  console.log('describe the task. agent plans, then /implement.\n');
+  console.log(`${s.bold('basic.mjs')}  ${s.dim(`model=${OPENAI.model}  dir=${workspace}  mode=plan`)}`);
+  console.log(`${s.dim('describe the task. agent plans, then')} ${s.cyan('/implement')}${s.dim('.')}\n`);
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const ask = () => rl.question(`${mode}> `, async (line) => {
+  const ask = () => rl.question(`${s.cyan(`${mode}>`)} `, async (line) => {
     try { await handle(line); }
-    catch (e) { console.error(e.message); }
+    catch (e) { console.error(s.red(e.message)); }
     ask();
   });
   rl.on('close', () => { mcp.closeAll(); process.exit(0); });
@@ -695,6 +857,6 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.error(e);
+  console.error(s.red(e.stack || String(e))); // stack: unexpected errors need the trail
   process.exit(1);
 });
