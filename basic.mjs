@@ -11,23 +11,26 @@
  *   implement — runs that prompt with tools. No extra system prompt.
  *
  * Config (optional JSON, --config path or BASIC_CONFIG):
- *   { openai: { baseURL, apiKey, model }, workspace, mcp: { servers: {
+ *   { openai: { baseURL, apiKey, model }, maxTokens: 4096, workspace, mcp: { servers: {
  *       name: { command, args?, env? }           // stdio
  *       name: { type: "http", url, headers? }    // HTTP
  *   } } }
  */
 
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { spawn } from 'node:child_process';
+import { classifyApiError, serverErrorSummary, smallerReplyTokenLimit, TOOL_CALL_PARSE_ERROR } from './lib/llm.js';
 
 const OPENAI = {
   baseURL: (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, ''),
   apiKey: process.env.OPENAI_API_KEY || '',
   model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
 };
+
+let maxTokens = 4096;
+const MAX_TOOL_CALL_RETRIES = 3;
 
 let workspace = process.cwd();
 let mcp = emptyMcp();
@@ -68,7 +71,7 @@ const BUILTIN = {
     },
   },
   write_file: {
-    description: 'Create or overwrite a text file.',
+    description: 'Create or overwrite a text file. Keep calls small: for large new files write the first section, then append sections using edit_file in separate replies. For existing files prefer targeted edit_file calls.',
     parameters: {
       type: 'object',
       properties: { path: { type: 'string' }, content: { type: 'string' } },
@@ -96,7 +99,7 @@ const BUILTIN = {
       const abs = resolvePath(p);
       const text = fs.readFileSync(abs, 'utf8');
       if (!text.includes(old_text)) throw new Error('old_text not found');
-      fs.writeFileSync(abs, text.replace(old_text, new_text), 'utf8');
+      fs.writeFileSync(abs, text.replace(old_text, () => new_text), 'utf8');
       return `edited ${abs}`;
     },
   },
@@ -326,12 +329,153 @@ function openaiTools() {
   return list;
 }
 
-async function chat(messages, { tools = true, temperature = 0.2 } = {}) {
+// Keep labels on their own lines while writing tokens immediately.
+function consoleStream() {
+  let section = null;
+  let newline = true;
+  return {
+    write(label, text) {
+      if (!text) return;
+      if (section !== label) {
+        if (!newline) process.stdout.write('\n');
+        process.stdout.write(`[${label}]\n`);
+        section = label;
+      }
+      process.stdout.write(text);
+      newline = text.endsWith('\n');
+    },
+    end() { if (!newline) process.stdout.write('\n'); },
+  };
+}
+
+// SSE frames and UTF-8 characters can both span network chunks.
+async function* streamEvents(body) {
+  if (!body) throw new Error('LLM returned an empty stream');
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  const dataOf = (event) => event.split(/\r?\n/)
+    .filter((line) => line.startsWith('data:'))
+    .map((line) => line.slice(5).replace(/^ /, '')).join('\n');
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      let boundary;
+      while ((boundary = /\r?\n\r?\n/.exec(buffer))) {
+        const data = dataOf(buffer.slice(0, boundary.index));
+        buffer = buffer.slice(boundary.index + boundary[0].length);
+        if (data) yield data;
+      }
+      if (done) {
+        const data = dataOf(buffer);
+        if (data) yield data;
+        break;
+      }
+    }
+  } finally {
+    try { await reader.cancel(); } finally { reader.releaseLock(); }
+  }
+}
+
+function llmError(payload, status = 500) {
+  const body = typeof payload === 'string' ? payload : JSON.stringify({ error: payload });
+  const error = new Error(`LLM error (${status}): ${serverErrorSummary(body)}`);
+  error.kind = classifyApiError(status, body);
+  return error;
+}
+
+function invalidToolCall(reason) {
+  const error = new Error(`Invalid or incomplete tool call: ${reason}. No tools from this reply were executed.`);
+  error.kind = TOOL_CALL_PARSE_ERROR;
+  return error;
+}
+
+// Validate the ENTIRE batch before adding history or executing any tools.
+function validateToolCalls(msg) {
+  for (const call of msg.tool_calls || []) {
+    if (!call.id || !call.function?.name) throw invalidToolCall('missing id or name');
+    let args;
+    try { args = JSON.parse(call.function.arguments); }
+    catch { throw invalidToolCall('arguments are not complete JSON'); }
+    if (!args || typeof args !== 'object' || Array.isArray(args)) {
+      throw invalidToolCall('arguments must be a JSON object');
+    }
+  }
+  return msg;
+}
+
+function toolCallRecovery(limit) {
+  return `[tool call recovery] Your previous reply contained invalid or incomplete tool-call JSON and was discarded. No tools from that reply ran and no files were changed by it.
+It may have exceeded the output budget. The next reply is limited to ${limit} tokens; keep the entire reply, including all arguments, well below ${Math.floor(limit * 2)} characters. Send only one small tool call per reply, then wait for its result.
+For existing files, use targeted edit_file calls rather than rewriting the whole file. For a large new file, write_file only the first section; then append each section in a separate edit_file reply (old_text = unique ending lines, new_text = those lines plus the next section).
+Return valid JSON with properly escaped strings and closing quotes/braces. Do not repeat the oversized call.`;
+}
+
+async function readChatResponse(res) {
+  const output = consoleStream();
+  const show = (delta) => {
+    // Only display reasoning explicitly supplied by the provider.
+    output.write('thinking', delta.reasoning_content || delta.reasoning || '');
+    output.write('response', delta.content || '');
+  };
+  try {
+    // Some OpenAI-compatible servers ignore stream: true and return JSON.
+    if (!(res.headers.get('content-type') || '').includes('text/event-stream')) {
+      const json = await res.json();
+      if (json.error) throw llmError(json.error);
+      const msg = json.choices?.[0]?.message;
+      if (!msg) throw new Error('LLM returned no message');
+      show(msg);
+      if (json.choices[0].finish_reason === 'length' && msg.tool_calls?.length) {
+        throw invalidToolCall('output token limit reached');
+      }
+      return validateToolCalls(msg);
+    }
+    const msg = { role: 'assistant', content: null };
+    const calls = new Map();
+    let finished = false;
+    let finishReason = null;
+    for await (const data of streamEvents(res.body)) {
+      if (data.trim() === '[DONE]') { finished = true; break; }
+      const chunk = JSON.parse(data);
+      if (chunk.error) throw llmError(chunk.error);
+      const choice = chunk.choices?.find((c) => c.index === 0 || c.index === undefined);
+      if (!choice) continue; // e.g. usage-only chunks
+      const delta = choice.delta || {};
+      show(delta);
+      for (const field of ['content', 'reasoning_content', 'reasoning']) {
+        if (typeof delta[field] === 'string') msg[field] = (msg[field] || '') + delta[field];
+      }
+      for (const part of delta.tool_calls || []) {
+        const index = part.index ?? 0;
+        if (!calls.has(index)) calls.set(index, { id: '', type: 'function', function: { name: '', arguments: '' } });
+        const call = calls.get(index);
+        if (part.id) call.id += part.id;
+        if (part.type) call.type = part.type;
+        if (part.function?.name) call.function.name += part.function.name;
+        if (part.function?.arguments) call.function.arguments += part.function.arguments;
+      }
+      if (choice.finish_reason) { finished = true; finishReason = choice.finish_reason; }
+    }
+    if ((!finished || finishReason === 'length') && calls.size) {
+      throw invalidToolCall('stream ended before tool calls were complete');
+    }
+    if (!finished) throw new Error('LLM stream ended before completion');
+    if (calls.size) {
+      msg.tool_calls = [...calls.entries()].sort(([a], [b]) => a - b).map(([, call]) => call);
+    }
+    return validateToolCalls(msg);
+  } finally { output.end(); }
+}
+
+async function chat(messages, { tools = true, temperature = 0.2, replyLimit = maxTokens } = {}) {
   const body = {
     model: OPENAI.model,
     messages,
     temperature,
-    max_tokens: 4096,
+    max_tokens: replyLimit,
+    stream: true,
   };
   if (tools) {
     const t = openaiTools();
@@ -345,9 +489,8 @@ async function chat(messages, { tools = true, temperature = 0.2 } = {}) {
     },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 400)}`);
-  const json = await res.json();
-  return json.choices?.[0]?.message || {};
+  if (!res.ok) throw llmError(await res.text(), res.status);
+  return await readChatResponse(res);
 }
 
 async function runTool(name, args) {
@@ -370,22 +513,41 @@ IMPLEMENT PROMPT
 No other work. No tools needed unless you must inspect the workspace to plan.`;
 
 async function loop(messages, { maxSteps = 40, tools = true } = {}) {
+  let replyLimit = maxTokens;
   for (let i = 0; i < maxSteps; i++) {
-    const msg = await chat(messages, { tools });
+    let msg;
+    for (let retries = 0; ; retries++) {
+      try {
+        msg = await chat(messages, { tools, replyLimit });
+        break;
+      } catch (e) {
+        if (e.kind !== TOOL_CALL_PARSE_ERROR) throw e;
+        if (retries >= MAX_TOOL_CALL_RETRIES) {
+          throw new Error(`Tool call still invalid after ${MAX_TOOL_CALL_RETRIES} smaller-output retries. Stop and request smaller, targeted edits; check the server output limit and config maxTokens. ${e.message}`);
+        }
+        replyLimit = smallerReplyTokenLimit(replyLimit);
+        console.error(`[retry ${retries + 1}/${MAX_TOOL_CALL_RETRIES}] ${e.message}\nRequesting one smaller tool call (max ${replyLimit} tokens); no tools from the rejected reply ran.`);
+        messages.push({ role: 'user', content: toolCallRecovery(replyLimit) });
+      }
+    }
     messages.push(msg);
     const calls = msg.tool_calls || [];
     if (!calls.length) return msg.content || '';
-    process.stdout.write(msg.content ? msg.content + '\n' : '');
     for (const c of calls) {
-      let args = {};
-      try { args = JSON.parse(c.function.arguments || '{}'); } catch { args = {}; }
-      process.stderr.write(`  tool ${c.function.name}\n`);
+      const name = c.function.name;
+      console.log(`\n[${name === 'read_file' ? 'read' : 'tool'}] ${name}\n${c.function.arguments || '{}'}`);
       let result;
-      try { result = await runTool(c.function.name, args); }
-      catch (e) { result = `error: ${e.message}`; }
-      messages.push({ role: 'tool', tool_call_id: c.id, content: String(result).slice(0, 20000) });
+      try {
+        const args = JSON.parse(c.function.arguments || '{}');
+        result = await runTool(name, args);
+      } catch (e) { result = `error: ${e.message}`; }
+      const content = String(result).slice(0, 20000);
+      console.log(`[tool result] ${name}\n${content}`);
+      if (String(result).length > content.length) console.log('(result truncated to 20000 chars)');
+      messages.push({ role: 'tool', tool_call_id: c.id, content });
     }
   }
+  console.log('(stopped: max steps)');
   return '(stopped: max steps)';
 }
 
@@ -414,6 +576,12 @@ function loadConfig(p) {
   const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
   if (cfg.openai) Object.assign(OPENAI, cfg.openai);
   if (cfg.workspace) workspace = path.resolve(cfg.workspace);
+  if (cfg.maxTokens !== undefined) {
+    if (!Number.isInteger(cfg.maxTokens) || cfg.maxTokens < 256) {
+      throw new Error('config maxTokens must be an integer >= 256');
+    }
+    maxTokens = cfg.maxTokens;
+  }
   return cfg;
 }
 
@@ -441,7 +609,11 @@ const HELP = `basic.mjs — plan then implement.
   /quit
 
 Everything goes through plan, then implement.
-Plan writes an IMPLEMENT PROMPT. Implement uses only that as the user prompt.`;
+Plan writes an IMPLEMENT PROMPT. Implement uses only that as the user prompt.
+Responses stream live. Console labels: [response], [thinking] (when supplied by
+the API), [read]/[tool] with arguments, and [tool result] (up to 20000 chars).
+Config maxTokens sets the reply budget (default 4096, minimum 256).
+Invalid tool-call JSON is retried up to 3 times with smaller-call instructions.`;
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
@@ -472,9 +644,8 @@ async function main() {
       const rest = t.slice(5).trim();
       console.log('[plan]');
       if (!rest) return;
-      const { text, prompt } = await planTurn(planHistory, rest);
+      const { prompt } = await planTurn(planHistory, rest);
       if (prompt) lastPrompt = prompt;
-      console.log(text);
       if (prompt) console.log('\n(saved IMPLEMENT PROMPT — /implement to run)');
       return;
     }
@@ -484,23 +655,20 @@ async function main() {
       if (!prompt) { console.log('no IMPLEMENT PROMPT yet — stay in /plan'); return; }
       mode = 'implement';
       console.log('[implement]');
-      const out = await implementTurn(prompt);
-      console.log(out);
+      await implementTurn(prompt);
       mode = 'plan';
       console.log('[plan] back to plan');
       return;
     }
     if (mode === 'plan') {
-      const { text, prompt } = await planTurn(planHistory, t);
+      const { prompt } = await planTurn(planHistory, t);
       if (prompt) lastPrompt = prompt;
-      console.log(text);
       if (prompt) console.log('\n(saved IMPLEMENT PROMPT — /implement to run)');
     }
   }
 
   if (opts.once) {
-    const { text, prompt } = await planTurn(planHistory, opts.once);
-    console.log(text);
+    const { prompt } = await planTurn(planHistory, opts.once);
     if (!prompt) {
       console.error('plan did not produce IMPLEMENT PROMPT');
       process.exitCode = 1;
@@ -509,7 +677,7 @@ async function main() {
     }
     lastPrompt = prompt;
     console.log('\n[implement]\n');
-    console.log(await implementTurn(prompt));
+    await implementTurn(prompt);
     mcp.closeAll();
     return;
   }
