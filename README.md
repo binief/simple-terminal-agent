@@ -61,7 +61,7 @@ subagentMaxSteps)`) so a new setting does not stay invisible just because your f
 | `openai.apiKey` | Bearer token (optional for local servers). |
 | `openai.model` | Model name. |
 | `contextSize` | Total context budget (tokens). Older turns are dropped once history grows past it. |
-| `maxTokens` | Max tokens the model may generate per reply. |
+| `maxTokens` | Max tokens the model may generate per reply — tool-call arguments included. A `write_file` whose content does not fit is cut off mid-JSON and never runs, so raise it (or ask for the file in sections) for big writes: 4096 tokens is only ~12-16k characters. |
 | `maxSteps` | Max model replies (tool round-trips) per user turn before the harness stops and asks you to say "continue". Default 50. |
 | `temperature` | Sampling temperature. |
 | `streaming` | `true` = stream tokens as they arrive; `false` = show the reply when complete. Also `--stream` / `--no-stream`. |
@@ -601,6 +601,14 @@ The harness actively keeps a turn running to completion instead of stopping half
 - **Half tool calls are never executed.** If the token limit cut a tool call mid-JSON, the call is *not*
   run; the model gets an error result asking it to re-issue the complete call, so no command ever runs
   with truncated arguments.
+- **A tool call the server itself rejects is recovered, not retried.** Some servers parse the tool call
+  out of the generated text and answer `500` when that fails — llama.cpp's
+  `Failed to parse tool call arguments as JSON: … missing closing quote` is a `write_file` whose content
+  ran past `max_tokens`. That is a 5xx, but it is not transient: re-sending the identical request spends
+  another full generation on the identical broken reply. The harness classifies it, skips the retries,
+  prints the server's first sentence (not the kilobytes of your own file it echoes back) and tells the
+  model to split the work — `write_file` for the first section, then one `edit_file` per section after
+  it. The turn continues; after three such rejections in a row it stops and points at `"maxTokens"`.
 - **The step limit warns before it bites.** A turn is capped at `maxSteps` model replies (default 50 —
   previously a hardcoded 25). Three steps before the limit the model is told to wrap the task up or say
   what remains; if the limit is still reached, the message points at the `"maxSteps"` config key. Raise
@@ -638,8 +646,9 @@ Runs an end-to-end suite against a mock OpenAI server and a mock MCP server (str
 round-trips, MCP tools, built-in tool smoke tests, search ignore rules, multiline input rules, plan
 mode: the read-only command rules, the tool gating, and a full plan → `/approve` → implementation run;
 the command gate, `.llmignore`, token calibration, delegation end to end — a real subagent writing
-a real file, recursion refused, and enforced mode refusing the editors — config migration, and chat
-save/load round-tripped through two separate processes).
+a real file, recursion refused, and enforced mode refusing the editors — cut-off recovery including a
+server that rejects an oversized tool call with a 500, config migration, and chat save/load
+round-tripped through two separate processes).
 
 `docs/late-cli-analysis.md` covers where delegation, the command gate and `.llmignore` came from and
 which of the reference project's ideas were deliberately left out.
