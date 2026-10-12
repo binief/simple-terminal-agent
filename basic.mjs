@@ -6,24 +6,36 @@
  *   node basic.mjs --once "…"   one shot (plan then implement)
  *
  * Modes
- *   plan      — user gives context. Agent asks questions if unclear, then
- *               writes an IMPLEMENT PROMPT (the whole user message for implement).
- *   implement — runs that prompt with tools. No extra system prompt.
+ *   plan      — analysis only. The project is READ-ONLY: write_file/edit_file
+ *               refuse any path outside the plan directory and run_command
+ *               only accepts read-only commands. The agent asks questions if
+ *               unclear, then writes an IMPLEMENT PROMPT, which is saved to a
+ *               plan file (a tmp directory, see planDir) instead of the project.
+ *   implement — the only mode that changes project files. Its user prompt is
+ *               the saved plan file; there is no extra system prompt.
+ *
+ * Context
+ *   Once the conversation is estimated at >= 90% of contextSize, compact mode
+ *   switches on: every request is sent with older tool results and reasoning
+ *   trimmed, and the user is told to run /compact for a real summary.
  *
  * Config (optional JSON, --config path or BASIC_CONFIG):
  *   { openai: { baseURL, apiKey, model }, maxTokens: 4096, contextSize: 64000,
- *     workspace, mcp: { servers: {
+ *     workspace, planDir: "<os tmp>/basic-plans", planAllowCommands: ["make"],
+ *     mcp: { servers: {
  *       name: { command, args?, env? }           // stdio
  *       name: { type: "http", url, headers? }    // HTTP
  *   } } }
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { spawn } from 'node:child_process';
 import { calibrateTokens, classifyApiError, estimatePromptTokens, serverErrorSummary, smallerReplyTokenLimit, TOOL_CALL_PARSE_ERROR } from './lib/llm.js';
-import { s, spinner } from './lib/ui.js';
+import { isReadOnlyCommand } from './lib/plan.js';
+import { fmtDuration, s, spinner } from './lib/ui.js';
 
 const OPENAI = {
   baseURL: (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, ''),
@@ -34,12 +46,23 @@ const OPENAI = {
 let maxTokens = 4096;
 let contextSize = 64000;
 const MAX_TOOL_CALL_RETRIES = 3;
-/** Estimated request size (as % of contextSize) that earns a "run /compact" nudge. */
+/** Estimated request size (as % of contextSize) that switches compact mode on. */
 const COMPACT_AT_PERCENT = 90;
 let contextWarned = false;
+/** On above COMPACT_AT_PERCENT: requests go out with older tool output trimmed. */
+let compactMode = false;
 
 let workspace = process.cwd();
 let mcp = emptyMcp();
+
+/** 'plan' (read-only analysis) or 'implement' (the only mode that writes). */
+let mode = 'plan';
+/** Where PLAN mode is allowed to write: the saved plans and any working notes. */
+let planDir = path.join(os.tmpdir(), 'basic-plans');
+/** Extra commands PLAN mode may run (config planAllowCommands). */
+let planAllowCommands = [];
+/** /verbose: show full tool arguments and results instead of the compact preview. */
+let verbose = process.env.BASIC_VERBOSE === '1';
 
 function emptyMcp() {
   return { listTools: () => [], has: () => false, call: async () => '', closeAll() {} };
@@ -51,6 +74,36 @@ function resolvePath(p) {
   if (!p) throw new Error('path required');
   const abs = path.isAbsolute(p) ? p : path.join(workspace, p);
   return path.normalize(abs);
+}
+
+function isInside(dir, abs) {
+  const rel = path.relative(path.resolve(dir), path.resolve(abs));
+  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
+/* PLAN mode is enforced here, not just asked for in the prompt: a tool that
+ * would change the project refuses before touching the disk, and the refusal
+ * comes back as a tool result the model can read and act on. The only
+ * writable place is planDir, so the plan (and any working notes) can still be
+ * persisted. */
+const PLAN_READ_ONLY = 'PLAN mode is read-only';
+
+function guardWrite(abs) {
+  if (mode !== 'plan' || isInside(planDir, abs)) return;
+  throw new Error(
+    `${PLAN_READ_ONLY}: ${abs} was not written. Project files change only in IMPLEMENT mode. ` +
+    `Keep plans and working notes under ${planDir}, and finish with the IMPLEMENT PROMPT block.`
+  );
+}
+
+function guardCommand(command) {
+  if (mode !== 'plan') return;
+  const verdict = isReadOnlyCommand(command, planAllowCommands);
+  if (verdict.ok) return;
+  throw new Error(
+    `${PLAN_READ_ONLY}: \`${String(command ?? '').trim()}\` was not run (${verdict.reason}). ` +
+    'Only read-only commands run in PLAN mode (ls, cat, grep, find, git status/log/diff, …); anything that changes the project waits for IMPLEMENT mode.'
+  );
 }
 
 const BUILTIN = {
@@ -85,6 +138,7 @@ const BUILTIN = {
     },
     async run({ path: p, content }) {
       const abs = resolvePath(p);
+      guardWrite(abs);
       fs.mkdirSync(path.dirname(abs), { recursive: true });
       fs.writeFileSync(abs, content ?? '', 'utf8');
       return `wrote ${abs} (${String(content ?? '').length} chars)`;
@@ -103,6 +157,7 @@ const BUILTIN = {
     },
     async run({ path: p, old_text, new_text }) {
       const abs = resolvePath(p);
+      guardWrite(abs);
       const text = fs.readFileSync(abs, 'utf8');
       if (!text.includes(old_text)) throw new Error('old_text not found');
       fs.writeFileSync(abs, text.replace(old_text, () => new_text), 'utf8');
@@ -120,9 +175,20 @@ const BUILTIN = {
       required: ['command'],
     },
     async run({ command, timeout_sec }) {
+      guardCommand(command);
       return await runShell(command, timeout_sec || 60);
     },
   },
+};
+
+/** Tool descriptions carry the current mode's rules, so the model is told, not just refused. */
+const MODE_NOTES = {
+  plan: {
+    write_file: () => ` PLAN mode: only paths under ${planDir} may be written (plans, working notes). Project files are read-only until IMPLEMENT mode.`,
+    edit_file: () => ` PLAN mode: only files under ${planDir} may be edited. Project files are read-only until IMPLEMENT mode.`,
+    run_command: () => ' PLAN mode: read-only commands only (ls, cat, grep, find, git status/log/diff, …); builds, installs and anything writing files are refused.',
+  },
+  implement: {},
 };
 
 function runShell(command, timeoutSec) {
@@ -322,9 +388,10 @@ async function connectMcp(servers, log = console.error) {
 /* ------------------------------ LLM + tools ------------------------------ */
 
 function openaiTools() {
+  const notes = MODE_NOTES[mode] || {};
   const list = Object.entries(BUILTIN).map(([name, t]) => ({
     type: 'function',
-    function: { name, description: t.description, parameters: t.parameters },
+    function: { name, description: t.description + (notes[name] ? notes[name]() : ''), parameters: t.parameters },
   }));
   for (const t of mcp.listTools()) {
     list.push({
@@ -349,17 +416,67 @@ function contextUsage(messages) {
   return { used, percent: Math.round((used / Math.max(1, contextSize)) * 100) };
 }
 
-/** Tell the user to compact before an oversized request, once per crossing. */
+/**
+ * Switch compact mode on (or off again) from the size of the conversation, and
+ * tell the user once per crossing. Compact mode is a stopgap: it trims what
+ * each request carries (see optimizePrompt) so work can continue, but only
+ * /compact actually frees the history.
+ */
 function noteContext(messages) {
   const { used, percent } = contextUsage(messages);
-  if (percent < COMPACT_AT_PERCENT) { contextWarned = false; return; }
+  if (percent < COMPACT_AT_PERCENT) { contextWarned = false; compactMode = false; return; }
+  compactMode = true;
   if (contextWarned) return;
   contextWarned = true;
+  const trimmed = estimatePromptTokens(optimizePrompt(messages));
   console.log(
     `\n${tag('context', s.yellow)} ~${fmtTokens(used)} of ${fmtTokens(contextSize)} tokens ` +
-    `${s.bold(`(${percent}%)`)} — run ${s.cyan('/compact')} to summarize the conversation and ` +
-    'free space, or the request may be rejected.'
+    `${s.bold(`(${percent}%)`)} — ${s.bold('compact mode on')}: older tool results and reasoning are ` +
+    `trimmed from each request (this one ~${fmtTokens(trimmed)}). ` +
+    `Please run ${s.cyan('/compact')} to summarize the conversation and free space for good.`
   );
+}
+
+/** Older tool results are cut to this many characters in compact mode. */
+const COMPACT_STUB_CHARS = 240;
+/** Tool results of the latest step keep this much when the first pass is not enough. */
+const COMPACT_RECENT_CHARS = 2000;
+
+function trimToolResult(m, keep) {
+  const text = String(m.content ?? '');
+  if (text.length <= keep + 80) return m;
+  return {
+    ...m,
+    content: `${text.slice(0, keep)}\n…[compact mode: ${text.length - keep} more chars of this tool result were trimmed from the request; re-run the tool if they matter]`,
+  };
+}
+
+/**
+ * The request to send when compact mode is on. The history itself is never
+ * changed — only the copy that goes over the wire:
+ *   1. Everything before the latest step (the last assistant message and its
+ *      tool results) loses reasoning fields and has tool results cut to a stub.
+ *      The system message and the first user message (the task) stay intact.
+ *   2. If that is still over the line, the latest step's tool results are cut
+ *      too, more generously, so the model keeps what it just asked for.
+ */
+function optimizePrompt(messages) {
+  let latest = messages.length;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'assistant') { latest = i; break; }
+  }
+  const firstUser = messages.findIndex((m) => m.role === 'user');
+  const pass1 = messages.map((m, i) => {
+    if (i >= latest || m.role === 'system' || i === firstUser) return m;
+    if (m.role === 'tool') return trimToolResult(m, COMPACT_STUB_CHARS);
+    if (m.role === 'assistant' && (m.reasoning !== undefined || m.reasoning_content !== undefined)) {
+      const { reasoning, reasoning_content, ...rest } = m; // eslint-disable-line no-unused-vars
+      return rest;
+    }
+    return m;
+  });
+  if (contextUsage(pass1).percent < COMPACT_AT_PERCENT) return pass1;
+  return pass1.map((m, i) => (i >= latest && m.role === 'tool' ? trimToolResult(m, COMPACT_RECENT_CHARS) : m));
 }
 
 // Keep labels on their own lines while writing tokens immediately.
@@ -371,8 +488,48 @@ const SECTIONS = {
   thinking: { tag: tag('thinking', s.magenta), text: s.dim },
   response: { tag: tag('response', s.green), text: (t) => t },
 };
-/** Tools that write — the colour warns before the arguments scroll past. */
-const MUTATING_TOOLS = new Set(['write_file', 'edit_file', 'run_shell']);
+/** Tools that can change the project — the colour warns before the arguments scroll past. */
+const MUTATING_TOOLS = new Set(['write_file', 'edit_file', 'run_command']);
+
+/* Compact tool display. The model always gets the full result (up to the
+ * 20000-char cap); the console shows enough to follow along — a one-line
+ * summary of the arguments, the first lines of the result and a count of what
+ * was left out. /verbose shows everything. */
+const ARGS_PREVIEW_CHARS = 200;
+const ARG_VALUE_CHARS = 80;
+const RESULT_PREVIEW_LINES = 8;
+const RESULT_PREVIEW_COLS = 160;
+
+const clip = (text, n) => (text.length > n ? `${text.slice(0, n - 1)}…` : text);
+
+/** `{"path":"a.js","content":"<first 40 chars>… (2345 chars, 61 lines)"}` */
+function summarizeArgs(raw) {
+  const text = raw || '{}';
+  if (verbose) return text;
+  let args;
+  try { args = JSON.parse(text); } catch { return clip(text.replace(/\s*\n\s*/g, ' '), ARGS_PREVIEW_CHARS); }
+  if (!args || typeof args !== 'object') return clip(text, ARGS_PREVIEW_CHARS);
+  const compact = {};
+  for (const [k, v] of Object.entries(args)) {
+    if (typeof v !== 'string' || v.length <= ARG_VALUE_CHARS) { compact[k] = v; continue; }
+    const lines = v.split('\n').length;
+    compact[k] = `${v.slice(0, 40).replace(/\n/g, '⏎')}… (${v.length} chars${lines > 1 ? `, ${lines} lines` : ''})`;
+  }
+  return clip(JSON.stringify(compact), ARGS_PREVIEW_CHARS);
+}
+
+/** First lines of a tool result, each clipped, plus how much was omitted. */
+function previewResult(content, { truncatedFrom = 0 } = {}) {
+  const text = String(content);
+  const note = truncatedFrom ? s.dim(`(result truncated to ${text.length} chars for the model, ${truncatedFrom} total)`) : '';
+  if (verbose) return [text, note].filter(Boolean).join('\n');
+  const lines = text.split('\n');
+  const shown = lines.slice(0, RESULT_PREVIEW_LINES).map((l) => `  ${clip(l, RESULT_PREVIEW_COLS)}`);
+  const more = lines.length - RESULT_PREVIEW_LINES;
+  if (more > 0) shown.push(s.dim(`  … +${more} more lines (${text.length} chars; the model gets the full result, /verbose shows it)`));
+  if (note) shown.push(`  ${note}`);
+  return shown.join('\n');
+}
 
 function consoleStream() {
   let section = null;
@@ -512,6 +669,11 @@ async function readChatResponse(res, waiting, { quiet = false, sent = [] } = {})
         if (part.function?.name) call.function.name += part.function.name;
         if (part.function?.arguments) call.function.arguments += part.function.arguments;
       }
+      // Tool-call arguments stream silently; keep the indicator honest about it.
+      if (calls.size && waiting.update) {
+        const names = [...calls.values()].map((c) => c.function.name).filter(Boolean);
+        waiting.update(`composing tool call${names.length > 1 ? 's' : ''} ${names.join(', ') || '…'}…`);
+      }
       if (choice.finish_reason) { finished = true; finishReason = choice.finish_reason; }
     }
     if ((!finished || finishReason === 'length') && calls.size) {
@@ -529,9 +691,16 @@ async function readChatResponse(res, waiting, { quiet = false, sent = [] } = {})
 }
 
 async function chat(messages, { tools = true, temperature = 0.2, replyLimit = maxTokens, quiet = false } = {}) {
+  // Compact mode never edits the history, only what this request carries.
+  const outbound = compactMode ? optimizePrompt(messages) : messages;
+  if (outbound !== messages && !quiet) {
+    const before = estimatePromptTokens(messages);
+    const after = estimatePromptTokens(outbound);
+    if (after < before) console.log(s.dim(`    · compact mode: request trimmed ~${fmtTokens(before)} → ~${fmtTokens(after)} tokens`));
+  }
   const body = {
     model: OPENAI.model,
-    messages,
+    messages: outbound,
     temperature,
     max_tokens: replyLimit,
     stream: true,
@@ -561,7 +730,7 @@ async function chat(messages, { tools = true, temperature = 0.2, replyLimit = ma
     waiting.stop();
     throw llmError(await res.text(), res.status);
   }
-  return await readChatResponse(res, waiting, { quiet, sent: messages });
+  return await readChatResponse(res, waiting, { quiet, sent: outbound });
 }
 
 async function runTool(name, args) {
@@ -570,7 +739,11 @@ async function runTool(name, args) {
   throw new Error(`unknown tool ${name}`);
 }
 
-const PLAN_SYSTEM = `You are in PLAN mode. You do not implement anything.
+const planSystem = () => `You are in PLAN mode. You analyse and plan; you do not implement anything.
+The project is READ-ONLY in this mode and the tools enforce it:
+- write_file and edit_file refuse every path outside ${planDir}. Use that directory for working notes if you need them.
+- run_command only runs read-only commands (ls, cat, grep, find, git status/log/diff, …). Builds, installs and anything that writes files are refused.
+Inspect the workspace with read_file and read-only commands until you understand the task.
 The user describes a coding task. If anything important is missing, ask short questions.
 When you have enough, output ONLY a prompt the implement agent will receive as its user message.
 That prompt must contain: goal, files to touch, steps, constraints, how to verify.
@@ -581,11 +754,30 @@ IMPLEMENT PROMPT
 <the full prompt>
 ---
 
-No other work. No tools needed unless you must inspect the workspace to plan.`;
+The block is saved to a plan file under ${planDir}; IMPLEMENT mode runs from that file and is the only mode that changes project files.
+No other work.`;
+
+/** One line at the end of a turn, so it is obvious the agent is idle again. */
+function turnSummary(stats, startedAt) {
+  const bits = [`${stats.steps} step${stats.steps === 1 ? '' : 's'}`];
+  if (stats.calls) {
+    const detail = [];
+    if (stats.writes) detail.push(`${stats.writes} file write${stats.writes === 1 ? '' : 's'}`);
+    if (stats.commands) detail.push(`${stats.commands} command${stats.commands === 1 ? '' : 's'}`);
+    if (stats.blocked) detail.push(`${stats.blocked} blocked by PLAN mode`);
+    if (stats.failed) detail.push(`${stats.failed} failed`);
+    bits.push(`${stats.calls} tool call${stats.calls === 1 ? '' : 's'}${detail.length ? ` (${detail.join(', ')})` : ''}`);
+  }
+  bits.push(fmtDuration(Date.now() - startedAt));
+  return `${tag('done', s.green)} ${s.dim(bits.join(' · '))}`;
+}
 
 async function loop(messages, { maxSteps = 40, tools = true } = {}) {
   let replyLimit = maxTokens;
+  const startedAt = Date.now();
+  const stats = { steps: 0, calls: 0, writes: 0, commands: 0, blocked: 0, failed: 0 };
   for (let i = 0; i < maxSteps; i++) {
+    stats.steps = i + 1;
     noteContext(messages); // nudge before the request, never while a tool runs
     let msg;
     for (let retries = 0; ; retries++) {
@@ -605,11 +797,20 @@ async function loop(messages, { maxSteps = 40, tools = true } = {}) {
     messages.push(msg);
     noteContext(messages); // the reply itself can be what pushed us over the line
     const calls = msg.tool_calls || [];
-    if (!calls.length) return msg.content || '';
-    for (const c of calls) {
+    if (!calls.length) {
+      console.log(turnSummary(stats, startedAt));
+      return msg.content || '';
+    }
+    for (const [k, c] of calls.entries()) {
       const name = c.function.name;
-      const paint = MUTATING_TOOLS.has(name) ? s.yellow : s.cyan;
-      console.log(`\n${tag(name === 'read_file' ? 'read' : 'tool', paint)} ${s.bold(name)}\n${s.dim(c.function.arguments || '{}')}`);
+      const mutating = MUTATING_TOOLS.has(name);
+      const paint = mutating ? s.yellow : s.cyan;
+      // Header: what is about to run, how far along the turn is, compact arguments.
+      console.log(
+        `\n${paint('⚙')} ${tag(name === 'read_file' ? 'read' : 'tool', paint)} ${s.bold(name)} ` +
+        `${s.dim(`· step ${i + 1}/${maxSteps} · call ${k + 1}/${calls.length}${mode === 'plan' && mutating ? ' · plan mode: project read-only' : ''}`)}\n` +
+        `  ${s.dim(summarizeArgs(c.function.arguments))}`
+      );
       const running = spinner(`running ${name}…`);
       let result;
       try {
@@ -617,13 +818,27 @@ async function loop(messages, { maxSteps = 40, tools = true } = {}) {
         result = await runTool(name, args);
       } catch (e) { result = `error: ${e.message}`; }
       finally { running.stop(); }
-      const content = String(result).slice(0, 20000);
-      console.log(`${tag('tool result', content.startsWith('error:') ? s.red : s.green)} ${s.bold(name)}\n${content}`);
-      if (String(result).length > content.length) console.log(s.dim('(result truncated to 20000 chars)'));
+      const full = String(result);
+      const content = full.slice(0, 20000);
+      const failed = content.startsWith('error:');
+      const blocked = failed && content.includes(PLAN_READ_ONLY);
+      stats.calls++;
+      if (blocked) stats.blocked++;
+      else if (failed) stats.failed++;
+      else if (name === 'run_command') stats.commands++;
+      else if (mutating) stats.writes++;
+      const lines = content ? content.split('\n').length : 0;
+      const mark = blocked ? s.yellow('⊘') : failed ? s.red('✗') : s.green('✓');
+      const status = blocked ? 'blocked' : failed ? 'failed' : 'ok';
+      console.log(
+        `${mark} ${tag('tool result', failed ? s.red : s.green)} ${s.bold(name)} ` +
+        `${s.dim(`· ${status} · ${fmtDuration(running.elapsedMs())} · ${lines} line${lines === 1 ? '' : 's'}`)}\n` +
+        previewResult(content, { truncatedFrom: full.length > content.length ? full.length : 0 })
+      );
       messages.push({ role: 'tool', tool_call_id: c.id, content });
     }
   }
-  console.log(s.dim('(stopped: max steps)'));
+  console.log(`${s.dim('(stopped: max steps)')}\n${turnSummary(stats, startedAt)}`);
   return '(stopped: max steps)';
 }
 
@@ -688,6 +903,7 @@ async function compactHistory(history) {
   history.length = 0;
   history.push(...rebuilt);
   contextWarned = false;
+  compactMode = false; // noteContext re-evaluates before the next request
   return { before, after };
 }
 
@@ -696,17 +912,52 @@ function extractImplementPrompt(text) {
   return m ? m[1].trim() : null;
 }
 
+/* ------------------------------- plan files ------------------------------ */
+
+/* PLAN mode's deliverable is persisted outside the project: the IMPLEMENT
+ * PROMPT goes to a timestamped file under planDir, and IMPLEMENT mode reads
+ * its brief from that file. The project itself is untouched until then. */
+
+function savePlan(prompt) {
+  fs.mkdirSync(planDir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  let file = path.join(planDir, `plan-${stamp}.md`);
+  for (let n = 2; fs.existsSync(file); n++) file = path.join(planDir, `plan-${stamp}-${n}.md`);
+  fs.writeFileSync(file, `${String(prompt).trim()}\n`, 'utf8');
+  return file;
+}
+
+function readPlan(file) {
+  const text = fs.readFileSync(file, 'utf8').trim();
+  if (!text) throw new Error(`plan file ${file} is empty`);
+  return text;
+}
+
+/** The whole user message for IMPLEMENT mode: the saved plan, and where it lives. */
+function implementPrompt(file) {
+  return `IMPLEMENT mode. The plan below was written in PLAN mode and saved at ${file}; it is your complete brief. ` +
+    'Carry it out now — project files may be read and modified in this mode. Re-read that file if the plan drops out of context.\n\n' +
+    readPlan(file);
+}
+
 async function planTurn(history, userText) {
+  mode = 'plan';
   history.push({ role: 'user', content: userText });
   const text = await loop(history, { tools: true });
   const prompt = extractImplementPrompt(text);
-  return { text, prompt };
+  const planFile = prompt ? savePlan(prompt) : null;
+  return { text, prompt, planFile };
 }
 
-async function implementTurn(prompt) {
-  // Everything is the user prompt. No system message.
-  const history = [{ role: 'user', content: prompt }];
-  return await loop(history, { tools: true });
+async function implementTurn(planFile) {
+  // The plan file is the user prompt. No system message.
+  const history = [{ role: 'user', content: implementPrompt(planFile) }];
+  mode = 'implement';
+  try {
+    return await loop(history, { tools: true });
+  } finally {
+    mode = 'plan';
+  }
 }
 
 /* --------------------------------- CLI --------------------------------- */
@@ -728,6 +979,14 @@ function loadConfig(p) {
     }
     contextSize = cfg.contextSize;
   }
+  if (cfg.planDir !== undefined) {
+    if (typeof cfg.planDir !== 'string' || !cfg.planDir.trim()) throw new Error('config planDir must be a non-empty string');
+    planDir = path.resolve(cfg.planDir);
+  }
+  if (cfg.planAllowCommands !== undefined) {
+    if (!Array.isArray(cfg.planAllowCommands)) throw new Error('config planAllowCommands must be an array of strings');
+    planAllowCommands = cfg.planAllowCommands.map(String);
+  }
   return cfg;
 }
 
@@ -748,26 +1007,36 @@ const HELP = `basic.mjs — plan then implement.
   node basic.mjs [--config file] [--dir path]
   node basic.mjs --once "task"
 
-  /plan [text]     plan mode (default). extra text is context.
-  /implement       run last IMPLEMENT PROMPT
-  /prompt          print last IMPLEMENT PROMPT
-  /compact         summarize the conversation to free context
-  /tools           list tools
+  /plan [text]       plan mode (default). extra text is context.
+  /implement [file]  run the last saved plan (or the given plan file / ad-hoc text)
+  /prompt            print the last saved plan and its path
+  /compact           summarize the conversation to free context
+  /verbose           toggle full tool arguments/results (default: compact preview)
+  /tools             list tools
   /quit
 
 Everything goes through plan, then implement.
-Plan writes an IMPLEMENT PROMPT. Implement uses only that as the user prompt.
+PLAN mode is analysis only — the project is read-only. write_file/edit_file
+refuse any path outside the plan directory and run_command only runs read-only
+commands (ls, cat, grep, git status/log/diff, …). When the plan is ready the
+IMPLEMENT PROMPT is saved to a plan file under the plan directory
+(config planDir, default <os tmp>/basic-plans). IMPLEMENT mode is the only mode
+that changes project files; its user prompt is that plan file.
 Responses stream live. Console labels: [response], [thinking] (when supplied by
-the API), [read]/[tool] with arguments, and [tool result] (up to 20000 chars).
+the API), ⚙ [read]/[tool] with a step/call counter and a one-line argument
+summary, then ✓/✗/⊘ [tool result] with status, duration and the first lines of
+the result (the model always gets the full result, up to 20000 chars).
+[done] closes every turn with step/tool counts and elapsed time.
 Labels are coloured on a terminal — [thinking] is dim, reads are cyan, tools that
-write files are yellow, failed tool results are red. NO_COLOR turns this off;
-FORCE_COLOR=1 turns it on for piped output too.
-While work is in progress a live line (thinking…, running <tool>…) shows elapsed
-time; it is erased as soon as the next output starts.
+can change files are yellow, failed tool results are red. NO_COLOR turns this
+off; FORCE_COLOR=1 turns it on for piped output too.
+While work is in progress a live line (thinking…, composing tool call <name>…,
+running <tool>…) shows elapsed time; it is erased when the next output starts.
 Config maxTokens sets the reply budget (default 4096, minimum 256).
 Config contextSize sets the model's context window (default 64000, minimum 2000).
-It drives the size estimate shown when the conversation reaches 90% full, which
-suggests /compact before the server starts rejecting requests.
+Once the conversation is estimated at 90% of it, compact mode switches on: each
+request is sent with older tool results and reasoning trimmed so work can go
+on, and you are asked to run /compact, which actually frees the history.
 /compact asks the model to summarize the conversation, then keeps the summary
 and the newest messages — the originals are dropped, so run it deliberately.
 Invalid tool-call JSON is retried up to 3 times with smaller-call instructions.`;
@@ -779,9 +1048,10 @@ async function main() {
   if (opts.dir) workspace = path.resolve(opts.dir);
   mcp = await connectMcp(cfg?.mcp?.servers);
 
-  const planHistory = [{ role: 'system', content: PLAN_SYSTEM }];
-  let lastPrompt = null;
-  let mode = 'plan';
+  const planHistory = [{ role: 'system', content: planSystem() }];
+  let lastPlanFile = null;
+
+  const savedNote = (file) => `\n${s.green('saved plan')} → ${file} — ${s.dim('/implement to run it')}`;
 
   async function handle(line) {
     const t = line.trim();
@@ -792,8 +1062,14 @@ async function main() {
       console.log(openaiTools().map((x) => x.function.name).join(', '));
       return;
     }
+    if (t === '/verbose') {
+      verbose = !verbose;
+      console.log(s.dim(`tool output: ${verbose ? 'verbose (full arguments and results)' : 'compact preview'}`));
+      return;
+    }
     if (t === '/prompt') {
-      console.log(lastPrompt || s.dim('(none yet)'));
+      if (!lastPlanFile) { console.log(s.dim('(no plan saved yet)')); return; }
+      console.log(`${s.dim(`plan file: ${lastPlanFile}`)}\n${readPlan(lastPlanFile)}`);
       return;
     }
     if (t === '/compact') {
@@ -804,47 +1080,53 @@ async function main() {
     if (t === '/plan' || t.startsWith('/plan ')) {
       mode = 'plan';
       const rest = t.slice(5).trim();
-      console.log(tag('plan', s.magenta));
+      console.log(`${tag('plan', s.magenta)} ${s.dim(`project read-only · plans go to ${planDir}`)}`);
       if (!rest) return;
-      const { prompt } = await planTurn(planHistory, rest);
-      if (prompt) lastPrompt = prompt;
-      if (prompt) console.log(`\n${s.green('saved IMPLEMENT PROMPT')} — ${s.dim('/implement to run')}`);
+      const { planFile } = await planTurn(planHistory, rest);
+      if (planFile) lastPlanFile = planFile;
+      if (planFile) console.log(savedNote(planFile));
       return;
     }
     if (t === '/implement' || t.startsWith('/implement ')) {
       const extra = t.slice(10).trim();
-      const prompt = extra || lastPrompt;
-      if (!prompt) { console.log(s.dim('no IMPLEMENT PROMPT yet — stay in /plan')); return; }
-      mode = 'implement';
-      console.log(tag('implement', s.cyan));
-      await implementTurn(prompt);
-      mode = 'plan';
-      console.log(`${tag('plan', s.magenta)} ${s.dim('back to plan')}`);
+      let planFile = lastPlanFile;
+      if (extra) {
+        // A path to an existing plan file, or ad-hoc text that becomes one.
+        const candidate = resolvePath(extra);
+        planFile = fs.existsSync(candidate) && fs.statSync(candidate).isFile() ? candidate : savePlan(extra);
+      }
+      if (!planFile) { console.log(s.dim('no plan saved yet — stay in /plan')); return; }
+      lastPlanFile = planFile;
+      console.log(`${tag('implement', s.cyan)} ${s.dim(`plan: ${planFile}`)}`);
+      await implementTurn(planFile);
+      console.log(`${tag('plan', s.magenta)} ${s.dim('back to plan — project read-only again')}`);
       return;
     }
     if (mode === 'plan') {
-      const { prompt } = await planTurn(planHistory, t);
-      if (prompt) lastPrompt = prompt;
-      if (prompt) console.log(`\n${s.green('saved IMPLEMENT PROMPT')} — ${s.dim('/implement to run')}`);
+      const { planFile } = await planTurn(planHistory, t);
+      if (planFile) lastPlanFile = planFile;
+      if (planFile) console.log(savedNote(planFile));
     }
   }
 
   if (opts.once) {
-    const { prompt } = await planTurn(planHistory, opts.once);
-    if (!prompt) {
+    const { planFile } = await planTurn(planHistory, opts.once);
+    if (!planFile) {
       console.error(s.red('plan did not produce IMPLEMENT PROMPT'));
       process.exitCode = 1;
       mcp.closeAll();
       return;
     }
-    lastPrompt = prompt;
-    console.log(`\n${tag('implement', s.cyan)}\n`);
-    await implementTurn(prompt);
+    lastPlanFile = planFile;
+    console.log(savedNote(planFile));
+    console.log(`\n${tag('implement', s.cyan)} ${s.dim(`plan: ${planFile}`)}\n`);
+    await implementTurn(planFile);
     mcp.closeAll();
     return;
   }
 
   console.log(`${s.bold('basic.mjs')}  ${s.dim(`model=${OPENAI.model}  dir=${workspace}  mode=plan`)}`);
+  console.log(s.dim(`plan mode is read-only; plans are saved under ${planDir}`));
   console.log(`${s.dim('describe the task. agent plans, then')} ${s.cyan('/implement')}${s.dim('.')}\n`);
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const ask = () => rl.question(`${s.cyan(`${mode}>`)} `, async (line) => {
