@@ -1,7 +1,7 @@
 /* Standalone basic.mjs integration tests; no API credentials required. */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import fs from 'node:fs';
@@ -13,7 +13,7 @@ const basic = fileURLToPath(new URL('../basic.mjs', import.meta.url));
 const plan = 'IMPLEMENT PROMPT\n---\nInspect the fixture.\n---';
 const frame = (delta, finish_reason = null) => `data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason }] })}\r\n\r\n`;
 
-async function session(handler, configOptions = {}) {
+async function session(handler, configOptions = {}, { env = {} } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'basic-stream-'));
   fs.writeFileSync(path.join(dir, 'fixture.txt'), 'héllo 🌍');
   const requests = [];
@@ -56,6 +56,7 @@ async function session(handler, configOptions = {}) {
     } }));
     child = spawn(process.execPath, [basic, '--config', config, '--once', 'inspect'], {
       stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...envWith(env) },
     });
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (data) => {
@@ -158,6 +159,21 @@ async function interactive(handler, configOptions = {}) {
   };
 }
 
+// A clean colour environment, so a NO_COLOR in the caller's shell cannot
+// silently change what these tests see.
+function envWith(extra = {}) {
+  const env = { ...process.env };
+  for (const key of ['NO_COLOR', 'FORCE_COLOR', 'TERM']) delete env[key];
+  return { ...env, ...extra };
+}
+
+/** What lib/ui.js styles one string as, in a throwaway process with `env`. */
+function styledIn(env) {
+  const ui = new URL('../lib/ui.js', import.meta.url).href;
+  const code = `import { s } from ${JSON.stringify(ui)}; process.stdout.write(s.cyan('x'))`;
+  return spawnSync(process.execPath, ['--input-type=module', '-e', code], { env: envWith(env) }).stdout.toString();
+}
+
 // Split every byte, including UTF-8 characters and CRLF separators.
 async function bytes(res, text) {
   for (const byte of Buffer.from(text)) {
@@ -219,7 +235,7 @@ test('live reasoning/text, fragmented parallel tools, results and history', asyn
   // Piped output gets one non-animated progress line per wait, not a frame stream.
   assert.ok(result.stdout.includes('· thinking…'), result.stdout);
   assert.ok(result.stdout.includes('· running read_file…'), result.stdout);
-  assert.doesNotMatch(result.stdout, /\x1b\[K/, 'no terminal redraws when stdout is a pipe');
+  assert.doesNotMatch(result.stdout + result.stderr, /\x1b\[/, 'no escapes when stdout is a pipe');
 });
 
 test('JSON-only compatible servers still display reasoning and responses once', async () => {
@@ -399,4 +415,41 @@ test('/compact summarizes the conversation, keeps the tail and drops the origina
   assert.match(after.messages[1].content, /Earlier in this session \(compacted summary/);
   assert.match(after.messages[1].content, /SUMMARY: inspected the fixture/);
   assert.equal(JSON.stringify(after).includes('history history'), false, 'the old messages were dropped');
+});
+
+test('tool calls, reasoning and tool results are coloured on a terminal', async () => {
+  const result = await session(({ res, step }) => {
+    startSse(res);
+    if (step === 1) {
+      res.write(frame({ reasoning_content: 'weighing options' }));
+      res.end(frame({ content: plan }, 'stop') + 'data: [DONE]\r\n\r\n');
+    } else if (step === 2) {
+      res.end(frame({ tool_calls: [
+        { index: 0, id: 'w', type: 'function', function: {
+          name: 'write_file', arguments: JSON.stringify({ path: 'out.txt', content: 'x' }) } },
+        { index: 1, id: 'r', type: 'function', function: {
+          name: 'read_file', arguments: JSON.stringify({ path: 'gone.txt' }) } },
+      ] }, 'tool_calls'));
+    } else {
+      res.end(frame({ content: 'COLOUR-DONE' }, 'stop'));
+    }
+  }, {}, { env: { FORCE_COLOR: '1' } });
+
+  assert.equal(result.code, 0, result.stdout);
+  const out = result.stdout;
+  assert.ok(out.includes('\x1b[35m[thinking]\x1b[0m'), 'thinking tag is magenta');
+  assert.ok(out.includes('\x1b[2mweighing options\x1b[0m'), 'reasoning text is dim');
+  assert.ok(out.includes('\x1b[33m[tool]\x1b[0m \x1b[1mwrite_file\x1b[0m'), 'a write tool is yellow and bold');
+  assert.ok(out.includes('\x1b[2m{"path":"out.txt"'), 'arguments are dim');
+  assert.ok(out.includes('\x1b[36m[read]\x1b[0m \x1b[1mread_file\x1b[0m'), 'a read tool is cyan');
+  assert.ok(out.includes('\x1b[32m[tool result]\x1b[0m \x1b[1mwrite_file\x1b[0m'), 'a good result is green');
+  assert.ok(out.includes('\x1b[31m[tool result]\x1b[0m \x1b[1mread_file\x1b[0m'), 'a failed result is red');
+  assert.ok(out.includes('\x1b[32m[response]\x1b[0m'), 'the response tag is green');
+});
+
+test('colour follows NO_COLOR, FORCE_COLOR and the TTY check', () => {
+  assert.equal(styledIn({}), 'x', 'a pipe gets no colour by default');
+  assert.equal(styledIn({ FORCE_COLOR: '1' }), '\x1b[36mx\x1b[0m', 'FORCE_COLOR=1 colours piped output');
+  assert.equal(styledIn({ FORCE_COLOR: '1', NO_COLOR: '1' }), 'x', 'NO_COLOR wins over FORCE_COLOR');
+  assert.equal(styledIn({ FORCE_COLOR: '0' }), 'x', 'FORCE_COLOR=0 means off');
 });
