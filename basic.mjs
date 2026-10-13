@@ -25,9 +25,23 @@
  *   started) and returns to the prompt with the history intact. A second Ctrl+C
  *   within a couple of seconds — or a Ctrl+C while the agent is idle — exits.
  *
+ * Paths
+ *   Every tool path is relative to the workspace (--dir, or config workspace):
+ *   "src/app.js" is the project's file, wherever the CLI was started. Paths
+ *   outside the workspace are refused (the plan directory excepted), and tool
+ *   results print workspace-relative paths — absolute ones only when a file
+ *   really is outside.
+ *
+ * Commands
+ *   Commands are OS-aware. They run in cmd.exe on Windows and in bash/zsh/sh
+ *   elsewhere (config shell or BASIC_SHELL overrides both), and PLAN mode
+ *   refuses read-only commands from the other OS — `ls` on Windows, `dir` on
+ *   Linux — naming the equivalent instead of letting the shell fail.
+ *
  * Config (optional JSON, --config path or BASIC_CONFIG):
  *   { openai: { baseURL, apiKey, model }, maxTokens: 4096, contextSize: 64000,
  *     workspace, planDir: "<os tmp>/basic-plans", planAllowCommands: ["make"],
+ *     shell: "bash",
  *     mcp: { servers: {
  *       name: { command, args?, env? }           // stdio
  *       name: { type: "http", url, headers? }    // HTTP
@@ -40,7 +54,8 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { spawn } from 'node:child_process';
 import { calibrateTokens, classifyApiError, estimatePromptTokens, serverErrorSummary, smallerReplyTokenLimit, TOOL_CALL_PARSE_ERROR } from './lib/llm.js';
-import { isReadOnlyCommand } from './lib/plan.js';
+import { extractImplementPrompt, isReadOnlyCommand, platformFamily, readOnlyCommandExamples, shellCommandFamily } from './lib/plan.js';
+import { resolveShell } from './lib/tools.js';
 import { fmtDuration, s, spinner } from './lib/ui.js';
 
 const OPENAI = {
@@ -67,6 +82,8 @@ let mode = 'plan';
 let planDir = path.join(os.tmpdir(), 'basic-plans');
 /** Extra commands PLAN mode may run (config planAllowCommands). */
 let planAllowCommands = [];
+/** Shell override (config shell / BASIC_SHELL): a path, or "powershell" on Windows. */
+let shellConfig = process.env.BASIC_SHELL || null;
 /** /verbose: show full tool arguments and results instead of the compact preview. */
 let verbose = process.env.BASIC_VERBOSE === '1';
 
@@ -165,15 +182,55 @@ process.on('SIGINT', onInterrupt); // piped stdin, `kill -INT`, --once mode
 
 /* ----------------------------- files / shell ----------------------------- */
 
+/** Expand a leading `~`, so `~/src/a.js` and `~` both work. */
+function expandHome(p) {
+  const text = String(p ?? '');
+  if (text === '~') return os.homedir();
+  if (text.startsWith('~/') || text.startsWith('~\\')) return path.join(os.homedir(), text.slice(2));
+  return text;
+}
+
+/**
+ * Absolute path for a tool argument. Anything that is not absolute is taken
+ * relative to the workspace — never to the directory the CLI happened to start
+ * in — so a model that answers with "src/app.js" always lands in the project.
+ */
 function resolvePath(p) {
-  if (!p) throw new Error('path required');
-  const abs = path.isAbsolute(p) ? p : path.join(workspace, p);
+  const text = expandHome(p);
+  if (!text || !text.trim()) throw new Error('path required');
+  const abs = path.isAbsolute(text) ? text : path.join(workspace, text);
   return path.normalize(abs);
+}
+
+/** The path as the model should think of it: workspace-relative, or absolute when it is outside. */
+function displayPath(abs) {
+  const rel = path.relative(workspace, abs);
+  return rel && !rel.startsWith('..') && !path.isAbsolute(rel) ? rel : abs;
 }
 
 function isInside(dir, abs) {
   const rel = path.relative(path.resolve(dir), path.resolve(abs));
   return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
+/**
+ * Every file tool argument lands here first. Two rules, both about scope:
+ *   - outside the workspace the tool does not touch it at all (the plan
+ *     directory excepted: that is where PLAN mode is allowed to write);
+ *   - PLAN mode additionally refuses every project path (see guardWrite).
+ * The refusal names the workspace root and the relative form, so a model that
+ * guessed a path learns how to write one instead of trying another random one.
+ */
+function guardPath(abs) {
+  if (isInside(planDir, abs)) return; // plans and working notes live here
+  if (isInside(workspace, abs)) return;
+  if (path.resolve(abs) === path.resolve(workspace)) {
+    throw new Error(`${workspace} is the workspace root, not a file — name a file inside it, e.g. "src/app.js"`);
+  }
+  throw new Error(
+    `${abs} is outside the workspace (${workspace}). Paths are relative to the workspace root — ` +
+    `use "src/app.js", or an absolute path inside ${workspace}. Outside files cannot be read or written.`
+  );
 }
 
 /* PLAN mode is enforced here, not just asked for in the prompt: a tool that
@@ -193,17 +250,41 @@ function guardWrite(abs) {
 
 function guardCommand(command) {
   if (mode !== 'plan') return;
-  const verdict = isReadOnlyCommand(command, planAllowCommands);
+  // OS-aware: `ls` is read-only but does not exist in cmd.exe, so the refusal
+  // names the command this machine has instead of letting the shell fail.
+  const { family } = shellInfo();
+  const verdict = isReadOnlyCommand(command, planAllowCommands, {
+    platform: process.platform,
+    // Git Bash on Windows really does have `ls` — then the OS check is noise.
+    ignoreOs: family !== platformFamily(process.platform),
+  });
   if (verdict.ok) return;
   throw new Error(
     `${PLAN_READ_ONLY}: \`${String(command ?? '').trim()}\` was not run (${verdict.reason}). ` +
-    'Only read-only commands run in PLAN mode (ls, cat, grep, find, git status/log/diff, …); anything that changes the project waits for IMPLEMENT mode.'
+    `Only read-only commands run in PLAN mode (${readOnlyCommandExamples(family)}, …), ` +
+    `and only ones this OS has (commands run through ${shellVia()}); anything that changes the project waits for IMPLEMENT mode.`
   );
+}
+
+/**
+ * Where commands actually run. The shell decides the command language: cmd.exe
+ * and PowerShell speak Windows, bash/sh/zsh speak POSIX — also on Windows, when
+ * the config points at Git Bash or WSL, in which case `ls` exists after all.
+ */
+function shellInfo() {
+  const shell = resolveShell(shellConfig);
+  const family = shellCommandFamily(shell.command) || platformFamily(shell.platform);
+  return { shell, family, platform: shell.platform || process.platform };
+}
+
+/** The platform whose command language the tools should assume. */
+function shellPlatform() {
+  return shellInfo().family;
 }
 
 const BUILTIN = {
   read_file: {
-    description: 'Read a text file. Optional start_line (1-based) and max_lines.',
+    description: 'Read a text file. Relative paths resolve against the workspace root; paths outside it are refused. Optional start_line (1-based) and max_lines.',
     parameters: {
       type: 'object',
       properties: {
@@ -215,17 +296,23 @@ const BUILTIN = {
     },
     async run({ path: p, start_line, max_lines }) {
       const abs = resolvePath(p);
-      const text = fs.readFileSync(abs, 'utf8');
+      guardPath(abs);
+      let text;
+      try {
+        text = fs.readFileSync(abs, 'utf8');
+      } catch (e) {
+        throw new Error(readPathError(e, abs));
+      }
       const lines = text.split(/\n/);
       const start = Math.max(1, start_line || 1);
       const take = Math.min(max_lines || 400, 800);
       const slice = lines.slice(start - 1, start - 1 + take);
       const numbered = slice.map((l, i) => `${String(start + i).padStart(4)}|${l}`).join('\n');
-      return `file ${abs} (${lines.length} lines)\n${numbered}`;
+      return `file ${displayPath(abs)} (${lines.length} lines)\n${numbered}`;
     },
   },
   write_file: {
-    description: 'Create or overwrite a text file. Keep calls small: for large new files write the first section, then append sections using edit_file in separate replies. For existing files prefer targeted edit_file calls.',
+    description: 'Create or overwrite a text file in the workspace (relative paths resolve against the workspace root; paths outside it are refused). Keep calls small: for large new files write the first section, then append sections using edit_file in separate replies. For existing files prefer targeted edit_file calls.',
     parameters: {
       type: 'object',
       properties: { path: { type: 'string' }, content: { type: 'string' } },
@@ -233,14 +320,15 @@ const BUILTIN = {
     },
     async run({ path: p, content }) {
       const abs = resolvePath(p);
+      guardPath(abs);
       guardWrite(abs);
       fs.mkdirSync(path.dirname(abs), { recursive: true });
       fs.writeFileSync(abs, content ?? '', 'utf8');
-      return `wrote ${abs} (${String(content ?? '').length} chars)`;
+      return `wrote ${displayPath(abs)} (${String(content ?? '').length} chars)`;
     },
   },
   edit_file: {
-    description: 'Replace old_text with new_text in a file (first match).',
+    description: 'Replace old_text with new_text in a workspace file (relative paths resolve against the workspace root; paths outside it are refused).',
     parameters: {
       type: 'object',
       properties: {
@@ -252,15 +340,21 @@ const BUILTIN = {
     },
     async run({ path: p, old_text, new_text }) {
       const abs = resolvePath(p);
+      guardPath(abs);
       guardWrite(abs);
-      const text = fs.readFileSync(abs, 'utf8');
-      if (!text.includes(old_text)) throw new Error('old_text not found');
+      let text;
+      try {
+        text = fs.readFileSync(abs, 'utf8');
+      } catch (e) {
+        throw new Error(readPathError(e, abs));
+      }
+      if (!text.includes(old_text)) throw new Error(`old_text not found in ${displayPath(abs)} — read the file again and copy the text exactly`);
       fs.writeFileSync(abs, text.replace(old_text, () => new_text), 'utf8');
-      return `edited ${abs}`;
+      return `edited ${displayPath(abs)}`;
     },
   },
   run_command: {
-    description: 'Run a shell command in the workspace. Optional timeout_sec (default 60).',
+    description: () => `Run a shell command in the workspace (${shellSummary()}). Optional timeout_sec (default 60).`,
     parameters: {
       type: 'object',
       properties: {
@@ -276,26 +370,50 @@ const BUILTIN = {
   },
 };
 
+/** Why a path could not be read, in words the model can act on (code included). */
+function readPathError(e, abs) {
+  const shown = displayPath(abs);
+  const code = e.code ? ` (${e.code})` : '';
+  if (e.code === 'ENOENT') {
+    return `no such file: ${shown}${code} — relative paths resolve against the workspace root ${workspace}`;
+  }
+  if (e.code === 'EISDIR') return `${shown} is a directory, not a file${code}`;
+  if (e.code === 'EACCES') return `${shown} cannot be read: permission denied${code}`;
+  return `${shown}: ${e.message}${code}`;
+}
+
 /** Tool descriptions carry the current mode's rules, so the model is told, not just refused. */
 const MODE_NOTES = {
   plan: {
     write_file: () => ` PLAN mode: only paths under ${planDir} may be written (plans, working notes). Project files are read-only until IMPLEMENT mode.`,
     edit_file: () => ` PLAN mode: only files under ${planDir} may be edited. Project files are read-only until IMPLEMENT mode.`,
-    run_command: () => ' PLAN mode: read-only commands only (ls, cat, grep, find, git status/log/diff, …); builds, installs and anything writing files are refused.',
+    run_command: () => ` PLAN mode: read-only commands only (${readOnlyCommandExamples(shellPlatform())}, …), and only ones that exist on this OS (commands run through ${shellVia()}); builds, installs and anything writing files are refused.`,
   },
   implement: {},
 };
 
+/** The shell this machine runs commands in: "Linux/macOS · bash -c". */
+function shellSummary() {
+  const { shell, family } = shellInfo();
+  return `${family === 'windows' ? 'Windows' : 'Linux/macOS'} · ${path.basename(shell.command)} ${shell.args.join(' ')}`;
+}
+
+/** The same thing in prose: "bash -c on Linux/macOS". */
+function shellVia() {
+  const { shell, family } = shellInfo();
+  return `${path.basename(shell.command)} ${shell.args.join(' ')} on ${family === 'windows' ? 'Windows' : 'Linux/macOS'}`;
+}
+
 function runShell(command, timeoutSec) {
+  const { shell, family } = shellInfo(); // cmd.exe on Windows, bash/zsh/sh on Unix
   return new Promise((resolve) => {
-    const isWin = process.platform === 'win32';
-    const child = spawn(isWin ? (process.env.ComSpec || 'cmd.exe') : 'bash', isWin ? ['/d', '/s', '/c', command] : ['-c', command], {
-      cwd: workspace,
+    const child = spawn(shell.command, [...shell.args, String(command ?? '')], {
+      cwd: workspace, // commands run in the project, whatever the CLI was started from
       env: process.env,
       windowsHide: true,
       // POSIX: give the command its own process group, so an interrupt can stop
       // the whole thing (pipes, `a && b`) instead of only the shell around it.
-      detached: !isWin,
+      detached: family !== 'windows',
     });
     let out = '';
     let settled = false;
@@ -506,7 +624,12 @@ function openaiTools() {
   const notes = MODE_NOTES[mode] || {};
   const list = Object.entries(BUILTIN).map(([name, t]) => ({
     type: 'function',
-    function: { name, description: t.description + (notes[name] ? notes[name]() : ''), parameters: t.parameters },
+    // A description can be a function so it can name the current shell/mode.
+    function: {
+      name,
+      description: (typeof t.description === 'function' ? t.description() : t.description) + (notes[name] ? notes[name]() : ''),
+      parameters: t.parameters,
+    },
   }));
   for (const t of mcp.listTools()) {
     list.push({
@@ -732,7 +855,15 @@ Return valid JSON with properly escaped strings and closing quotes/braces. Do no
 // waiting = the "still working" indicator to clear as soon as anything prints,
 // so the spinner never fights the streamed text for the same terminal row.
 // quiet = no streaming to the console (internal requests such as /compact).
+/**
+ * Why the last reply stopped ('stop', 'length', 'tool_calls', …), or null.
+ * Module-level on purpose: the message object is sent back to the API, which
+ * does not accept extra fields, so the finish reason travels beside it.
+ */
+let lastFinishReason = null;
+
 async function readChatResponse(res, waiting, { quiet = false, sent = [] } = {}) {
+  lastFinishReason = null;
   const output = quiet ? { write() {}, end() {} } : consoleStream();
   // Feed the server's own prompt_tokens back into the estimator when offered.
   const calibrate = (usage) => { if (usage?.prompt_tokens) calibrateTokens(sent, usage.prompt_tokens); };
@@ -754,6 +885,7 @@ async function readChatResponse(res, waiting, { quiet = false, sent = [] } = {})
       const msg = json.choices?.[0]?.message;
       if (!msg) throw new Error('LLM returned no message');
       show(msg);
+      lastFinishReason = json.choices[0].finish_reason || null;
       if (json.choices[0].finish_reason === 'length' && msg.tool_calls?.length) {
         throw invalidToolCall('output token limit reached');
       }
@@ -791,6 +923,7 @@ async function readChatResponse(res, waiting, { quiet = false, sent = [] } = {})
       }
       if (choice.finish_reason) { finished = true; finishReason = choice.finish_reason; }
     }
+    lastFinishReason = finishReason;
     if ((!finished || finishReason === 'length') && calls.size) {
       throw invalidToolCall('stream ended before tool calls were complete');
     }
@@ -858,9 +991,15 @@ async function runTool(name, args) {
 }
 
 const planSystem = () => `You are in PLAN mode. You analyse and plan; you do not implement anything.
+The workspace is ${workspace} — every relative path you pass to a tool resolves against it
+(never against some other directory) and paths outside it are refused. Use short
+workspace-relative paths like "src/app.js"; results come back the same way.
 The project is READ-ONLY in this mode and the tools enforce it:
 - write_file and edit_file refuse every path outside ${planDir}. Use that directory for working notes if you need them.
-- run_command only runs read-only commands (ls, cat, grep, find, git status/log/diff, …). Builds, installs and anything that writes files are refused.
+- run_command only runs read-only commands (${readOnlyCommandExamples(shellPlatform())}, …), and only
+  ones this machine has: commands run through ${shellVia()}, so a command from the other OS is
+  refused (on Windows use dir/type/findstr, on Linux/macOS use ls/cat/grep).
+  Builds, installs and anything that writes files are refused.
 Inspect the workspace with read_file and read-only commands until you understand the task.
 The user describes a coding task. If anything important is missing, ask short questions.
 When you have enough, output ONLY a prompt the implement agent will receive as its user message.
@@ -872,7 +1011,8 @@ IMPLEMENT PROMPT
 <the full prompt>
 ---
 
-The block is saved to a plan file under ${planDir}; IMPLEMENT mode runs from that file and is the only mode that changes project files.
+End the reply with that block: it is saved to a plan file under ${planDir}, and IMPLEMENT mode runs
+from that file. Nothing may follow the closing "---" — no summary, no questions, no offer to continue.
 No other work.`;
 
 /** One line at the end of a turn, so it is obvious the agent is idle again. */
@@ -898,6 +1038,9 @@ async function loop(messages, { maxSteps = 40, tools = true } = {}) {
   // command a tool starts; endExecution() retires the handle either way.
   const execution = beginExecution();
   const aborted = () => execution.controller.signal.aborted;
+  // Every reply the turn produced, in order — the plan can be written in one
+  // reply and the turn can end (or be cut off) in a later one.
+  const texts = [];
   try {
     for (let i = 0; i < maxSteps; i++) {
       if (aborted()) break; // Ctrl+C between steps: do not start another one
@@ -922,10 +1065,21 @@ async function loop(messages, { maxSteps = 40, tools = true } = {}) {
       if (aborted()) break; // a reply cut short by Ctrl+C never enters the history
       messages.push(msg);
       noteContext(messages); // the reply itself can be what pushed us over the line
+      // A reply can carry prose and a tool call at once: the plan may be in it.
+      if (msg.content) texts.push(msg.content);
       const calls = msg.tool_calls || [];
       if (!calls.length) {
+        const text = msg.content || '';
+        // A reply cut off by the reply-token limit can end mid-plan; say so,
+        // because the rest of the turn works from whatever arrived.
+        if (lastFinishReason === 'length') {
+          console.log(
+            `\n${tag('truncated', s.yellow)} the reply hit the ${fmtTokens(replyLimit)} reply-token limit and stopped mid-sentence` +
+            `${s.dim(' — raise config maxTokens, or ask for a shorter plan')}`
+          );
+        }
         console.log(turnSummary(stats, startedAt));
-        return msg.content || '';
+        return { text, texts, stats };
       }
       for (const [k, c] of calls.entries()) {
         const name = c.function.name;
@@ -972,10 +1126,10 @@ async function loop(messages, { maxSteps = 40, tools = true } = {}) {
     if (aborted()) {
       console.log(`\n${tag('interrupt', s.yellow)} ${s.dim('turn stopped — history is intact')}`);
       console.log(turnSummary(stats, startedAt));
-      return '(stopped: interrupted)';
+      return { text: '(stopped: interrupted)', texts, stats };
     }
     console.log(`${s.dim('(stopped: max steps)')}\n${turnSummary(stats, startedAt)}`);
-    return '(stopped: max steps)';
+    return { text: '(stopped: max steps)', texts, stats };
   } finally {
     endExecution(execution);
   }
@@ -1053,11 +1207,6 @@ async function compactHistory(history) {
   return { before, after };
 }
 
-function extractImplementPrompt(text) {
-  const m = String(text || '').match(/IMPLEMENT PROMPT\s*\n---\s*\n([\s\S]*?)\n---/);
-  return m ? m[1].trim() : null;
-}
-
 /* ------------------------------- plan files ------------------------------ */
 
 /* PLAN mode's deliverable is persisted outside the project: the IMPLEMENT
@@ -1089,8 +1238,10 @@ function implementPrompt(file) {
 async function planTurn(history, userText) {
   mode = 'plan';
   history.push({ role: 'user', content: userText });
-  const text = await loop(history, { tools: true });
-  const prompt = extractImplementPrompt(text);
+  const { text, texts } = await loop(history, { tools: true });
+  // Look at the whole turn, not just its last reply: a plan written before
+  // another tool call, or before the step limit stopped the turn, still counts.
+  const prompt = extractImplementPrompt(texts.length ? texts : [text]);
   const planFile = prompt ? savePlan(prompt) : null;
   return { text, prompt, planFile, interrupted }; // interrupted: Ctrl+C stopped the turn
 }
@@ -1133,6 +1284,10 @@ function loadConfig(p) {
     if (!Array.isArray(cfg.planAllowCommands)) throw new Error('config planAllowCommands must be an array of strings');
     planAllowCommands = cfg.planAllowCommands.map(String);
   }
+  if (cfg.shell !== undefined) {
+    if (typeof cfg.shell !== 'string' || !cfg.shell.trim()) throw new Error('config shell must be a non-empty string');
+    shellConfig = cfg.shell.trim();
+  }
   return cfg;
 }
 
@@ -1171,11 +1326,18 @@ starts from an empty context.
 
 Everything goes through plan, then implement.
 PLAN mode is analysis only — the project is read-only. write_file/edit_file
-refuse any path outside the plan directory and run_command only runs read-only
-commands (ls, cat, grep, git status/log/diff, …). When the plan is ready the
-IMPLEMENT PROMPT is saved to a plan file under the plan directory
-(config planDir, default <os tmp>/basic-plans). IMPLEMENT mode is the only mode
-that changes project files; its user prompt is that plan file.
+refuse every project path (only the plan directory is writable, and nothing
+outside the workspace is touched at all) and run_command only runs read-only
+commands (${readOnlyCommandExamples()}, …) that exist on this OS (${shellVia()}).
+When the plan is ready the IMPLEMENT PROMPT is saved to a plan file under the plan
+directory (config planDir, default <os tmp>/basic-plans); the block is read
+tolerantly, but if a reply never writes one the turn says so instead of leaving
+/implement with nothing to run. IMPLEMENT mode is the only mode that changes
+project files; its user prompt is that plan file.
+Paths are relative to the workspace (--dir, or config workspace, default: the
+current directory). A tool path outside the workspace is refused — the plan
+directory excepted — and tool results print workspace-relative paths, falling
+back to the full path only for files outside it.
 Responses stream live. Console labels: [response], [thinking] (when supplied by
 the API), ⚙ [read]/[tool] with a step/call counter and a one-line argument
 summary, then ✓/✗/⊘ [tool result] with status, duration and the first lines of
@@ -1206,6 +1368,19 @@ async function main() {
   let lastPlanFile = null;
 
   const savedNote = (file) => `\n${s.green('saved plan')} → ${file} — ${s.dim('/implement to run it')}`;
+  /** Printed when a PLAN turn ended without a plan, so the silence is explained. */
+  const noPlanNote = () => console.log(
+    s.dim('no IMPLEMENT PROMPT block in that reply — ask again in /plan, or run ') +
+    s.cyan('/implement <instructions>') + s.dim(' to hand the work over directly')
+  );
+  /** After a plan turn: remember the plan file, or say why there is none. */
+  const finishPlanTurn = async (history, userText) => {
+    const { planFile } = await planTurn(history, userText);
+    if (!planFile) { noPlanNote(); return null; }
+    lastPlanFile = planFile;
+    console.log(savedNote(planFile));
+    return planFile;
+  };
 
   async function handle(line) {
     const t = line.trim();
@@ -1222,7 +1397,11 @@ async function main() {
       return;
     }
     if (t === '/prompt') {
-      if (!lastPlanFile) { console.log(s.dim('(no plan saved yet)')); return; }
+      if (!lastPlanFile) {
+        console.log(s.dim('(no plan saved yet)'));
+        console.log(s.dim(`  a PLAN reply that ends with the IMPLEMENT PROMPT block saves one under ${planDir}`));
+        return;
+      }
       console.log(`${s.dim(`plan file: ${lastPlanFile}`)}\n${readPlan(lastPlanFile)}`);
       return;
     }
@@ -1252,9 +1431,7 @@ async function main() {
       const rest = t.slice(5).trim();
       console.log(`${tag('plan', s.magenta)} ${s.dim(`project read-only · plans go to ${planDir}`)}`);
       if (!rest) return;
-      const { planFile } = await planTurn(planHistory, rest);
-      if (planFile) lastPlanFile = planFile;
-      if (planFile) console.log(savedNote(planFile));
+      await finishPlanTurn(planHistory, rest);
       return;
     }
     if (t === '/implement' || t.startsWith('/implement ')) {
@@ -1265,18 +1442,26 @@ async function main() {
         const candidate = resolvePath(extra);
         planFile = fs.existsSync(candidate) && fs.statSync(candidate).isFile() ? candidate : savePlan(extra);
       }
-      if (!planFile) { console.log(s.dim('no plan saved yet — stay in /plan')); return; }
+      if (!planFile) {
+        console.log(s.dim('no plan saved yet — stay in /plan'));
+        console.log(
+          s.dim('  (the last PLAN reply had no IMPLEMENT PROMPT block. ') +
+          s.cyan('/implement <instructions>') + s.dim(' runs text directly, ') +
+          s.cyan('/implement <file>') + s.dim(' runs a saved plan file)')
+        );
+        return;
+      }
+      if (!fs.existsSync(planFile)) {
+        console.log(s.red(`plan file is gone: ${planFile}`) + s.dim(' — plan again, or pass another plan file'));
+        return;
+      }
       lastPlanFile = planFile;
       console.log(`${tag('implement', s.cyan)} ${s.dim(`plan: ${planFile}`)}`);
       await implementTurn(planFile);
       console.log(`${tag('plan', s.magenta)} ${s.dim('back to plan — project read-only again')}`);
       return;
     }
-    if (mode === 'plan') {
-      const { planFile } = await planTurn(planHistory, t);
-      if (planFile) lastPlanFile = planFile;
-      if (planFile) console.log(savedNote(planFile));
-    }
+    if (mode === 'plan') await finishPlanTurn(planHistory, t);
   }
 
   if (opts.once) {
@@ -1289,6 +1474,7 @@ async function main() {
     }
     if (!planFile) {
       console.error(s.red('plan did not produce IMPLEMENT PROMPT'));
+      console.error(s.dim(`the reply held no IMPLEMENT PROMPT block — raise config maxTokens if it was cut off, or ask again`));
       process.exitCode = 1;
       mcp.closeAll();
       return;

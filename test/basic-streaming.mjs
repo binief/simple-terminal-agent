@@ -528,6 +528,111 @@ test('PLAN mode refuses project writes and shell writes, allows the plan dir; IM
   assert.match(result.stdout, /\[done\] 2 steps · 2 tool calls \(1 file write, 1 command\)/);
 });
 
+test('a plan is recognised however the model decorates the IMPLEMENT PROMPT block', async () => {
+  // The strict "IMPLEMENT PROMPT\n---\n…\n---" reading threw plans away: the
+  // plan was plainly written, yet /implement had nothing to run.
+  const replies = [
+    ['I read the fixture.\n\n**IMPLEMENT PROMPT**\n***\nGoal: note the greeting.\n***\n\nShall I go on?', 'Goal: note the greeting.'],
+    ['## Implement prompt:\n---\nGoal: tidy the tests.\n---', 'Goal: tidy the tests.'],
+    ['Here it is:\n\n```\nIMPLEMENT PROMPT\n---\nGoal: quoted plan.\n---\n```', 'Goal: quoted plan.'],
+    ['IMPLEMENT PROMPT\nGoal: no delimiters at all.', 'Goal: no delimiters at all.'],
+  ];
+  for (const [reply, expected] of replies) {
+    const result = await session(({ res, step, body }) => {
+      startSse(res);
+      if (step === 1) res.end(frame({ content: reply }, 'stop'));
+      else {
+        // The implement prompt is the plan file's contents: the plan arrived.
+        assert.match(body.messages[0].content, /^IMPLEMENT mode\./, reply);
+        assert.ok(body.messages[0].content.endsWith(expected), `${reply}\n---\n${body.messages[0].content}`);
+        res.end(frame({ content: 'DONE' }, 'stop'));
+      }
+    });
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /saved plan → \S+plan-[\dT-]+\.md/, reply);
+    assert.match(result.stdout, /\[implement\] plan: \S+\.md/, reply);
+    assert.doesNotMatch(result.stdout, /no plan saved yet/, reply);
+    assert.equal(result.requests.length, 2, reply);
+  }
+});
+
+test('a plan written before the turn ends is not lost — an earlier reply counts', async () => {
+  const result = await session(({ res, step, body }) => {
+    startSse(res);
+    if (step === 1) {
+      // Prose and a tool call in the same reply, the plan already written.
+      res.end(frame({ content: 'IMPLEMENT PROMPT\n---\nGoal: greet.\n---', tool_calls: [call('r', 'read_file', { path: 'fixture.txt' })] }, 'tool_calls'));
+    } else if (step === 2) {
+      assert.match(body.messages.find((m) => m.tool_call_id === 'r').content, /^file fixture\.txt \(1 lines\)/);
+      res.end(frame({ content: 'nothing more to add' }, 'stop')); // the turn ends on a later reply
+    } else {
+      assert.equal(step, 3);
+      assert.match(body.messages[0].content, /^IMPLEMENT mode\./); // and the plan still ran
+      res.end(frame({ content: 'DONE' }, 'stop'));
+    }
+  });
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /saved plan → \S+plan-[\dT-]+\.md/);
+  assert.match(result.stdout, /Goal: greet\./);
+});
+
+test('a plan cut off by the reply-token limit is saved and the cut is reported', async () => {
+  const result = await session(({ res, step }) => {
+    startSse(res);
+    // finish_reason 'length': the reply stopped mid-block, no closing ---.
+    if (step === 1) res.end(frame({ content: 'IMPLEMENT PROMPT\n---\nGoal: x\nSteps: 1' }, 'length'));
+    else res.end(frame({ content: 'DONE' }, 'stop'));
+  });
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /\[truncated\] the reply hit the [\d.]+k? reply-token limit/, result.stdout);
+  assert.match(result.stdout, /saved plan → \S+plan-[\dT-]+\.md/);
+});
+
+test('a PLAN reply without the block says so instead of leaving /implement empty-handed', async () => {
+  const live = await interactive(({ res, step }) => {
+    startSse(res);
+    if (step === 1) res.end(frame({ content: 'The project looks fine, I would tidy the tests.' }, 'stop'));
+    else res.end(frame({ content: 'DONE' }, 'stop'));
+  });
+  live.send('how is the project?');
+  await live.waitNew('no IMPLEMENT PROMPT block in that reply');
+  live.send('/implement');
+  await live.waitNew('no plan saved yet — stay in /plan');
+  await live.waitNew('/implement <instructions>');
+  const result = await live.finish();
+  assert.equal(result.code, 0, result.stdout);
+  assert.equal(result.requests.length, 1, 'no implement turn ran');
+});
+
+test('paths are workspace-relative: outside paths are refused, results print relative paths', async () => {
+  // the workspace is a fresh dir under os.tmpdir(), so "../x" escapes the project
+  const outside = path.join(os.tmpdir(), 'basic-outside-target.txt');
+  const result = await session(({ res, step, body }) => {
+    startSse(res);
+    if (step === 1) {
+      res.end(frame({ tool_calls: [
+        call('r1', 'read_file', { path: '../basic-outside-target.txt' }, 0),
+        call('r2', 'read_file', { path: 'fixture.txt' }, 1),
+      ] }, 'tool_calls'));
+    } else if (step === 2) {
+      const results = Object.fromEntries(body.messages.filter((m) => m.role === 'tool').map((m) => [m.tool_call_id, m.content]));
+      assert.match(results.r1, /^error: .* is outside the workspace/, results.r1);
+      assert.match(results.r1, /[Pp]aths are relative to the workspace root/, results.r1);
+      assert.match(results.r2, /^file fixture\.txt \(1 lines\)\n {3}1\|héllo/, results.r2);
+      res.end(frame({ content: 'IMPLEMENT PROMPT\n---\nGoal: x\n---' }, 'stop'));
+    } else if (step === 3) {
+      res.end(frame({ tool_calls: [call('w', 'write_file', { path: '../basic-outside-target.txt', content: 'pwned' })] }, 'tool_calls'));
+    } else {
+      const written = body.messages.filter((m) => m.role === 'tool').map((m) => m.content).join('\n');
+      assert.match(written, /^error: .*basic-outside-target\.txt is outside the workspace/m, written);
+      res.end(frame({ content: 'DONE' }, 'stop'));
+    }
+  });
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(fs.existsSync(outside), false, 'nothing may be written outside the workspace');
+  assert.equal(result.requests.length, 4);
+});
+
 test('/implement accepts a plan file path or ad-hoc text, and /prompt shows the saved plan', async () => {
   const live = await interactive(({ res, step, body, dir }) => {
     startSse(res);
