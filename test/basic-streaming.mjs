@@ -1130,3 +1130,94 @@ test('--once exits 130 when Ctrl+C stops the run', async () => {
     fs.rmSync(planDir, { recursive: true, force: true });
   }
 });
+
+/* ------------------------------------------------------------------ */
+/* No step limit, and CRLF/LF handling                                 */
+/* ------------------------------------------------------------------ */
+
+test('a turn has no step limit: it runs past the old 40-step cap until the model finishes', async () => {
+  const TOOL_STEPS = 45; // the plan request + 45 tool steps + the final reply
+  const result = await session(({ res, step }) => {
+    startSse(res);
+    if (step === 1) {
+      res.end(frame({ content: plan }, 'stop'));
+    } else if (step <= 1 + TOOL_STEPS) {
+      res.end(frame({ tool_calls: [call('r', 'read_file', { path: 'fixture.txt' })] }, 'tool_calls'));
+    } else {
+      assert.equal(step, 2 + TOOL_STEPS);
+      res.end(frame({ content: 'LONG-DONE' }, 'stop'));
+    }
+  });
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.requests.length, 2 + TOOL_STEPS, 'every step was requested — nothing stopped the turn early');
+  assert.match(result.stdout, /step 45 · call 1\/1/, 'the step counter is a counter, not a budget');
+  assert.match(result.stdout, /\[done\] 46 steps · 45 tool calls/);
+  assert.match(result.stdout, /LONG-DONE/);
+  assert.doesNotMatch(result.stdout + result.stderr, /max steps/);
+});
+
+test('CRLF and LF files keep their own line endings through reads, searches, edits and writes', async () => {
+  const result = await session(({ res, step, body, dir }) => {
+    startSse(res);
+    if (step === 1) {
+      fs.writeFileSync(path.join(dir, 'crlf.txt'), 'one\r\ntwo\r\nthree\r\n');
+      fs.writeFileSync(path.join(dir, 'lf.txt'), 'one\ntwo\nthree\n');
+      res.end(frame({ content: plan }, 'stop'));
+    } else if (step === 2) {
+      res.end(frame({ tool_calls: [
+        call('read-crlf', 'read_file', { path: 'crlf.txt' }, 0),
+        call('search-crlf', 'search_files', { pattern: 'two', path: '.' }, 1),
+        // The model speaks LF for the CRLF file, and CRLF for the LF file:
+        // both edits must land, and neither file may change style.
+        call('edit-crlf', 'edit_file', { path: 'crlf.txt', old_text: 'two\nthree', new_text: 'TWO\nthree' }, 2),
+        call('edit-lf', 'edit_file', { path: 'lf.txt', old_text: 'two\r\nthree', new_text: 'TWO\r\nthree' }, 3),
+      ] }, 'tool_calls'));
+    } else if (step === 3) {
+      const results = Object.fromEntries(body.messages.filter((m) => m.role === 'tool').map((m) => [m.tool_call_id, m.content]));
+      assert.match(results['read-crlf'], /CRLF line endings \(shown as LF; edits keep CRLF\)/);
+      assert.match(results['read-crlf'], /\n {3}2\|two\n/, 'lines are shown as LF');
+      assert.doesNotMatch(results['read-crlf'], /\r/, 'no stray CR reaches the model');
+      assert.match(results['search-crlf'], /crlf\.txt:2: two/);
+      assert.doesNotMatch(results['search-crlf'], /\r/);
+      assert.match(results['edit-crlf'], /^edited crlf\.txt \(CRLF line endings preserved\)/);
+      assert.match(results['edit-lf'], /^edited lf\.txt/);
+      assert.equal(fs.readFileSync(path.join(dir, 'crlf.txt'), 'utf8'), 'one\r\nTWO\r\nthree\r\n', 'CRLF file stayed CRLF');
+      assert.equal(fs.readFileSync(path.join(dir, 'lf.txt'), 'utf8'), 'one\nTWO\nthree\n', 'LF file stayed LF');
+      res.end(frame({ tool_calls: [
+        call('write-crlf', 'write_file', { path: 'crlf.txt', content: 'a\nb\n' }, 0),
+        call('write-new', 'write_file', { path: 'new.txt', content: 'a\r\nb\nc\r\n' }, 1),
+      ] }, 'tool_calls'));
+    } else {
+      assert.equal(step, 4);
+      assert.equal(fs.readFileSync(path.join(dir, 'crlf.txt'), 'utf8'), 'a\r\nb\r\n', 'an overwritten CRLF file keeps CRLF');
+      const native = process.platform === 'win32' ? '\r\n' : '\n';
+      assert.equal(
+        fs.readFileSync(path.join(dir, 'new.txt'), 'utf8'),
+        `a${native}b${native}c${native}`,
+        'a new file gets the one OS style, never a mix'
+      );
+      res.end(frame({ content: 'EOL-DONE' }, 'stop'));
+    }
+  });
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /EOL-DONE/);
+});
+
+test('config lineEndings forces the style new files are written with', async () => {
+  const result = await session(({ res, step, body, dir }) => {
+    startSse(res);
+    if (step === 1) {
+      res.end(frame({ content: plan }, 'stop'));
+    } else if (step === 2) {
+      res.end(frame({ tool_calls: [call('w', 'write_file', { path: 'forced.txt', content: 'one\ntwo\n' })] }, 'tool_calls'));
+    } else {
+      assert.equal(step, 3);
+      const written = body.messages.find((m) => m.tool_call_id === 'w');
+      assert.match(written.content, /^wrote forced\.txt \(\d+ chars, CRLF line endings\)/);
+      assert.equal(fs.readFileSync(path.join(dir, 'forced.txt'), 'utf8'), 'one\r\ntwo\r\n');
+      res.end(frame({ content: 'FORCED-DONE' }, 'stop'));
+    }
+  }, { lineEndings: 'crlf' });
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /FORCED-DONE/);
+});
