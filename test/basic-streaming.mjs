@@ -15,6 +15,9 @@ const frame = (delta, finish_reason = null) => `data: ${JSON.stringify({ choices
 
 async function session(handler, configOptions = {}, { env = {} } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'basic-stream-'));
+  // Plans live outside the workspace, as they do by default: the two are never
+  // the same directory, and that is what the CLI enforces.
+  const plans = fs.mkdtempSync(path.join(os.tmpdir(), 'basic-plans-'));
   fs.writeFileSync(path.join(dir, 'fixture.txt'), 'héllo 🌍');
   const requests = [];
   let stdout = '';
@@ -40,7 +43,7 @@ async function session(handler, configOptions = {}, { env = {} } = {}) {
       const body = JSON.parse(raw);
       requests.push(body);
       assert.equal(body.stream, true);
-      await handler({ body, res, step: requests.length, waitForOutput, dir });
+      await handler({ body, res, step: requests.length, waitForOutput, dir, plans });
     } catch (e) {
       serverError = e;
       res.destroy();
@@ -51,7 +54,7 @@ async function session(handler, configOptions = {}, { env = {} } = {}) {
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
     const config = path.join(dir, 'config.json');
-    fs.writeFileSync(config, JSON.stringify({ planDir: path.join(dir, '.plans'), ...configOptions, workspace: dir, openai: {
+    fs.writeFileSync(config, JSON.stringify({ planDir: plans, ...configOptions, workspace: dir, openai: {
       baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: '', model: 'mock',
     } }));
     child = spawn(process.execPath, [basic, '--config', config, '--once', 'inspect'], {
@@ -74,6 +77,7 @@ async function session(handler, configOptions = {}, { env = {} } = {}) {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
     fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(plans, { recursive: true, force: true });
   }
 }
 
@@ -84,6 +88,7 @@ async function session(handler, configOptions = {}, { env = {} } = {}) {
  */
 async function interactive(handler, configOptions = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'basic-interactive-'));
+  const plans = fs.mkdtempSync(path.join(os.tmpdir(), 'basic-plans-'));
   fs.writeFileSync(path.join(dir, 'fixture.txt'), 'héllo 🌍');
   const requests = [];
   let stdout = '';
@@ -113,7 +118,7 @@ async function interactive(handler, configOptions = {}) {
       for await (const chunk of req) raw += chunk;
       const body = JSON.parse(raw);
       requests.push(body);
-      await handler({ body, res, step: requests.length, dir });
+      await handler({ body, res, step: requests.length, dir, plans });
     } catch (e) {
       serverError = e;
       if (process.env.DEBUG_TESTS) console.error('handler error:', e);
@@ -127,12 +132,13 @@ async function interactive(handler, configOptions = {}) {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
     fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(plans, { recursive: true, force: true });
   };
   try {
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
     const config = path.join(dir, 'config.json');
-    fs.writeFileSync(config, JSON.stringify({ planDir: path.join(dir, '.plans'), ...configOptions, workspace: dir, openai: {
+    fs.writeFileSync(config, JSON.stringify({ planDir: plans, ...configOptions, workspace: dir, openai: {
       baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: '', model: 'mock',
     } }));
     child = spawn(process.execPath, [basic, '--config', config], { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -376,7 +382,8 @@ test('contextSize drives a /compact nudge once the window is nearly full', async
     const content = step === 1 ? `IMPLEMENT PROMPT\n---\n${'filler '.repeat(1400)}\n---` : 'done';
     startSse(res);
     res.end(frame({ content }, 'stop') + 'data: [DONE]\r\n\r\n');
-  }, { contextSize: 2000 });
+    // autoCompact off: this test is about the nudge, not the automatic summary.
+  }, { contextSize: 2000, autoCompact: false });
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /\[context\] ~[\d.]+k? of 2\.0k tokens \(\d+%\)/);
   assert.match(result.stdout, /run \/compact to summarize/);
@@ -401,7 +408,8 @@ test('/compact summarizes the conversation, keeps the tail and drops the origina
     } else {
       res.end(frame({ content: 'REPLY-AFTER' }, 'stop') + 'data: [DONE]\r\n\r\n');
     }
-  }, { contextSize: 2000 });
+    // autoCompact off, so /compact is the only thing that compacts here.
+  }, { contextSize: 2000, autoCompact: false });
 
   live.send('/plan inspect the fixture');
   await live.waitNew(big.slice(0, 8)); // the reply with the oversized history lands
@@ -422,6 +430,65 @@ test('/compact summarizes the conversation, keeps the tail and drops the origina
   assert.match(after.messages[1].content, /Earlier in this session \(compacted summary/);
   assert.match(after.messages[1].content, /SUMMARY: inspected the fixture/);
   assert.equal(JSON.stringify(after).includes('history history'), false, 'the old messages were dropped');
+});
+
+test('at 90% of the context window the conversation is compacted automatically', async () => {
+  const big = `OLD ${'history '.repeat(1200)}`;
+  const live = await interactive(({ res, step, body }) => {
+    startSse(res);
+    if (step === 2) { // the automatic compaction, before the next request is sent
+      assert.match(body.messages.at(-1).content, /\[compaction request\]/);
+      res.end(frame({ content: 'SUMMARY: inspected the fixture; nothing pending.' }, 'stop') + 'data: [DONE]\r\n\r\n');
+    } else {
+      res.end(frame({ content: step === 1 ? `IMPLEMENT PROMPT\n---\n${big}\n---` : 'REPLY-AFTER' }, 'stop') + 'data: [DONE]\r\n\r\n');
+    }
+  }, { contextSize: 2000 });
+
+  live.send('/plan inspect the fixture');
+  await live.waitNew('compacting automatically'); // as soon as the reply overflowed
+  await live.waitNew('[compact] conversation:'); // no /compact needed
+  live.send('/plan second question');
+  await live.waitNew('REPLY-AFTER');
+  const result = await live.finish();
+  assert.equal(result.code, 0, result.stdout);
+  // request 1: the plan turn · 2: the compaction · 3: the next question
+  assert.match(result.requests[1].messages.at(-1).content, /\[compaction request\]/);
+  const after = result.requests[2];
+  assert.match(after.messages[1].content, /Earlier in this session \(compacted summary/);
+  assert.match(after.messages[1].content, /SUMMARY: inspected the fixture/);
+  assert.equal(JSON.stringify(after).includes('history history'), false, 'the old messages were dropped');
+});
+
+test('a request the server refuses for a full context is compacted and sent again', async () => {
+  const big = `OLD ${'history '.repeat(1200)}`;
+  const live = await interactive(({ res, step, body }) => {
+    if (step === 2) { // "does not fit" — the window is full
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: "This model's maximum context length is 8192 tokens" } }));
+      return;
+    }
+    startSse(res);
+    if (step === 1) {
+      res.end(frame({ content: big }, 'stop') + 'data: [DONE]\r\n\r\n');
+    } else if (step === 3) { // the compaction that refusal triggered
+      assert.match(body.messages.at(-1).content, /\[compaction request\]/);
+      res.end(frame({ content: 'SUMMARY: nothing pending.' }, 'stop') + 'data: [DONE]\r\n\r\n');
+    } else {
+      res.end(frame({ content: 'RETRY-OK' }, 'stop') + 'data: [DONE]\r\n\r\n');
+    }
+    // autoCompact off, so nothing compacts but the refusal handler below.
+  }, { contextSize: 2000, autoCompact: false });
+
+  live.send('/plan first question');
+  await live.waitNew('[done] 1 step');
+  live.send('/plan second question');
+  await live.waitNew('compacting and sending it again'); // instead of losing the turn
+  await live.waitNew('RETRY-OK');
+  const result = await live.finish();
+  assert.equal(result.code, 0, result.stdout);
+  assert.equal(result.requests.length, 4, 'one refusal, one compaction, one retry');
+  assert.match(result.requests[3].messages[1].content, /Earlier in this session \(compacted summary/);
+  assert.match(result.requests[3].messages[1].content, /SUMMARY: nothing pending/);
 });
 
 test('tool calls, reasoning and tool results are coloured on a terminal', async () => {
@@ -469,13 +536,13 @@ const call = (id, name, args, index = 0) => ({ index, id, type: 'function', func
 
 test('PLAN mode refuses project writes and shell writes, allows the plan dir; IMPLEMENT runs from the saved plan file', async () => {
   let planDir;
-  const result = await session(({ res, step, body, dir }) => {
-    planDir = path.join(dir, '.plans');
+  const result = await session(({ res, step, body, dir, plans }) => {
+    planDir = plans; // outside the workspace: plan files are not part of the project
     startSse(res);
     if (step === 1) {
       // Tool descriptions carry the plan-mode rules.
       const tools = Object.fromEntries(body.tools.map((t) => [t.function.name, t.function.description]));
-      assert.match(tools.write_file, /PLAN mode: only paths under .*\.plans/);
+      assert.match(tools.write_file, /PLAN mode: only paths under \S+ may be written/);
       assert.match(tools.run_command, /PLAN mode: read-only commands only/);
       assert.match(body.messages[0].content, /READ-ONLY in this mode/);
       res.end(frame({ tool_calls: [
@@ -563,7 +630,7 @@ test('a plan written before the turn ends is not lost — an earlier reply count
       // Prose and a tool call in the same reply, the plan already written.
       res.end(frame({ content: 'IMPLEMENT PROMPT\n---\nGoal: greet.\n---', tool_calls: [call('r', 'read_file', { path: 'fixture.txt' })] }, 'tool_calls'));
     } else if (step === 2) {
-      assert.match(body.messages.find((m) => m.tool_call_id === 'r').content, /^file fixture\.txt \(1 lines\)/);
+      assert.match(body.messages.find((m) => m.tool_call_id === 'r').content, /^file fixture\.txt — lines 1-1 of 1\n/);
       res.end(frame({ content: 'nothing more to add' }, 'stop')); // the turn ends on a later reply
     } else {
       assert.equal(step, 3);
@@ -618,7 +685,7 @@ test('paths are workspace-relative: outside paths are refused, results print rel
       const results = Object.fromEntries(body.messages.filter((m) => m.role === 'tool').map((m) => [m.tool_call_id, m.content]));
       assert.match(results.r1, /^error: .* is outside the workspace/, results.r1);
       assert.match(results.r1, /[Pp]aths are relative to the workspace root/, results.r1);
-      assert.match(results.r2, /^file fixture\.txt \(1 lines\)\n {3}1\|héllo/, results.r2);
+      assert.match(results.r2, /^file fixture\.txt — lines 1-1 of 1\n {3}1\|héllo/, results.r2);
       res.end(frame({ content: 'IMPLEMENT PROMPT\n---\nGoal: x\n---' }, 'stop'));
     } else if (step === 3) {
       res.end(frame({ tool_calls: [call('w', 'write_file', { path: '../basic-outside-target.txt', content: 'pwned' })] }, 'tool_calls'));
@@ -634,17 +701,17 @@ test('paths are workspace-relative: outside paths are refused, results print rel
 });
 
 test('/implement accepts a plan file path or ad-hoc text, and /prompt shows the saved plan', async () => {
-  const live = await interactive(({ res, step, body, dir }) => {
+  const live = await interactive(({ res, step, body, plans }) => {
     startSse(res);
     if (step === 1) {
       assert.match(body.messages[0].content, /^IMPLEMENT mode\./);
-      assert.match(body.messages[0].content, /saved at \S*basic-handwritten-\d+\.md;/);
+      assert.match(body.messages[0].content, /saved at \S*basic-handwritten-\d+\.md\b/);
       assert.match(body.messages[0].content, /\n\nHand-written plan\.$/);
       res.end(frame({ content: 'FROM-FILE' }, 'stop'));
     } else if (step === 2) {
       assert.match(body.messages[0].content, /\n\nad hoc instructions$/);
       const file = body.messages[0].content.match(/saved at (\S+\.md)/)[1];
-      assert.ok(file.startsWith(path.join(dir, '.plans')), file);
+      assert.ok(file.startsWith(plans), file);
       res.end(frame({ content: 'FROM-TEXT' }, 'stop'));
     }
   });
@@ -669,6 +736,154 @@ test('/implement accepts a plan file path or ad-hoc text, and /prompt shows the 
   } finally {
     fs.rmSync(handwritten, { force: true });
   }
+});
+
+test('plans survive a restart: /plans lists them, /implement <n> runs one, and a new session resumes the last', async () => {
+  const shared = fs.mkdtempSync(path.join(os.tmpdir(), 'basic-shared-plans-'));
+  try {
+    // Session one: a plan is written and implemented.
+    const first = await session(({ res, step }) => {
+      startSse(res);
+      if (step === 1) res.end(frame({ content: 'IMPLEMENT PROMPT\n---\nGoal: resumed work.\n---' }, 'stop'));
+      else res.end(frame({ content: 'FIRST-DONE' }, 'stop'));
+    }, { planDir: shared });
+    assert.equal(first.code, 0, first.stderr);
+    assert.match(first.stdout, /saved plan → \S+plan-[\dT-]+\.md/);
+
+    // Session two: the console reopens, remembers the plan, and runs it again.
+    const live = await interactive(({ res, step, body }) => {
+      startSse(res);
+      if (step <= 2) {
+        assert.match(body.messages[0].content, /^IMPLEMENT mode\./);
+        assert.match(body.messages[0].content, /Goal: resumed work\./);
+        res.end(frame({ content: `RESUMED-${step}` }, 'stop'));
+        return;
+      }
+      res.end(frame({ content: 'UNUSED' }, 'stop'));
+    }, { planDir: shared });
+
+    await live.waitNew('workspace  (the project'); // the banner names the two apart
+    await live.waitNew('plans      (outside the workspace)');
+    await live.waitNew('last plan: '); // the previous session's plan is picked up
+    live.send('/plans');
+    await live.waitNew('plan directory (outside the workspace)');
+    await live.waitNew('Goal: resumed work.'); // the listing shows what each plan is about
+    live.send('/implement 1'); // by number, newest first
+    await live.waitNew('RESUMED-1');
+    live.send('/implement'); // and by memory
+    await live.waitNew('RESUMED-2');
+    const result = await live.finish();
+    assert.equal(result.code, 0, result.stdout);
+    assert.equal(result.requests.length, 2, 'the /plans listing sends no request');
+  } finally {
+    fs.rmSync(shared, { recursive: true, force: true });
+  }
+});
+
+test('a planDir inside the workspace is moved out, so plans never land in the project', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'basic-sepdir-'));
+  const inside = path.join(dir, '.plans');
+  const server = createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.end(frame({ content: 'IMPLEMENT PROMPT\n---\nGoal: x\n---' }, 'stop') + 'data: [DONE]\r\n\r\n');
+  });
+  let child;
+  try {
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const config = path.join(dir, 'config.json');
+    fs.writeFileSync(config, JSON.stringify({ planDir: inside, workspace: dir, openai: {
+      baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: '', model: 'mock',
+    } }));
+    child = spawn(process.execPath, [basic, '--config', config, '--once', 'inspect'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (d) => { stdout += d; });
+    await once(child, 'close');
+    assert.match(stdout, /config planDir \S*\.plans is inside the workspace — using \S+ instead/);
+    assert.equal(fs.existsSync(inside), false, 'no plan directory is created inside the project');
+    const written = stdout.match(/saved plan → (\S+\.md)/)?.[1];
+    assert.ok(written && !written.startsWith(dir), `plan written outside the project: ${written}`);
+    fs.rmSync(written, { force: true }); // it went to the shared default directory
+  } finally {
+    child?.kill();
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('reading is token-lean: search_files finds code, list_files maps a directory, read_file reads a window', async () => {
+  const result = await session(({ res, step, body, dir }) => {
+    startSse(res);
+    if (step === 1) {
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src/app.ts'), 'export const alpha = 1;\nexport const beta = 2;\n');
+      fs.writeFileSync(path.join(dir, 'src/other.ts'), 'export const gamma = 3;\n');
+      res.end(frame({ tool_calls: [
+        call('s', 'search_files', { pattern: 'beta' }, 0),
+        call('l', 'list_files', { path: '.', depth: 2 }, 1),
+      ] }, 'tool_calls'));
+    } else if (step === 2) {
+      const results = Object.fromEntries(body.messages.filter((m) => m.role === 'tool').map((m) => [m.tool_call_id, m.content]));
+      // One call, one matching line — no file had to be read whole.
+      assert.match(results.s, /^1 match\(es\) for \/beta\/ under/);
+      assert.match(results.s, /src\/app\.ts:2: export const beta = 2;/);
+      assert.doesNotMatch(results.s, /alpha/, 'only matching lines come back');
+      assert.match(results.l, /# \. — \d+ dir\(s\), \d+ file\(s\)/);
+      assert.match(results.l, /src\//);
+      fs.writeFileSync(path.join(dir, 'big.ts'), Array.from({ length: 300 }, (_, i) => `line ${i + 1}`).join('\n'));
+      res.end(frame({ tool_calls: [call('r', 'read_file', { path: 'big.ts' })] }, 'tool_calls'));
+    } else if (step === 3) {
+      const read = body.messages.filter((m) => m.role === 'tool').map((m) => m.content).join('\n');
+      assert.match(read, /file big\.ts — lines 1-200 of 300/); // a window, not the file
+      assert.match(read, /…\[100 more lines — read_file start_line=201/);
+      assert.doesNotMatch(read, /\n 201\|/, 'the rest of the file stays out of the context');
+      res.end(frame({ content: 'IMPLEMENT PROMPT\n---\nGoal: lean reads.\n---' }, 'stop'));
+    } else {
+      res.end(frame({ content: 'LEAN-DONE' }, 'stop'));
+    }
+  });
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.requests.length, 4);
+});
+
+test('a whole read is capped, so a big file cannot flood the context', async () => {
+  const result = await session(({ res, step, body, dir }) => {
+    startSse(res);
+    if (step === 1) {
+      // 600 lines of 200 chars: more than one window's worth of characters.
+      fs.writeFileSync(path.join(dir, 'dense.ts'), Array.from({ length: 600 }, (_, i) => `line ${i + 1} ${'y'.repeat(190)}`).join('\n'));
+      res.end(frame({ tool_calls: [call('r', 'read_file', { path: 'dense.ts' })] }, 'tool_calls'));
+    } else if (step === 2) {
+      const read = body.messages.filter((m) => m.role === 'tool').map((m) => m.content).join('\n');
+      assert.ok(read.length < 18000, `one read is capped: ${read.length} chars`);
+      assert.match(read, /…\[\d+ more lines — read_file start_line=\d+ to continue/);
+      res.end(frame({ content: 'IMPLEMENT PROMPT\n---\nGoal: dense file.\n---' }, 'stop'));
+    } else {
+      res.end(frame({ content: 'DENSE-DONE' }, 'stop'));
+    }
+  });
+  assert.equal(result.code, 0, result.stderr);
+});
+
+test('one over-long line is cut instead of eating the context', async () => {
+  const result = await session(({ res, step, body, dir }) => {
+    startSse(res);
+    if (step === 1) {
+      fs.writeFileSync(path.join(dir, 'min.js'), `${'x'.repeat(9000)}\nshort\n`);
+      res.end(frame({ tool_calls: [call('r', 'read_file', { path: 'min.js' })] }, 'tool_calls'));
+    } else if (step === 2) {
+      const read = body.messages.filter((m) => m.role === 'tool').map((m) => m.content).join('\n');
+      assert.ok(read.length < 3000, `long line cut: ${read.length} chars`);
+      assert.match(read, /… \(\+7000 chars\)/);
+      assert.match(read, /short/);
+      res.end(frame({ content: 'IMPLEMENT PROMPT\n---\nGoal: minified file.\n---' }, 'stop'));
+    } else {
+      res.end(frame({ content: 'MIN-DONE' }, 'stop'));
+    }
+  });
+  assert.equal(result.code, 0, result.stderr);
 });
 
 test('tool arguments and results are shown compactly; the model still gets everything', async () => {
@@ -717,11 +932,12 @@ test('/verbose shows full tool arguments and results', async () => {
   const result = await live.finish();
   assert.equal(result.code, 0, result.stdout);
   assert.match(result.stdout, /\{"path":"fixture\.txt","max_lines":5\}/);
-  assert.match(result.stdout, /\[tool result\] read_file · ok · [\d.]+s · 2 lines\nfile .*fixture\.txt \(1 lines\)\n   1\|héllo 🌍/);
+  assert.match(result.stdout, /\[tool result\] read_file · ok · [\d.]+s · 2 lines\nfile .*fixture\.txt — lines 1-1 of 1\n   1\|héllo 🌍/);
 });
 
 test('compact mode trims older tool results from requests above 90% and asks for /compact, without touching history', async () => {
-  const huge = `${'payload '.repeat(900)}END-OF-PAYLOAD`; // ~1.8k tokens: enough to cross 90% of 2000 on its own
+  // ~1.9k tokens across many lines: enough to cross 90% of 2000 on its own
+  const huge = `${Array.from({ length: 60 }, (_, i) => `payload ${i} ${'x'.repeat(120)}`).join('\n')}\nEND-OF-PAYLOAD`;
   const result = await session(({ res, step, body, dir }) => {
     startSse(res);
     if (step === 1) {
@@ -750,7 +966,9 @@ test('compact mode trims older tool results from requests above 90% and asks for
       assert.match(body.messages[0].content, /Inspect the fixture\./);
       res.end(frame({ content: 'STILL-WORKING' }, 'stop'));
     }
-  }, { contextSize: 2000 });
+    // autoCompact off: with it on, the conversation would be summarized
+    // instead of trimmed, which is the test below.
+  }, { contextSize: 2000, autoCompact: false });
   assert.equal(result.code, 0, result.stderr);
   assert.equal(result.requests.length, 4);
   assert.match(result.stdout, /\[context\] ~[\d.]+k? of 2\.0k tokens \(\d+%\) — compact mode on: older tool results and reasoning are trimmed from each request \(this one ~[\d.]+k?\)\. Please run \/compact to summarize the conversation and free space for good\./);
@@ -868,6 +1086,7 @@ test('Ctrl+C kills the command a tool started and ends the turn', async () => {
 
 test('--once exits 130 when Ctrl+C stops the run', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'basic-once-interrupt-'));
+  const planDir = fs.mkdtempSync(path.join(os.tmpdir(), 'basic-plans-'));
   const server = createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
     res.write(frame({ content: 'STILL-REQUESTING' })); // hold the stream open
@@ -877,7 +1096,7 @@ test('--once exits 130 when Ctrl+C stops the run', async () => {
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
     const config = path.join(dir, 'config.json');
-    fs.writeFileSync(config, JSON.stringify({ planDir: path.join(dir, '.plans'), workspace: dir, openai: {
+    fs.writeFileSync(config, JSON.stringify({ planDir, workspace: dir, openai: {
       baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: '', model: 'mock',
     } }));
     child = spawn(process.execPath, [basic, '--config', config, '--once', 'slow task'], { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -908,5 +1127,6 @@ test('--once exits 130 when Ctrl+C stops the run', async () => {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
     fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(planDir, { recursive: true, force: true });
   }
 });

@@ -10,15 +10,27 @@
  *               refuse any path outside the plan directory and run_command
  *               only accepts read-only commands. The agent asks questions if
  *               unclear, then writes an IMPLEMENT PROMPT, which is saved to a
- *               plan file (a tmp directory, see planDir) instead of the project.
+ *               plan file under planDir instead of the project. planDir lives
+ *               outside the workspace (a planDir inside it is moved out), so
+ *               plan files are never part of the project. Plans outlive the
+ *               console: the last one is picked up on start, /plans lists them
+ *               and /implement <n> runs one, so work can be resumed.
  *   implement — the only mode that changes project files. Its user prompt is
  *               the saved plan file; there is no extra system prompt.
  *
  * Context
- *   Once the conversation is estimated at >= 90% of contextSize, compact mode
- *   switches on: every request is sent with older tool results and reasoning
- *   trimmed, and the user is told to run /compact for a real summary. /reset is
- *   the blunt version of the same idea: it drops the conversation outright.
+ *   The conversation is measured before every request. At >= 90% of contextSize
+ *   it is compacted automatically (config autoCompact): the model summarizes it
+ *   and the originals are dropped, so a turn is not lost to a "context length
+ *   exceeded" error. A request the server refuses for being too long is
+ *   compacted and sent again, once. When a compaction is not possible, requests
+ *   go out with older tool results and reasoning trimmed instead. /compact does
+ *   it on demand, /reset is the blunt version: it drops the conversation.
+ *
+ * Reading, cheaply
+ *   search_files finds code without opening files, list_files maps a directory
+ *   (both in-process, so no grep/findstr needed), and read_file reads a window
+ *   rather than a whole file — the context is spent on the code that matters.
  *
  * Ctrl+C
  *   Interrupts the running execution (the model request and any command a tool
@@ -41,7 +53,7 @@
  * Config (optional JSON, --config path or BASIC_CONFIG):
  *   { openai: { baseURL, apiKey, model }, maxTokens: 4096, contextSize: 64000,
  *     workspace, planDir: "<os tmp>/basic-plans", planAllowCommands: ["make"],
- *     shell: "bash",
+ *     shell: "bash", autoCompact: true,
  *     mcp: { servers: {
  *       name: { command, args?, env? }           // stdio
  *       name: { type: "http", url, headers? }    // HTTP
@@ -53,7 +65,8 @@ import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { spawn } from 'node:child_process';
-import { calibrateTokens, classifyApiError, estimatePromptTokens, serverErrorSummary, smallerReplyTokenLimit, TOOL_CALL_PARSE_ERROR } from './lib/llm.js';
+import { calibrateTokens, classifyApiError, estimatePromptTokens, isContextLengthError, serverErrorSummary, smallerReplyTokenLimit, TOOL_CALL_PARSE_ERROR } from './lib/llm.js';
+import { createIgnoreMatcher } from './lib/ignore.js';
 import { extractImplementPrompt, isReadOnlyCommand, platformFamily, readOnlyCommandExamples, shellCommandFamily } from './lib/plan.js';
 import { resolveShell } from './lib/tools.js';
 import { fmtDuration, s, spinner } from './lib/ui.js';
@@ -67,9 +80,21 @@ const OPENAI = {
 let maxTokens = 4096;
 let contextSize = 64000;
 const MAX_TOOL_CALL_RETRIES = 3;
-/** Estimated request size (as % of contextSize) that switches compact mode on. */
+/**
+ * Context accounting. At COMPACT_AT_PERCENT the conversation is compacted
+ * automatically (autoCompact, default on) so a turn is not lost to a
+ * "context length exceeded" error; the request also goes out trimmed. After a
+ * compaction nothing more happens until the conversation drops back below
+ * COMPACT_CLEAR_PERCENT, so a summary that frees little does not run again on
+ * every step.
+ */
 const COMPACT_AT_PERCENT = 90;
+const COMPACT_CLEAR_PERCENT = 75;
+/** Compact the conversation automatically at COMPACT_AT_PERCENT (config autoCompact). */
+let autoCompact = process.env.BASIC_AUTO_COMPACT !== '0';
 let contextWarned = false;
+/** A compaction is allowed again once usage falls below COMPACT_CLEAR_PERCENT. */
+let compactArmed = true;
 /** On above COMPACT_AT_PERCENT: requests go out with older tool output trimmed. */
 let compactMode = false;
 
@@ -205,7 +230,8 @@ function resolvePath(p) {
 /** The path as the model should think of it: workspace-relative, or absolute when it is outside. */
 function displayPath(abs) {
   const rel = path.relative(workspace, abs);
-  return rel && !rel.startsWith('..') && !path.isAbsolute(rel) ? rel : abs;
+  if (!rel) return '.'; // the workspace root itself
+  return !rel.startsWith('..') && !path.isAbsolute(rel) ? rel : abs;
 }
 
 function isInside(dir, abs) {
@@ -221,16 +247,34 @@ function isInside(dir, abs) {
  * The refusal names the workspace root and the relative form, so a model that
  * guessed a path learns how to write one instead of trying another random one.
  */
-function guardPath(abs) {
+function guardPath(abs, { allowRoot = false } = {}) {
   if (isInside(planDir, abs)) return; // plans and working notes live here
   if (isInside(workspace, abs)) return;
-  if (path.resolve(abs) === path.resolve(workspace)) {
+  const root = path.resolve(abs) === path.resolve(workspace);
+  if (root && allowRoot) return; // "." is a fine directory for a search or a listing
+  if (root) {
     throw new Error(`${workspace} is the workspace root, not a file — name a file inside it, e.g. "src/app.js"`);
   }
   throw new Error(
     `${abs} is outside the workspace (${workspace}). Paths are relative to the workspace root — ` +
     `use "src/app.js", or an absolute path inside ${workspace}. Outside files cannot be read or written.`
   );
+}
+
+/**
+ * Keep the two directories visibly apart. Plans are never part of the project:
+ * if the config points planDir inside the workspace, the model ends up
+ * searching the project for plan files (and writing notes into it), so the
+ * default outside the workspace wins and the override is reported.
+ */
+function separatePlanDir() {
+  if (!isInside(workspace, planDir) && path.resolve(planDir) !== path.resolve(workspace)) return;
+  const outside = path.join(os.tmpdir(), 'basic-plans');
+  console.log(
+    `${tag('plans', s.yellow)} config planDir ${planDir} is inside the workspace — ` +
+    `using ${outside} instead, so plans and project files stay separate`
+  );
+  planDir = outside;
 }
 
 /* PLAN mode is enforced here, not just asked for in the prompt: a tool that
@@ -282,15 +326,35 @@ function shellPlatform() {
   return shellInfo().family;
 }
 
+/* Reading costs tokens, and a whole 2000-line file is nearly never what the
+ * model needs. search_files answers "where is X?" with a handful of lines,
+ * list_files answers "what is here?" without `ls -R`, and read_file reads a
+ * window — so a turn spends its context on the code that matters. */
+
+/** Default and hard cap for one read_file window. */
+const READ_LINES = 200;
+const MAX_READ_LINES = 800;
+/** A single line longer than this (minified bundles, lockfiles) is cut. */
+const MAX_LINE_CHARS = 2000;
+const MAX_SEARCH_RESULTS = 40;
+const MAX_LIST_ENTRIES = 200;
+/** Files bigger than this are not searched or dumped; they need a narrower tool. */
+const MAX_FILE_BYTES = 512 * 1024;
+/**
+ * Hard ceiling on what one read_file call returns, kept below the 20000-char
+ * cap every tool result is sent under so the "… N more lines" footer survives.
+ */
+const MAX_READ_CHARS = 16_000;
+
 const BUILTIN = {
   read_file: {
-    description: 'Read a text file. Relative paths resolve against the workspace root; paths outside it are refused. Optional start_line (1-based) and max_lines.',
+    description: `Read a window of a text file (${READ_LINES} lines by default, at most ${MAX_READ_LINES}). Relative paths resolve against the workspace root; paths outside it are refused. Locate code with search_files first — reading a whole file to find one function wastes the context.`,
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string' },
-        start_line: { type: 'integer' },
-        max_lines: { type: 'integer' },
+        start_line: { type: 'integer', description: 'First line to return (1-based).' },
+        max_lines: { type: 'integer', description: `How many lines to return (default ${READ_LINES}, max ${MAX_READ_LINES}).` },
       },
       required: ['path'],
     },
@@ -305,10 +369,156 @@ const BUILTIN = {
       }
       const lines = text.split(/\n/);
       const start = Math.max(1, start_line || 1);
-      const take = Math.min(max_lines || 400, 800);
-      const slice = lines.slice(start - 1, start - 1 + take);
-      const numbered = slice.map((l, i) => `${String(start + i).padStart(4)}|${l}`).join('\n');
-      return `file ${displayPath(abs)} (${lines.length} lines)\n${numbered}`;
+      const take = Math.min(max_lines || READ_LINES, MAX_READ_LINES);
+      // Two budgets: one window of lines, and a ceiling on characters — 800
+      // lines of minified code would otherwise be a megabyte of context.
+      const numbered = [];
+      let budget = MAX_READ_CHARS;
+      for (let i = 0; i < take; i++) {
+        const line = lines[start - 1 + i];
+        if (line === undefined) break;
+        const text = line.length > MAX_LINE_CHARS ? `${line.slice(0, MAX_LINE_CHARS)}… (+${line.length - MAX_LINE_CHARS} chars)` : line;
+        const row = `${String(start + i).padStart(4)}|${text}\n`;
+        if (row.length > budget) break;
+        budget -= row.length;
+        numbered.push(row);
+      }
+      const shownTo = start - 1 + numbered.length;
+      const more = lines.length - shownTo;
+      const footer = more > 0 ? `\n…[${more} more lines — read_file start_line=${shownTo + 1} to continue; prefer search_files to jump straight to a match]` : '';
+      return `file ${displayPath(abs)} — lines ${start}-${shownTo} of ${lines.length}\n${numbered.join('').trimEnd()}${footer}`;
+    },
+  },
+  search_files: {
+    description:
+      'Search the workspace for a regular expression and return file:line:text matches. ' +
+      'This is how to find code without reading whole files — use it before read_file. ' +
+      'Skips dependency, build and cache directories, binary files and .gitignore matches (include_ignored to override). ' +
+      'Works the same on every OS: no grep or findstr needed.',
+    parameters: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'Regular expression to search for (case-insensitive).' },
+        path: { type: 'string', description: 'Directory to search, relative to the workspace root. Default "."' },
+        include: { type: 'string', description: 'Filename filter with * and ? wildcards, e.g. "*.js".' },
+        max_results: { type: 'integer', description: `Maximum matches (default ${MAX_SEARCH_RESULTS}).` },
+        include_ignored: { type: 'boolean', description: 'Also search ignored paths (dependencies, build output). Default false.' },
+      },
+      required: ['pattern'],
+    },
+    run({ pattern, path: p = '.', include, max_results, include_ignored }) {
+      const absRoot = resolvePath(p);
+      guardPath(absRoot, { allowRoot: true });
+      let re;
+      try {
+        re = new RegExp(String(pattern ?? ''), 'i');
+      } catch (e) {
+        throw new Error(`invalid regular expression: ${e.message}`);
+      }
+      let fileRe = null;
+      if (include) {
+        const esc = String(include).replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*').replace(/\?/g, '.');
+        fileRe = new RegExp(`^${esc}$`, 'i');
+      }
+      const cap = Math.min(200, Math.max(1, Number(max_results) || MAX_SEARCH_RESULTS));
+      const ignore = createIgnoreMatcher({ root: workspace, gitignore: !include_ignored, builtins: !include_ignored });
+      ignore.seed();
+      const results = [];
+      let scanned = 0;
+      let skipped = 0;
+      const walk = (dir) => {
+        let entries;
+        try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+        entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+        const mark = ignore.enter(dir);
+        try {
+          for (const e of entries) {
+            if (results.length >= cap) return;
+            const full = path.join(dir, e.name);
+            if (e.isDirectory()) {
+              if (!ignore.ignores(full, true)) walk(full);
+              continue;
+            }
+            if (!e.isFile() || (fileRe && !fileRe.test(e.name)) || ignore.ignores(full, false)) continue;
+            let st;
+            try { st = fs.statSync(full); } catch { continue; }
+            if (st.size > MAX_FILE_BYTES) { skipped++; continue; }
+            let text;
+            try { text = fs.readFileSync(full, 'utf8'); } catch { continue; }
+            if (text.includes('\u0000')) { skipped++; continue; } // binary
+            scanned++;
+            const lines = text.split(/\n/);
+            for (let i = 0; i < lines.length && results.length < cap; i++) {
+              if (re.test(lines[i])) results.push(`${displayPath(full)}:${i + 1}: ${lines[i].trim().slice(0, 200)}`);
+            }
+          }
+        } finally {
+          ignore.leave(mark);
+        }
+      };
+      walk(absRoot);
+      const scope = displayPath(absRoot);
+      if (!results.length) {
+        return `No matches for /${pattern}/ under ${scope} — ${scanned} file(s) searched${skipped ? `, ${skipped} skipped (binary or too large)` : ''}.`;
+      }
+      const cut = results.length >= cap ? `\n… (stopped at ${cap} matches — narrow the pattern or the include filter)` : '';
+      return `${results.length} match(es) for /${pattern}/ under ${scope} — ${scanned} file(s) searched\n${results.join('\n')}${cut}`;
+    },
+  },
+  list_files: {
+    description:
+      'List workspace files and directories, ignoring dependencies, build output and caches. ' +
+      'Cheaper than `ls -R` and the same on every OS. Use it to get oriented, then search_files or read_file.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Directory to list, relative to the workspace root. Default "."' },
+        depth: { type: 'integer', description: 'How many levels to walk (default 2).' },
+        max_entries: { type: 'integer', description: `Maximum entries (default ${MAX_LIST_ENTRIES}).` },
+      },
+      required: [],
+    },
+    run({ path: p = '.', depth, max_entries }) {
+      const absRoot = resolvePath(p);
+      guardPath(absRoot, { allowRoot: true });
+      const maxDepth = Math.min(6, Math.max(1, Number(depth) || 2));
+      const cap = Math.min(1000, Math.max(1, Number(max_entries) || MAX_LIST_ENTRIES));
+      const ignore = createIgnoreMatcher({ root: workspace });
+      ignore.seed();
+      const dirs = [];
+      const files = [];
+      let truncated = false;
+      const walk = (dir, level) => {
+        if (dirs.length + files.length >= cap) { truncated = true; return; }
+        let entries;
+        try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+        entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+        const mark = ignore.enter(dir);
+        try {
+          for (const e of entries) {
+            if (dirs.length + files.length >= cap) { truncated = true; return; }
+            const full = path.join(dir, e.name);
+            if (e.isDirectory()) {
+              if (ignore.ignores(full, true)) continue;
+              dirs.push(`${displayPath(full)}/`);
+              if (level < maxDepth) walk(full, level + 1);
+              continue;
+            }
+            if (!e.isFile() || ignore.ignores(full, false)) continue;
+            let size = '';
+            try {
+              const st = fs.statSync(full);
+              size = st.size > 4096 ? `  (${Math.round(st.size / 1024)}k)` : `  (${st.size}b)`;
+            } catch { /* stat may fail on a broken symlink */ }
+            files.push(`${displayPath(full)}${size}`);
+          }
+        } finally {
+          ignore.leave(mark);
+        }
+      };
+      walk(absRoot, 1);
+      const more = truncated ? `\n… (stopped at ${cap} entries — raise max_entries or narrow the path)` : '';
+      return `# ${displayPath(absRoot)} — ${dirs.length} dir(s), ${files.length} file(s), depth ≤ ${maxDepth}\n${[...dirs, ...files].join('\n')}${more}`;
     },
   },
   write_file: {
@@ -660,18 +870,56 @@ function contextUsage(messages) {
  * each request carries (see optimizePrompt) so work can continue, but only
  * /compact actually frees the history.
  */
+/**
+ * Switch compact mode on (or off again) from the size of the conversation, and
+ * tell the user once per crossing. Compact mode is the stopgap — it trims what
+ * each request carries (see optimizePrompt) so the turn survives — while
+ * maybeAutoCompact() does the real thing below.
+ */
 function noteContext(messages) {
   const { used, percent } = contextUsage(messages);
-  if (percent < COMPACT_AT_PERCENT) { contextWarned = false; compactMode = false; return; }
-  compactMode = true;
+  if (percent < COMPACT_CLEAR_PERCENT) compactArmed = true; // room again: allow the next compaction
+  compactMode = percent >= COMPACT_AT_PERCENT;
+  if (!compactMode) { contextWarned = false; return; }
   if (contextWarned) return;
   contextWarned = true;
+  if (autoCompact) return; // the compaction itself reports what it did
   const trimmed = estimatePromptTokens(optimizePrompt(messages));
   console.log(
     `\n${tag('context', s.yellow)} ~${fmtTokens(used)} of ${fmtTokens(contextSize)} tokens ` +
     `${s.bold(`(${percent}%)`)} — ${s.bold('compact mode on')}: older tool results and reasoning are ` +
     `trimmed from each request (this one ~${fmtTokens(trimmed)}). ` +
     `Please run ${s.cyan('/compact')} to summarize the conversation and free space for good.`
+  );
+}
+
+/**
+ * Compact *before* the request that would not fit. Waiting for the server to
+ * refuse costs the turn: the request is already lost, and some providers bill
+ * the attempt. So at COMPACT_AT_PERCENT the conversation is summarized here,
+ * once per crossing (compactArmed), and the model carries on with a shorter
+ * history instead of hitting the limit.
+ */
+async function maybeAutoCompact(messages) {
+  if (!autoCompact) return;
+  const { used, percent } = contextUsage(messages);
+  if (percent < COMPACT_AT_PERCENT || !compactArmed) return;
+  compactArmed = false; // rearmed once usage falls back below COMPACT_CLEAR_PERCENT
+  const size = `\n${tag('context', s.yellow)} ~${fmtTokens(used)} of ${fmtTokens(contextSize)} tokens ${s.bold(`(${percent}%)`)}`;
+  if (messages.length <= 2) {
+    // One message cannot be summarized into less than itself: usually a long
+    // plan arriving as the first message of the implement turn. Say what would
+    // actually help instead of pretending to compact.
+    console.log(`${size} — too big to summarize (the request is a single message). ${s.dim('It goes out trimmed; raise config contextSize, or write a shorter plan.')}`);
+    return;
+  }
+  console.log(`${size} — ${s.bold('compacting automatically')} before the window runs out`);
+  const freed = await compactHistory(messages);
+  if (freed) { compactMode = false; contextWarned = false; return; }
+  // Nothing freed (or the summary failed): fall back to trimming each request.
+  console.log(
+    `${tag('context', s.yellow)} that freed nothing — older tool results are trimmed from each request instead. ` +
+    `${s.dim(`Run ${s.cyan('/compact')} yourself, or raise config contextSize.`)}`
   );
 }
 
@@ -728,6 +976,8 @@ const SECTIONS = {
 };
 /** Tools that can change the project — the colour warns before the arguments scroll past. */
 const MUTATING_TOOLS = new Set(['write_file', 'edit_file', 'run_command']);
+/** Tools that only look — labelled [read] in the console. */
+const READ_TOOLS = new Set(['read_file', 'search_files', 'list_files']);
 
 /* Compact tool display. The model always gets the full result (up to the
  * 20000-char cap); the console shows enough to follow along — a one-line
@@ -822,6 +1072,10 @@ function llmError(payload, status = 500) {
   const body = typeof payload === 'string' ? payload : JSON.stringify({ error: payload });
   const error = new Error(`LLM error (${status}): ${serverErrorSummary(body)}`);
   error.kind = classifyApiError(status, body);
+  // Kept so a caller can react to the class of failure (e.g. a full context
+  // window: compact the conversation and send the request again).
+  error.status = status;
+  error.body = body;
   return error;
 }
 
@@ -991,16 +1245,25 @@ async function runTool(name, args) {
 }
 
 const planSystem = () => `You are in PLAN mode. You analyse and plan; you do not implement anything.
-The workspace is ${workspace} — every relative path you pass to a tool resolves against it
-(never against some other directory) and paths outside it are refused. Use short
-workspace-relative paths like "src/app.js"; results come back the same way.
+Two directories, and they are never the same one:
+- WORKSPACE (the project, what you are reading): ${workspace}
+  Every relative path resolves against it (never against some other directory), results
+  come back relative to it, and paths outside it are refused.
+- PLAN DIRECTORY (where plans and working notes are stored): ${planDir}
+  It is outside the workspace on purpose. Plan files are never part of the project: do not
+  look for them in the workspace, do not search the workspace for "plan-*.md", and do not
+  write notes there.
 The project is READ-ONLY in this mode and the tools enforce it:
 - write_file and edit_file refuse every path outside ${planDir}. Use that directory for working notes if you need them.
 - run_command only runs read-only commands (${readOnlyCommandExamples(shellPlatform())}, …), and only
   ones this machine has: commands run through ${shellVia()}, so a command from the other OS is
   refused (on Windows use dir/type/findstr, on Linux/macOS use ls/cat/grep).
   Builds, installs and anything that writes files are refused.
-Inspect the workspace with read_file and read-only commands until you understand the task.
+Inspect the workspace until you understand the task, spending as few tokens as you can:
+- search_files to find where something is (one call instead of reading ten files).
+- list_files to see what is in a directory.
+- read_file with start_line/max_lines for the region you need — never to skim a whole file.
+- Prefer several narrow calls over one wide one; a big file you did not need costs the context.
 The user describes a coding task. If anything important is missing, ask short questions.
 When you have enough, output ONLY a prompt the implement agent will receive as its user message.
 That prompt must contain: goal, files to touch, steps, constraints, how to verify.
@@ -1011,8 +1274,9 @@ IMPLEMENT PROMPT
 <the full prompt>
 ---
 
-End the reply with that block: it is saved to a plan file under ${planDir}, and IMPLEMENT mode runs
-from that file. Nothing may follow the closing "---" — no summary, no questions, no offer to continue.
+End the reply with that block: it is saved to a plan file under ${planDir} (outside the workspace),
+and IMPLEMENT mode runs from that file. Nothing may follow the closing "---" — no summary, no
+questions, no offer to continue.
 No other work.`;
 
 /** One line at the end of a turn, so it is obvious the agent is idle again. */
@@ -1045,15 +1309,31 @@ async function loop(messages, { maxSteps = 40, tools = true } = {}) {
     for (let i = 0; i < maxSteps; i++) {
       if (aborted()) break; // Ctrl+C between steps: do not start another one
       stats.steps = i + 1;
+      await maybeAutoCompact(messages); // free space before the request, not after the refusal
       noteContext(messages); // nudge before the request, never while a tool runs
       let msg;
+      let recoveredContext = false; // one compaction per "window is full" error
       for (let retries = 0; ; retries++) {
         try {
           msg = await chat(messages, { tools, replyLimit });
           break;
         } catch (e) {
           if (aborted()) break; // interrupted: the turn ends here, without a retry
-          if (e.kind !== TOOL_CALL_PARSE_ERROR) throw e;
+          if (e.kind !== TOOL_CALL_PARSE_ERROR) {
+            // The window really is full: summarize the conversation and send
+            // this same request again, once, instead of losing the turn.
+            if (!recoveredContext && isContextLengthError(e.status, `${e.body ?? ''} ${e.message ?? ''}`)) {
+              recoveredContext = true;
+              console.log(
+                `\n${tag('context', s.yellow)} the request did not fit (${e.message}) — ` +
+                `${s.bold('compacting and sending it again')}`
+              );
+              await compactHistory(messages); // best effort: it says what it freed
+              compactMode = true; // and this attempt goes out trimmed, once
+              continue;
+            }
+            throw e;
+          }
           if (retries >= MAX_TOOL_CALL_RETRIES) {
             throw new Error(`Tool call still invalid after ${MAX_TOOL_CALL_RETRIES} smaller-output retries. Stop and request smaller, targeted edits; check the server output limit and config maxTokens. ${e.message}`);
           }
@@ -1079,6 +1359,9 @@ async function loop(messages, { maxSteps = 40, tools = true } = {}) {
           );
         }
         console.log(turnSummary(stats, startedAt));
+        // The reply may have been what tipped the conversation over: clean up
+        // now, so the transcript reports it and the next turn starts small.
+        await maybeAutoCompact(messages);
         return { text, texts, stats };
       }
       for (const [k, c] of calls.entries()) {
@@ -1087,7 +1370,7 @@ async function loop(messages, { maxSteps = 40, tools = true } = {}) {
         const paint = mutating ? s.yellow : s.cyan;
         // Header: what is about to run, how far along the turn is, compact arguments.
         console.log(
-          `\n${paint('⚙')} ${tag(name === 'read_file' ? 'read' : 'tool', paint)} ${s.bold(name)} ` +
+          `\n${paint('⚙')} ${tag(READ_TOOLS.has(name) ? 'read' : 'tool', paint)} ${s.bold(name)} ` +
           `${s.dim(`· step ${i + 1}/${maxSteps} · call ${k + 1}/${calls.length}${mode === 'plan' && mutating ? ' · plan mode: project read-only' : ''}`)}\n` +
           `  ${s.dim(summarizeArgs(c.function.arguments))}`
         );
@@ -1123,6 +1406,7 @@ async function loop(messages, { maxSteps = 40, tools = true } = {}) {
       }
       if (aborted()) break; // the interrupt already stopped this batch: end the turn
     }
+    if (!aborted()) await maybeAutoCompact(messages); // the turn ended; leave the history tidy
     if (aborted()) {
       console.log(`\n${tag('interrupt', s.yellow)} ${s.dim('turn stopped — history is intact')}`);
       console.log(turnSummary(stats, startedAt));
@@ -1147,13 +1431,26 @@ Be concise and factual, short bullet points, no preamble. Do not call tools.`;
 const COMPACT_SUMMARY_PREFIX =
   'Earlier in this session (compacted summary — the raw messages were dropped to free context):';
 
-/** Trailing messages that can be replayed verbatim after a compaction. */
-function compactTail(messages, keep = 2) {
+/** The newest messages a compaction keeps verbatim may take this share of the window. */
+const COMPACT_TAIL_SHARE = 0.2;
+/** Rough characters per token, for the tail budget (the estimator is calibrated, this is a cap). */
+const CHARS_PER_TOKEN = 4;
+
+/**
+ * Trailing messages that can be replayed verbatim after a compaction. Never
+ * orphans an assistant tool_calls message from its tool results, and stops at
+ * the budget: a last reply that alone fills the window is the thing a
+ * compaction has to get rid of — the summary says what it said.
+ */
+function compactTail(messages, keep = 2, budgetChars = Infinity) {
   const tail = [];
+  let size = 0;
   for (let i = messages.length - 1; i >= 0 && tail.length < keep; i--) {
     const m = messages[i];
-    // Never orphan an assistant tool_calls message from its tool results.
     if (m.role === 'tool' || (m.role === 'assistant' && m.tool_calls)) break;
+    const len = String(m.content ?? '').length;
+    if (size + len > budgetChars) break;
+    size += len;
     tail.unshift(m);
   }
   return tail;
@@ -1171,8 +1468,12 @@ async function compactHistory(history) {
   }
   const before = estimatePromptTokens(history);
   const [systemMsg, ...rest] = history;
-  const tail = compactTail(rest);
-  const execution = beginExecution(); // a compaction is a request of its own: Ctrl+C stops it
+  const tail = compactTail(rest, 2, Math.round(contextSize * COMPACT_TAIL_SHARE * CHARS_PER_TOKEN));
+  // A compaction is a request of its own and Ctrl+C stops it. Run inside a turn
+  // (auto-compaction) it joins that turn's execution instead of replacing it —
+  // otherwise ending it would retire the running turn's interrupt handler.
+  const outer = activeExecution;
+  const execution = outer || beginExecution();
   const spin = spinner('compacting conversation…');
   let summary = '';
   try {
@@ -1187,7 +1488,7 @@ async function compactHistory(history) {
     console.log(`${tag('compact', s.red)} compaction failed: ${e.message} — history kept as is`);
     return null;
   } finally {
-    endExecution(execution);
+    if (!outer) endExecution(execution);
   }
   spin.stop();
   if (!summary) {
@@ -1204,6 +1505,9 @@ async function compactHistory(history) {
   history.push(...rebuilt);
   contextWarned = false;
   compactMode = false; // noteContext re-evaluates before the next request
+  // Reported here, not by the caller: an automatic compaction has to say what
+  // it did too, and /compact is just one way to start one.
+  console.log(`${tag('compact', s.cyan)} conversation: ${fmtTokens(before)} → ${fmtTokens(after)} tokens`);
   return { before, after };
 }
 
@@ -1219,7 +1523,74 @@ function savePlan(prompt) {
   let file = path.join(planDir, `plan-${stamp}.md`);
   for (let n = 2; fs.existsSync(file); n++) file = path.join(planDir, `plan-${stamp}-${n}.md`);
   fs.writeFileSync(file, `${String(prompt).trim()}\n`, 'utf8');
+  rememberPlan(file);
   return file;
+}
+
+/* ---------------------------- the plan index ---------------------------- */
+
+/*
+ * Plans live in planDir, which is deliberately outside the workspace: the
+ * project stays untouched until IMPLEMENT mode, and "is plan.md part of the
+ * project?" never has to be asked. Two things make that directory usable
+ * across sessions — the last plan is remembered by name (so a reopened console
+ * can pick the work up), and every plan can be listed.
+ */
+
+const PLAN_FILE_RE = /^plan-.+\.md$/;
+const LAST_PLAN_FILE = 'last-plan.json';
+
+const lastPlanIndexPath = () => path.join(planDir, LAST_PLAN_FILE);
+
+/** Saved plans, newest first. */
+function listPlans() {
+  if (!fs.existsSync(planDir)) return [];
+  return fs.readdirSync(planDir)
+    .filter((name) => PLAN_FILE_RE.test(name))
+    .map((name) => {
+      const file = path.join(planDir, name);
+      let mtime = 0;
+      let lines = 0;
+      let first = '';
+      try {
+        mtime = fs.statSync(file).mtimeMs;
+        const text = fs.readFileSync(file, 'utf8');
+        const all = text.split('\n').filter((l) => l.trim());
+        lines = all.length;
+        first = (all[0] || '').trim();
+      } catch { /* unreadable plan: listed with what we have */ }
+      return { file, name, mtime, lines, first };
+    })
+    .sort((a, b) => b.mtime - a.mtime);
+}
+
+/** Point the directory at `file`, so the next session can resume from it. */
+function rememberPlan(file) {
+  try {
+    fs.mkdirSync(planDir, { recursive: true });
+    fs.writeFileSync(lastPlanIndexPath(), `${JSON.stringify({ file, savedAt: new Date().toISOString() }, null, 2)}\n`, 'utf8');
+  } catch { /* a missing plan index only costs the resume hint */ }
+}
+
+/** The plan the previous session left behind, when the file is still there. */
+function loadLastPlan() {
+  try {
+    const data = JSON.parse(fs.readFileSync(lastPlanIndexPath(), 'utf8'));
+    const file = String(data?.file || '');
+    return file && fs.existsSync(file) ? file : null;
+  } catch {
+    // Older sessions kept no index: fall back to the newest plan file.
+    return listPlans()[0]?.file || null;
+  }
+}
+
+/** "3 minutes ago" — plans are picked by age more easily than by timestamp. */
+function ago(ms) {
+  const secs = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (secs < 60) return `${secs}s ago`;
+  if (secs < 3600) return `${Math.round(secs / 60)} min ago`;
+  if (secs < 86400) return `${Math.round(secs / 3600)} h ago`;
+  return `${Math.round(secs / 86400)} d ago`;
 }
 
 function readPlan(file) {
@@ -1230,7 +1601,8 @@ function readPlan(file) {
 
 /** The whole user message for IMPLEMENT mode: the saved plan, and where it lives. */
 function implementPrompt(file) {
-  return `IMPLEMENT mode. The plan below was written in PLAN mode and saved at ${file}; it is your complete brief. ` +
+  return `IMPLEMENT mode. The plan below was written in PLAN mode and saved at ${file} — outside the workspace ` +
+    `(${workspace}), which is where plan files belong. It is your complete brief. ` +
     'Carry it out now — project files may be read and modified in this mode. Re-read that file if the plan drops out of context.\n\n' +
     readPlan(file);
 }
@@ -1288,6 +1660,10 @@ function loadConfig(p) {
     if (typeof cfg.shell !== 'string' || !cfg.shell.trim()) throw new Error('config shell must be a non-empty string');
     shellConfig = cfg.shell.trim();
   }
+  if (cfg.autoCompact !== undefined) {
+    if (typeof cfg.autoCompact !== 'boolean') throw new Error('config autoCompact must be true or false');
+    autoCompact = cfg.autoCompact;
+  }
   return cfg;
 }
 
@@ -1308,13 +1684,17 @@ const HELP = `basic.mjs — plan then implement.
   node basic.mjs [--config file] [--dir path]
   node basic.mjs --once "task"
 
-  /plan [text]       plan mode (default). extra text is context.
-  /implement [file]  run the last saved plan (or the given plan file / ad-hoc text)
-  /prompt            print the last saved plan and its path
-  /compact           summarize the conversation to free context
-  /reset             clear the conversation (same session, fresh context)
-  /verbose           toggle full tool arguments/results (default: compact preview)
-  /tools             list tools
+  /plan [text]        plan mode (default). extra text is context.
+  /implement [target] run a plan. No target: the last plan of this session, or the
+                      one the previous session left behind (plans survive a restart).
+                      A number: that entry from /plans. A path: that plan file.
+                      Anything else: those words become an ad-hoc plan.
+  /plans              list the saved plan files, newest first
+  /prompt             print the plan /implement would run and its path
+  /compact            summarize the conversation to free context
+  /reset              clear the conversation (same session, fresh context)
+  /verbose            toggle full tool arguments/results (default: compact preview)
+  /tools              list tools
   /quit
 
 Ctrl+C stops the running execution — the model request and any command a tool
@@ -1338,6 +1718,10 @@ Paths are relative to the workspace (--dir, or config workspace, default: the
 current directory). A tool path outside the workspace is refused — the plan
 directory excepted — and tool results print workspace-relative paths, falling
 back to the full path only for files outside it.
+Workspace and plan directory are separate places and stay that way: plans are
+written under the plan directory (config planDir, default <os tmp>/basic-plans),
+which is outside the workspace, so plan files are never part of the project. A
+planDir configured inside the workspace is moved out with a notice.
 Responses stream live. Console labels: [response], [thinking] (when supplied by
 the API), ⚙ [read]/[tool] with a step/call counter and a one-line argument
 summary, then ✓/✗/⊘ [tool result] with status, duration and the first lines of
@@ -1350,11 +1734,15 @@ While work is in progress a live line (thinking…, composing tool call <name>�
 running <tool>…) shows elapsed time; it is erased when the next output starts.
 Config maxTokens sets the reply budget (default 4096, minimum 256).
 Config contextSize sets the model's context window (default 64000, minimum 2000).
-Once the conversation is estimated at 90% of it, compact mode switches on: each
-request is sent with older tool results and reasoning trimmed so work can go
-on, and you are asked to run /compact, which actually frees the history.
-/compact asks the model to summarize the conversation, then keeps the summary
-and the newest messages — the originals are dropped, so run it deliberately.
+The conversation is measured before every request. Once it is estimated at 90%
+of contextSize it is compacted automatically — the model summarizes it and the
+originals are dropped — so a turn is not lost to "context length exceeded"
+(config autoCompact: false turns that off and only trims each request). If a
+request is refused for being too long anyway, the same thing happens once and
+the request goes out again. /compact does it on demand.
+Reading costs tokens, so: search_files finds code without opening files,
+list_files maps a directory, and read_file reads a window (200 lines by
+default) — the model is told to use them instead of reading whole files.
 Invalid tool-call JSON is retried up to 3 times with smaller-call instructions.`;
 
 async function main() {
@@ -1362,12 +1750,31 @@ async function main() {
   if (opts.help) { console.log(HELP); return; }
   const cfg = loadConfig(opts.config);
   if (opts.dir) workspace = path.resolve(opts.dir);
+  separatePlanDir(); // plans live outside the project, or the two get confused
   mcp = await connectMcp(cfg?.mcp?.servers);
 
   const planHistory = [{ role: 'system', content: planSystem() }];
-  let lastPlanFile = null;
+  // Plans survive the console: the last one is picked up, so a reopened session
+  // can carry on with /implement instead of planning the same task again.
+  let lastPlanFile = loadLastPlan();
 
   const savedNote = (file) => `\n${s.green('saved plan')} → ${file} — ${s.dim('/implement to run it')}`;
+  /** The plan `/implement n` means, or null when `n` is not one of them. */
+  const planByIndex = (n) => listPlans()[n - 1]?.file || null;
+  /** One line per saved plan: index, age, size, and what it is about. */
+  const printPlans = () => {
+    const plans = listPlans();
+    if (!plans.length) {
+      console.log(s.dim(`no saved plans in ${planDir} yet — a PLAN turn that ends with the IMPLEMENT PROMPT block writes one`));
+      return;
+    }
+    console.log(`${s.dim(`plan directory (outside the workspace): ${planDir}`)}`);
+    for (const [i, p] of plans.entries()) {
+      const head = p.first ? s.dim(` — ${p.first.slice(0, 90)}`) : '';
+      console.log(`  ${s.cyan(String(i + 1))}. ${path.basename(p.file)}  ${s.dim(`${ago(p.mtime)} · ${p.lines} line${p.lines === 1 ? '' : 's'}`)}${head}`);
+    }
+    console.log(s.dim(`  /implement <number> runs one, /prompt shows the current plan`));
+  };
   /** Printed when a PLAN turn ended without a plan, so the silence is explained. */
   const noPlanNote = () => console.log(
     s.dim('no IMPLEMENT PROMPT block in that reply — ask again in /plan, or run ') +
@@ -1396,6 +1803,10 @@ async function main() {
       console.log(s.dim(`tool output: ${verbose ? 'verbose (full arguments and results)' : 'compact preview'}`));
       return;
     }
+    if (t === '/plans' || t === '/plan list') {
+      printPlans();
+      return;
+    }
     if (t === '/prompt') {
       if (!lastPlanFile) {
         console.log(s.dim('(no plan saved yet)'));
@@ -1406,8 +1817,7 @@ async function main() {
       return;
     }
     if (t === '/compact') {
-      const freed = await compactHistory(planHistory);
-      if (freed) console.log(`${tag('compact', s.cyan)} conversation: ${fmtTokens(freed.before)} → ${fmtTokens(freed.after)} tokens`);
+      await compactHistory(planHistory); // it reports what it freed (or why not)
       return;
     }
     if (t === '/reset') {
@@ -1437,7 +1847,14 @@ async function main() {
     if (t === '/implement' || t.startsWith('/implement ')) {
       const extra = t.slice(10).trim();
       let planFile = lastPlanFile;
-      if (extra) {
+      if (/^\d+$/.test(extra)) {
+        // /implement 2 — the second plan in /plans, newest first.
+        planFile = planByIndex(Number(extra));
+        if (!planFile) {
+          console.log(s.dim(`no plan #${extra} — /plans lists the saved ones`));
+          return;
+        }
+      } else if (extra) {
         // A path to an existing plan file, or ad-hoc text that becomes one.
         const candidate = resolvePath(extra);
         planFile = fs.existsSync(candidate) && fs.statSync(candidate).isFile() ? candidate : savePlan(extra);
@@ -1456,6 +1873,7 @@ async function main() {
         return;
       }
       lastPlanFile = planFile;
+      rememberPlan(planFile); // a restart resumes from the plan that ran last
       console.log(`${tag('implement', s.cyan)} ${s.dim(`plan: ${planFile}`)}`);
       await implementTurn(planFile);
       console.log(`${tag('plan', s.magenta)} ${s.dim('back to plan — project read-only again')}`);
@@ -1488,8 +1906,14 @@ async function main() {
     return;
   }
 
-  console.log(`${s.bold('basic.mjs')}  ${s.dim(`model=${OPENAI.model}  dir=${workspace}  mode=plan`)}`);
-  console.log(s.dim(`plan mode is read-only; plans are saved under ${planDir}`));
+  // Workspace and plan directory are named separately and never overlap: the
+  // project is what gets changed, the plan directory is where plans are kept.
+  console.log(`${s.bold('basic.mjs')}  ${s.dim(`model=${OPENAI.model}  mode=plan`)}`);
+  console.log(`${s.dim('workspace  (the project, read-only until /implement):')} ${workspace}`);
+  console.log(`${s.dim('plans      (outside the workspace):')} ${planDir}${s.dim(`  ·  context ${fmtTokens(contextSize)} tokens`)}`);
+  if (lastPlanFile) {
+    console.log(`${s.dim('last plan:')} ${lastPlanFile} ${s.dim(`— /implement to run it, /plans to list them`)}`);
+  }
   console.log(`${s.dim('describe the task. agent plans, then')} ${s.cyan('/implement')}${s.dim('.')}`);
   console.log(`${s.dim('Ctrl+C stops the running turn (press twice to quit);')} ${s.cyan('/reset')} ${s.dim('clears the context.')}\n`);
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });

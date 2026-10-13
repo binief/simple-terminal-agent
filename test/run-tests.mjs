@@ -1629,10 +1629,12 @@ async function main() {
   /* --- a 500 that is really the server rejecting the model's own tool call --- */
   const {
     classifyApiError,
+    isContextLengthError,
     serverErrorSummary,
     oversizedToolCallNudge,
     smallerReplyTokenLimit,
     TOOL_CALL_PARSE_ERROR,
+    CONTEXT_LENGTH_ERROR,
     OVERSIZED_TOOL_CALL_TAG,
   } = await import(pathToFileURL(path.join(proj, 'lib', 'llm.js')).href);
 
@@ -1650,6 +1652,21 @@ async function main() {
   check('a plain 5xx stays transient', classifyApiError(503, 'upstream connect error') === null, 'misclassified');
   check('a 400 about our own request body stays transient', classifyApiError(400, 'invalid request: unexpected end of JSON input') === null, 'misclassified');
   check('an unterminated tool call without a status is classified', classifyApiError(0, 'tool_calls: unterminated string') === TOOL_CALL_PARSE_ERROR, 'missed');
+  // A full context window is its own class of failure: compacting helps,
+  // telling the model to make a smaller tool call does not.
+  const fullWindow = [
+    "This model's maximum context length is 8192 tokens. However, you requested 10000 tokens",
+    'context_length_exceeded: maximum context length exceeded',
+    'prompt is too long: 200000 tokens > 128000 maximum',
+    'input is too long for requested model',
+    'request exceeds the maximum allowed number of tokens',
+  ];
+  const missedWindow = fullWindow.filter((text) => classifyApiError(400, text) !== CONTEXT_LENGTH_ERROR);
+  check('a full context window is classified', missedWindow.length === 0, missedWindow.join(' | '));
+  check('isContextLengthError agrees with the classifier', fullWindow.every((text) => isContextLengthError(400, text)), 'disagreed');
+  check('an ordinary error is not a context error', !isContextLengthError(400, 'invalid api key') && classifyApiError(400, 'upstream connect error') === null, 'false positive');
+  check('a context error is not an oversized tool call', classifyApiError(400, 'maximum context length exceeded') !== TOOL_CALL_PARSE_ERROR, 'misclassified');
+
   const summary = serverErrorSummary(llamaBody);
   check('the error summary keeps the useful sentence', summary.startsWith('Failed to parse tool call arguments as JSON'), summary);
   check('the error summary drops the echoed model output', !summary.includes('container-fluid') && summary.length <= 241, `${summary.length} chars: ${summary.slice(0, 120)}`);
