@@ -18,6 +18,19 @@
  *   implement — the only mode that changes project files. Its user prompt is
  *               the saved plan file; there is no extra system prompt.
  *
+ * Turns
+ *   A turn has no step limit: it keeps stepping — request, tool calls,
+ *   request — until the model replies without tool calls (the task is done)
+ *   or Ctrl+C stops it. Auto-compaction (below) keeps a long turn inside
+ *   the context window, so a big task is not cut off by either budget.
+ *
+ * Line endings
+ *   CRLF, CR and LF files are all read as LF for matching and display, and
+ *   written back in the file's own style: a read shows clean LF lines (the
+ *   header names a non-LF style), an edit's LF old_text matches a CRLF
+ *   file, and no write ever mixes endings or silently converts a file.
+ *   New files get the OS style; config lineEndings can force one.
+ *
  * Context
  *   The conversation is measured before every request. At >= 90% of contextSize
  *   it is compacted automatically (config autoCompact): the model summarizes it
@@ -53,7 +66,7 @@
  * Config (optional JSON, --config path or BASIC_CONFIG):
  *   { openai: { baseURL, apiKey, model }, maxTokens: 4096, contextSize: 64000,
  *     workspace, planDir: "<os tmp>/basic-plans", planAllowCommands: ["make"],
- *     shell: "bash", autoCompact: true,
+ *     shell: "bash", autoCompact: true, lineEndings: "auto",
  *     mcp: { servers: {
  *       name: { command, args?, env? }           // stdio
  *       name: { type: "http", url, headers? }    // HTTP
@@ -68,7 +81,7 @@ import { spawn } from 'node:child_process';
 import { calibrateTokens, classifyApiError, estimatePromptTokens, isContextLengthError, serverErrorSummary, smallerReplyTokenLimit, TOOL_CALL_PARSE_ERROR } from './lib/llm.js';
 import { createIgnoreMatcher } from './lib/ignore.js';
 import { extractImplementPrompt, isReadOnlyCommand, platformFamily, readOnlyCommandExamples, shellCommandFamily } from './lib/plan.js';
-import { resolveShell } from './lib/tools.js';
+import { applyEol, detectEol, eolName, normalizeEol, resolveEol, resolveShell } from './lib/tools.js';
 import { fmtDuration, s, spinner } from './lib/ui.js';
 
 const OPENAI = {
@@ -111,6 +124,21 @@ let planAllowCommands = [];
 let shellConfig = process.env.BASIC_SHELL || null;
 /** /verbose: show full tool arguments and results instead of the compact preview. */
 let verbose = process.env.BASIC_VERBOSE === '1';
+/** Newline style for files the tools write (config lineEndings, default 'auto': keep the file's own, else the OS style). */
+let lineEndings = 'auto';
+
+/** Accepted config lineEndings values and their aliases — mirrors lib/config.js. */
+const LINE_ENDING_ALIASES = {
+  auto: 'auto', lf: 'lf', unix: 'lf', crlf: 'crlf', win: 'crlf', windows: 'crlf',
+  cr: 'cr', mac: 'cr', native: 'native', os: 'native', system: 'native',
+};
+
+/**
+ * The newline a write should use for a file whose current style is
+ * `existingEol` (null when unknown/new): the configured style when forced,
+ * otherwise the file's own, otherwise the OS default — never a mix.
+ */
+const eolFor = (existingEol) => resolveEol({ lineEndings }, existingEol);
 
 function emptyMcp() {
   return { listTools: () => [], has: () => false, call: async () => '', closeAll() {} };
@@ -367,7 +395,10 @@ const BUILTIN = {
       } catch (e) {
         throw new Error(readPathError(e, abs));
       }
-      const lines = text.split(/\n/);
+      // CRLF/CR files are shown as LF, so no stray \r rides along on a line;
+      // the header names the file's own style, which an edit writes back.
+      const eol = detectEol(text);
+      const lines = normalizeEol(text).split('\n');
       const start = Math.max(1, start_line || 1);
       const take = Math.min(max_lines || READ_LINES, MAX_READ_LINES);
       // Two budgets: one window of lines, and a ceiling on characters — 800
@@ -386,7 +417,8 @@ const BUILTIN = {
       const shownTo = start - 1 + numbered.length;
       const more = lines.length - shownTo;
       const footer = more > 0 ? `\n…[${more} more lines — read_file start_line=${shownTo + 1} to continue; prefer search_files to jump straight to a match]` : '';
-      return `file ${displayPath(abs)} — lines ${start}-${shownTo} of ${lines.length}\n${numbered.join('').trimEnd()}${footer}`;
+      const eolNote = eol && eol !== '\n' ? ` · ${eolName(eol)} line endings (shown as LF; edits keep ${eolName(eol)})` : '';
+      return `file ${displayPath(abs)} — lines ${start}-${shownTo} of ${lines.length}${eolNote}\n${numbered.join('').trimEnd()}${footer}`;
     },
   },
   search_files: {
@@ -447,7 +479,7 @@ const BUILTIN = {
             try { text = fs.readFileSync(full, 'utf8'); } catch { continue; }
             if (text.includes('\u0000')) { skipped++; continue; } // binary
             scanned++;
-            const lines = text.split(/\n/);
+            const lines = normalizeEol(text).split('\n'); // CRLF files match and report clean LF lines
             for (let i = 0; i < lines.length && results.length < cap; i++) {
               if (re.test(lines[i])) results.push(`${displayPath(full)}:${i + 1}: ${lines[i].trim().slice(0, 200)}`);
             }
@@ -522,7 +554,7 @@ const BUILTIN = {
     },
   },
   write_file: {
-    description: 'Create or overwrite a text file in the workspace (relative paths resolve against the workspace root; paths outside it are refused). Keep calls small: for large new files write the first section, then append sections using edit_file in separate replies. For existing files prefer targeted edit_file calls.',
+    description: 'Create or overwrite a text file in the workspace (relative paths resolve against the workspace root; paths outside it are refused). Line endings are written in the overwritten file\'s own style (a new file gets the OS style; config lineEndings can force one), so mixed CRLF/LF content comes out in the one style. Keep calls small: for large new files write the first section, then append sections using edit_file in separate replies. For existing files prefer targeted edit_file calls.',
     parameters: {
       type: 'object',
       properties: { path: { type: 'string' }, content: { type: 'string' } },
@@ -533,12 +565,18 @@ const BUILTIN = {
       guardPath(abs);
       guardWrite(abs);
       fs.mkdirSync(path.dirname(abs), { recursive: true });
-      fs.writeFileSync(abs, content ?? '', 'utf8');
-      return `wrote ${displayPath(abs)} (${String(content ?? '').length} chars)`;
+      // An overwritten file keeps its own newline style; the content is
+      // normalized to that one style first, so endings are never mixed.
+      let existingEol = null;
+      try { existingEol = detectEol(fs.readFileSync(abs, 'utf8')); } catch { /* a new file has no style yet */ }
+      const eol = eolFor(existingEol);
+      const text = applyEol(content ?? '', eol);
+      fs.writeFileSync(abs, text, 'utf8');
+      return `wrote ${displayPath(abs)} (${text.length} chars, ${eolName(eol)} line endings)`;
     },
   },
   edit_file: {
-    description: 'Replace old_text with new_text in a workspace file (relative paths resolve against the workspace root; paths outside it are refused).',
+    description: 'Replace old_text with new_text in a workspace file (relative paths resolve against the workspace root; paths outside it are refused). Line endings are handled for you: a CRLF/CR file matches LF old_text and is written back in its own style.',
     parameters: {
       type: 'object',
       properties: {
@@ -552,15 +590,26 @@ const BUILTIN = {
       const abs = resolvePath(p);
       guardPath(abs);
       guardWrite(abs);
-      let text;
+      let raw;
       try {
-        text = fs.readFileSync(abs, 'utf8');
+        raw = fs.readFileSync(abs, 'utf8');
       } catch (e) {
         throw new Error(readPathError(e, abs));
       }
-      if (!text.includes(old_text)) throw new Error(`old_text not found in ${displayPath(abs)} — read the file again and copy the text exactly`);
-      fs.writeFileSync(abs, text.replace(old_text, () => new_text), 'utf8');
-      return `edited ${displayPath(abs)}`;
+      // Match in canonical LF, write back in the file's own style: an LF
+      // old_text from the model matches a CRLF file, a CRLF new_text lands
+      // in an LF file as LF — endings are never mixed, never converted.
+      const fileEol = detectEol(raw);
+      const text = normalizeEol(raw);
+      const needle = normalizeEol(old_text ?? '');
+      if (!needle) throw new Error('old_text must not be empty');
+      if (!text.includes(needle)) {
+        throw new Error(`old_text not found in ${displayPath(abs)} — read the file again and copy the text exactly (line endings are matched as LF, so a CRLF file needs no special handling)`);
+      }
+      const updated = text.replace(needle, () => normalizeEol(new_text ?? '')); // function form: $ sequences stay literal
+      const eol = eolFor(fileEol);
+      fs.writeFileSync(abs, applyEol(updated, eol), 'utf8');
+      return `edited ${displayPath(abs)}${fileEol && fileEol !== '\n' ? ` (${eolName(fileEol)} line endings preserved)` : ''}`;
     },
   },
   run_command: {
@@ -1000,15 +1049,18 @@ function summarizeArgs(raw) {
   const compact = {};
   for (const [k, v] of Object.entries(args)) {
     if (typeof v !== 'string' || v.length <= ARG_VALUE_CHARS) { compact[k] = v; continue; }
-    const lines = v.split('\n').length;
-    compact[k] = `${v.slice(0, 40).replace(/\n/g, '⏎')}… (${v.length} chars${lines > 1 ? `, ${lines} lines` : ''})`;
+    const clean = normalizeEol(v); // CRLF counts and previews as LF
+    const lines = clean.split('\n').length;
+    compact[k] = `${clean.slice(0, 40).replace(/\n/g, '⏎')}… (${v.length} chars${lines > 1 ? `, ${lines} lines` : ''})`;
   }
   return clip(JSON.stringify(compact), ARGS_PREVIEW_CHARS);
 }
 
 /** First lines of a tool result, each clipped, plus how much was omitted. */
 function previewResult(content, { truncatedFrom = 0 } = {}) {
-  const text = String(content);
+  // Console only: shown as LF whatever the result carries (e.g. CRLF command
+  // output on Windows) — the model still receives the original text.
+  const text = normalizeEol(String(content));
   const note = truncatedFrom ? s.dim(`(result truncated to ${text.length} chars for the model, ${truncatedFrom} total)`) : '';
   if (verbose) return [text, note].filter(Boolean).join('\n');
   const lines = text.split('\n');
@@ -1294,7 +1346,7 @@ function turnSummary(stats, startedAt) {
   return `${tag('done', s.green)} ${s.dim(bits.join(' · '))}`;
 }
 
-async function loop(messages, { maxSteps = 40, tools = true } = {}) {
+async function loop(messages, { tools = true } = {}) {
   let replyLimit = maxTokens;
   const startedAt = Date.now();
   const stats = { steps: 0, calls: 0, writes: 0, commands: 0, blocked: 0, failed: 0 };
@@ -1306,9 +1358,13 @@ async function loop(messages, { maxSteps = 40, tools = true } = {}) {
   // reply and the turn can end (or be cut off) in a later one.
   const texts = [];
   try {
-    for (let i = 0; i < maxSteps; i++) {
+    // No step limit: the turn keeps going until the model replies without
+    // tool calls — the task is finished — or Ctrl+C stops it. The context
+    // window is not a limit either: maybeAutoCompact summarizes the
+    // conversation as it fills, so however many steps a task takes, it runs.
+    for (let step = 1; ; step++) {
       if (aborted()) break; // Ctrl+C between steps: do not start another one
-      stats.steps = i + 1;
+      stats.steps = step;
       await maybeAutoCompact(messages); // free space before the request, not after the refusal
       noteContext(messages); // nudge before the request, never while a tool runs
       let msg;
@@ -1371,7 +1427,7 @@ async function loop(messages, { maxSteps = 40, tools = true } = {}) {
         // Header: what is about to run, how far along the turn is, compact arguments.
         console.log(
           `\n${paint('⚙')} ${tag(READ_TOOLS.has(name) ? 'read' : 'tool', paint)} ${s.bold(name)} ` +
-          `${s.dim(`· step ${i + 1}/${maxSteps} · call ${k + 1}/${calls.length}${mode === 'plan' && mutating ? ' · plan mode: project read-only' : ''}`)}\n` +
+          `${s.dim(`· step ${step} · call ${k + 1}/${calls.length}${mode === 'plan' && mutating ? ' · plan mode: project read-only' : ''}`)}\n` +
           `  ${s.dim(summarizeArgs(c.function.arguments))}`
         );
         const running = spinner(`running ${name}…`);
@@ -1394,7 +1450,7 @@ async function loop(messages, { maxSteps = 40, tools = true } = {}) {
         else if (failed) stats.failed++;
         else if (name === 'run_command') stats.commands++;
         else if (mutating) stats.writes++;
-        const lines = content ? content.split('\n').length : 0;
+        const lines = content ? normalizeEol(content).split('\n').length : 0;
         const mark = blocked ? s.yellow('⊘') : failed ? s.red('✗') : s.green('✓');
         const status = blocked ? 'blocked' : failed ? 'failed' : 'ok';
         console.log(
@@ -1406,14 +1462,11 @@ async function loop(messages, { maxSteps = 40, tools = true } = {}) {
       }
       if (aborted()) break; // the interrupt already stopped this batch: end the turn
     }
-    if (!aborted()) await maybeAutoCompact(messages); // the turn ended; leave the history tidy
-    if (aborted()) {
-      console.log(`\n${tag('interrupt', s.yellow)} ${s.dim('turn stopped — history is intact')}`);
-      console.log(turnSummary(stats, startedAt));
-      return { text: '(stopped: interrupted)', texts, stats };
-    }
-    console.log(`${s.dim('(stopped: max steps)')}\n${turnSummary(stats, startedAt)}`);
-    return { text: '(stopped: max steps)', texts, stats };
+    // The loop has no other way out: a reply without tool calls returned in
+    // place above, so reaching here means Ctrl+C stopped the turn.
+    console.log(`\n${tag('interrupt', s.yellow)} ${s.dim('turn stopped — history is intact')}`);
+    console.log(turnSummary(stats, startedAt));
+    return { text: '(stopped: interrupted)', texts, stats };
   } finally {
     endExecution(execution);
   }
@@ -1522,7 +1575,7 @@ function savePlan(prompt) {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   let file = path.join(planDir, `plan-${stamp}.md`);
   for (let n = 2; fs.existsSync(file); n++) file = path.join(planDir, `plan-${stamp}-${n}.md`);
-  fs.writeFileSync(file, `${String(prompt).trim()}\n`, 'utf8');
+  fs.writeFileSync(file, applyEol(`${String(prompt).trim()}\n`, eolFor(null)), 'utf8');
   rememberPlan(file);
   return file;
 }
@@ -1555,7 +1608,7 @@ function listPlans() {
       try {
         mtime = fs.statSync(file).mtimeMs;
         const text = fs.readFileSync(file, 'utf8');
-        const all = text.split('\n').filter((l) => l.trim());
+        const all = normalizeEol(text).split('\n').filter((l) => l.trim());
         lines = all.length;
         first = (all[0] || '').trim();
       } catch { /* unreadable plan: listed with what we have */ }
@@ -1612,7 +1665,7 @@ async function planTurn(history, userText) {
   history.push({ role: 'user', content: userText });
   const { text, texts } = await loop(history, { tools: true });
   // Look at the whole turn, not just its last reply: a plan written before
-  // another tool call, or before the step limit stopped the turn, still counts.
+  // another tool call, or before Ctrl+C stopped the turn, still counts.
   const prompt = extractImplementPrompt(texts.length ? texts : [text]);
   const planFile = prompt ? savePlan(prompt) : null;
   return { text, prompt, planFile, interrupted }; // interrupted: Ctrl+C stopped the turn
@@ -1663,6 +1716,10 @@ function loadConfig(p) {
   if (cfg.autoCompact !== undefined) {
     if (typeof cfg.autoCompact !== 'boolean') throw new Error('config autoCompact must be true or false');
     autoCompact = cfg.autoCompact;
+  }
+  if (cfg.lineEndings !== undefined) {
+    if (typeof cfg.lineEndings !== 'string' || !cfg.lineEndings.trim()) throw new Error('config lineEndings must be a non-empty string');
+    lineEndings = LINE_ENDING_ALIASES[cfg.lineEndings.trim().toLowerCase()] || 'auto'; // unknown styles fall back to auto
   }
   return cfg;
 }
@@ -1743,7 +1800,14 @@ the request goes out again. /compact does it on demand.
 Reading costs tokens, so: search_files finds code without opening files,
 list_files maps a directory, and read_file reads a window (200 lines by
 default) — the model is told to use them instead of reading whole files.
-Invalid tool-call JSON is retried up to 3 times with smaller-call instructions.`;
+Invalid tool-call JSON is retried up to 3 times with smaller-call instructions.
+A turn has no step limit: it keeps stepping until the model replies without
+tool calls (the task is done) or Ctrl+C stops it — auto-compaction keeps a
+long turn inside the context window, so neither budget cuts a task off.
+Files keep their own line endings: they are matched and shown as LF and
+written back as CRLF, CR or LF exactly as found, never mixed and never
+silently converted (a new file gets the OS style). Config lineEndings
+("auto" | "lf" | "crlf" | "cr" | "native") can force a style for writes.`;
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
