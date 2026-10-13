@@ -702,6 +702,8 @@ async function main() {
   console.log('\n[plan mode]');
   const {
     isReadOnlyCommand,
+    readOnlyCommandExamples,
+    extractImplementPrompt,
     createPlanState,
     normalizePlan,
     formatPlan,
@@ -768,6 +770,49 @@ async function main() {
   check('planAllowCommands can allow an exact prefix', ro('npm test --silent', ['npm test']) && !ro('npm start', ['npm test']), 'prefix allow ignored');
   check('the refusal says why', /not a known read-only command/.test(isReadOnlyCommand('rm -rf x').reason || ''), isReadOnlyCommand('rm -rf x').reason);
   check('scanCommand splits on shell separators', scanCommand('a && b | c; d').segments.length === 4, JSON.stringify(scanCommand('a && b | c; d').segments));
+
+  /* Read-only classification is OS-aware: a command the shell does not have is
+   * a command that cannot run, however harmless it looks on paper. */
+  const onOs = (platform, cmd) => isReadOnlyCommand(cmd, [], { platform });
+  const onWin = (cmd) => onOs('win32', cmd).ok;
+  const onLinux = (cmd) => onOs('linux', cmd).ok;
+  const posixCmds = ['ls -la', 'cat a.js', 'grep -rn x src', 'head -20 a', 'wc -l *.js', 'which node', 'pwd'];
+  const winCmds = ['dir', 'type a.js', 'findstr "x" a', 'where node', 'ver', 'fc a b'];
+  const posixOnWin = posixCmds.filter(onWin);
+  const winOnPosix = winCmds.filter(onLinux);
+  check('POSIX commands are read-only on POSIX', posixCmds.every(onLinux), posixCmds.filter((c) => !onLinux(c)).join(' | '));
+  check('POSIX commands are refused on Windows', posixOnWin.length === 0, `allowed: ${posixOnWin.join(' | ')}`);
+  check('Windows commands are read-only on Windows', winCmds.every(onWin), winCmds.filter((c) => !onWin(c)).join(' | '));
+  check('Windows commands are refused on POSIX', winOnPosix.length === 0, `allowed: ${winOnPosix.join(' | ')}`);
+  check('the OS refusal names the equivalent for this machine', /use `dir` instead/.test(onOs('win32', 'ls -la').reason || ''), onOs('win32', 'ls -la').reason);
+  check('cross-platform commands are unaffected', ['echo hi', 'sort', 'find "x" a', 'git status', 'npm ls'].every((c) => onWin(c) && onLinux(c)), 'a shared command was refused');
+  check('--version works on any OS', onWin('node --version') && onLinux('node --version'), 'an inert flag was refused');
+  check('mutating commands are refused on every OS', !onWin('rm -rf x') && !onLinux('del /f x') && !onWin('git push') && !onLinux('git commit -m x'), 'the OS check let a write through');
+  check('a POSIX shell on Windows keeps ls (Git Bash, WSL)', isReadOnlyCommand('ls -la', [], { platform: 'win32', ignoreOs: true }).ok, 'ls refused under a bash shell');
+  check('planAllowCommands beats the OS check', isReadOnlyCommand('ls -la', ['ls'], { platform: 'win32' }).ok, 'an allowed command was still refused');
+  check('the prompt examples follow the OS', /dir, type, findstr/.test(readOnlyCommandExamples('win32')) && /ls, cat, grep/.test(readOnlyCommandExamples('linux')), `${readOnlyCommandExamples('win32')} | ${readOnlyCommandExamples('linux')}`);
+
+  /* The IMPLEMENT PROMPT block is the hand-off, so it is read tolerantly: a
+   * plan that is not recognised leaves /implement with nothing to run. */
+  const block = (text) => extractImplementPrompt(text);
+  check('the plain block is read', block('IMPLEMENT PROMPT\n---\nGoal: x\n---') === 'Goal: x', block('IMPLEMENT PROMPT\n---\nGoal: x\n---'));
+  check('a decorated marker is still the marker', [
+    '**IMPLEMENT PROMPT**\n---\nGoal: x\n---',
+    '### IMPLEMENT PROMPT\n---\nGoal: x\n---',
+    'IMPLEMENT PROMPT:\n---\nGoal: x\n---',
+    'Implementation Prompt\n---\nGoal: x\n---',
+  ].every((t) => block(t) === 'Goal: x'), 'a heading or bold marker was missed');
+  check('CRLF and stray spaces do not matter', block('IMPLEMENT PROMPT\r\n--- \r\nGoal: x\r\n--- \r\n') === 'Goal: x', block('IMPLEMENT PROMPT\r\n--- \r\nGoal: x\r\n--- \r\n'));
+  check('*** and ___ work as delimiters', block('IMPLEMENT PROMPT\n***\nGoal: x\n***') === 'Goal: x' && block('IMPLEMENT PROMPT\n___\nGoal: x\n___') === 'Goal: x', 'only --- was accepted');
+  check('a fenced body is unwrapped', block('IMPLEMENT PROMPT\n\n```\nGoal: x\n```') === 'Goal: x', block('IMPLEMENT PROMPT\n\n```\nGoal: x\n```'));
+  check('prose around the block is dropped', block('Done reading.\n\nIMPLEMENT PROMPT\n---\nGoal: x\n---\nLet me know.') === 'Goal: x', block('Done reading.\n\nIMPLEMENT PROMPT\n---\nGoal: x\n---\nLet me know.'));
+  check('a reply cut off before the closing line still yields a plan', block('IMPLEMENT PROMPT\n---\nGoal: x\nSteps: 1') === 'Goal: x\nSteps: 1', block('IMPLEMENT PROMPT\n---\nGoal: x\nSteps: 1'));
+  check('a block with no delimiters at all still yields a plan', block('IMPLEMENT PROMPT\nGoal: x') === 'Goal: x', block('IMPLEMENT PROMPT\nGoal: x'));
+  check('a --- inside the plan does not cut it short', block('IMPLEMENT PROMPT\n---\n## Goal\nx\n\n---\n\n## Verify\nnpm test\n---') === '## Goal\nx\n\n---\n\n## Verify\nnpm test', block('IMPLEMENT PROMPT\n---\n## Goal\nx\n\n---\n\n## Verify\nnpm test\n---'));
+  check('a plan written in an earlier reply of the turn is found', block(['researching…', 'IMPLEMENT PROMPT\n---\nearlier\n---']) === 'earlier', block(['researching…', 'IMPLEMENT PROMPT\n---\nearlier\n---']));
+  check('the newest block wins', block('IMPLEMENT PROMPT\n---\nfirst\n---\n\nIMPLEMENT PROMPT\n---\nsecond\n---') === 'second', block('IMPLEMENT PROMPT\n---\nfirst\n---\n\nIMPLEMENT PROMPT\n---\nsecond\n---'));
+  check('an empty block is no plan', block('IMPLEMENT PROMPT\n---\n---') === null, block('IMPLEMENT PROMPT\n---\n---'));
+  check('talking about the block is not the block', block('see the IMPLEMENT PROMPT above') === null && block('I will write the plan now') === null, 'prose was read as a plan');
 
   // --- the plan object ---
   check('normalizePlan keeps the steps in order', normalizePlan({ title: 't', steps: ['one', 'two'] }).steps.join('|') === 'one|two', 'reordered');
@@ -1584,10 +1629,12 @@ async function main() {
   /* --- a 500 that is really the server rejecting the model's own tool call --- */
   const {
     classifyApiError,
+    isContextLengthError,
     serverErrorSummary,
     oversizedToolCallNudge,
     smallerReplyTokenLimit,
     TOOL_CALL_PARSE_ERROR,
+    CONTEXT_LENGTH_ERROR,
     OVERSIZED_TOOL_CALL_TAG,
   } = await import(pathToFileURL(path.join(proj, 'lib', 'llm.js')).href);
 
@@ -1605,6 +1652,21 @@ async function main() {
   check('a plain 5xx stays transient', classifyApiError(503, 'upstream connect error') === null, 'misclassified');
   check('a 400 about our own request body stays transient', classifyApiError(400, 'invalid request: unexpected end of JSON input') === null, 'misclassified');
   check('an unterminated tool call without a status is classified', classifyApiError(0, 'tool_calls: unterminated string') === TOOL_CALL_PARSE_ERROR, 'missed');
+  // A full context window is its own class of failure: compacting helps,
+  // telling the model to make a smaller tool call does not.
+  const fullWindow = [
+    "This model's maximum context length is 8192 tokens. However, you requested 10000 tokens",
+    'context_length_exceeded: maximum context length exceeded',
+    'prompt is too long: 200000 tokens > 128000 maximum',
+    'input is too long for requested model',
+    'request exceeds the maximum allowed number of tokens',
+  ];
+  const missedWindow = fullWindow.filter((text) => classifyApiError(400, text) !== CONTEXT_LENGTH_ERROR);
+  check('a full context window is classified', missedWindow.length === 0, missedWindow.join(' | '));
+  check('isContextLengthError agrees with the classifier', fullWindow.every((text) => isContextLengthError(400, text)), 'disagreed');
+  check('an ordinary error is not a context error', !isContextLengthError(400, 'invalid api key') && classifyApiError(400, 'upstream connect error') === null, 'false positive');
+  check('a context error is not an oversized tool call', classifyApiError(400, 'maximum context length exceeded') !== TOOL_CALL_PARSE_ERROR, 'misclassified');
+
   const summary = serverErrorSummary(llamaBody);
   check('the error summary keeps the useful sentence', summary.startsWith('Failed to parse tool call arguments as JSON'), summary);
   check('the error summary drops the echoed model output', !summary.includes('container-fluid') && summary.length <= 241, `${summary.length} chars: ${summary.slice(0, 120)}`);

@@ -314,9 +314,14 @@ Plan mode is enforced by the harness, not by asking the model nicely:
   (`$(…)`, backticks), `find -delete`/`-exec`, `sed -i`, installers, `git commit`/`push`, and
   interpreters that can run arbitrary code (`node x.js`, `python …`) are all rejected — with a reason
   the model can act on.
+- **Commands must exist on this OS.** The check knows which shell it is running in, so a read-only
+  command from the other family is refused with the equivalent this machine has: `ls` on Windows
+  (use `dir`), `dir` on Linux/macOS (use `ls`), `cat`/`grep` vs `type`/`findstr`, `which` vs `where`.
+  Point `shell` at a POSIX shell (Git Bash, WSL) and the POSIX commands are accepted again.
 - **MCP tools are hidden** (an MCP server can write anywhere); list the safe ones in `planAllowTools`.
 - Project-specific read-only commands go in `planAllowCommands`: `["make"]` allows the command,
-  `["npm test"]` allows exactly that prefix.
+  `["npm test"]` allows exactly that prefix. It also overrides the OS check, so `["ls"]` allows `ls`
+  on Windows.
 
 ```json
 { "planAllowCommands": ["make", "npm test"], "planAllowTools": ["mcp_docs_search"] }
