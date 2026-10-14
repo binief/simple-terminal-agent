@@ -643,6 +643,38 @@ node harness.js [--config <path>] [--dir <path>] [--init] [--once "<prompt>"] [-
 `--resume [name]` loads a saved chat before the first prompt (no name = the most recent). `--continue`
 is an alias. See [Saving and loading a chat](#saving-and-loading-a-chat).
 
+## agentic.mjs — load an agent (.md), give it a prompt
+
+`agentic.mjs` is the agent-file-driven sibling of `harness.js`/`basic.mjs`: point it at a folder of
+Markdown agents, pick one, give it a prompt, and it runs the task with the shared coding tools
+(`read_file`, `write_file`, `edit_file`, `list_dir`, `search_files`, `run_command`, plus MCP tools).
+
+```bash
+node agentic.mjs --init-agents agents        # example agents: coder, researcher, reviewer
+node agentic.mjs --init                      # example ./agentic.config.json
+node agentic.mjs --list-agents               # what's in the agents folder (no API call)
+node agentic.mjs --agent researcher --once "how does auth work here?"
+node agentic.mjs --agents .github/agents --agent plan --once "add a --version flag"
+node agentic.mjs                             # interactive — /agents lists, /agent <name> switches
+```
+
+An agent is a `.md` / `.agent.md` file (the Copilot files in `.github/agents/` load as-is): optional
+frontmatter — `name`, `description`, `tools` (aliases `read`/`search`/`edit`/`execute`/`mcp` or exact
+tool names), `model`, `temperature`, `maxSteps`, `maxTokens`, `readOnly`, `promptMode` — and a body
+that becomes the system prompt. An agent with no writing tool is enforced read-only, not just asked.
+Switching (`--agent`, `--agent-file`, or `/agent <name>` mid-session) rebuilds the system prompt and
+keeps the conversation. The folder comes from `--agents`, config `agentsDir`, `AGENTIC_AGENTS_DIR`,
+or defaults to `./agents` (else `./.github/agents`).
+
+Config is one optional JSON file (`--config`, `AGENTIC_CONFIG`, `./agentic.config.json`, or
+`~/.agentic/config.json`) in the `basic.mjs` shape: `openai: { baseURL, apiKey, model }`,
+`contextSize` (alias `maxContext`), `maxTokens`, `maxSteps`, `temperature`, `streaming`, `workspace`,
+`shell`, `lineEndings`, `searchIgnore`, `commandTimeout`, `autoCompact`, `promptStyle`,
+`instructions`, `agentsDir`, `agent`, and `mcp: { servers: { … } }` (stdio or HTTP, as below).
+History is auto-compacted at 90% of the context budget; `/compact`, `/reset`, `/tools` and `/config`
+work interactively. `node --test test/agentic.mjs` covers agent loading/switching, the read-only
+enforcement, the config alias, and MCP end to end against a mock server.
+
 ## GitHub Copilot custom agents
 
 `basic.mjs`'s three phases are packaged as Copilot custom agents, one per phase, in
