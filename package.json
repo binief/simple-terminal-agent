@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node harness.js",
-    "test": "node test/run-tests.mjs && node --test test/basic-streaming.mjs"
+    "test": "node test/run-tests.mjs && node --test test/basic-streaming.mjs && node --test test/copilot-agents.mjs"
   },
   "engines": {
     "node": ">=18"
