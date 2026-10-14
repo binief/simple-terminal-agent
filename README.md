@@ -643,6 +643,21 @@ node harness.js [--config <path>] [--dir <path>] [--init] [--once "<prompt>"] [-
 `--resume [name]` loads a saved chat before the first prompt (no name = the most recent). `--continue`
 is an alias. See [Saving and loading a chat](#saving-and-loading-a-chat).
 
+## GitHub Copilot custom agents
+
+`basic.mjs`'s three phases are packaged as Copilot custom agents, one per phase, in
+[`.github/agents/`](.github/agents/): **rewrite** (shapes the raw request into a `REFINED PROMPT`
+block, `read`/`search` only), **plan** (read-only research → `IMPLEMENT PROMPT` block, no editing
+tool), **implement** (the only agent with `edit`, carrying the change out and verifying it). Each phase
+ends with a handoff button to the next, and the tool allowlist in the frontmatter is what keeps the
+read-only phases read-only — the rule `basic.mjs` enforces in `guardWrite`/`guardCommand`.
+
+The blocks are the ones `basic.mjs` already reads (`extractRefinedPrompt` / `extractImplementPrompt`),
+so a prompt shaped in Copilot can be planned by the CLI and vice versa, and plans are saved to the
+git-ignored `.copilot/plans/` — a `planDir` outside the workspace, as far as a repository-scoped agent
+can have one. [`docs/copilot-agents.md`](docs/copilot-agents.md) covers the mapping, the surfaces
+(VS Code, Copilot CLI, GitHub.com) and how to customize the agents.
+
 ## Tests
 
 ```bash
@@ -657,5 +672,12 @@ a real file, recursion refused, and enforced mode refusing the editors — cut-o
 server that rejects an oversized tool call with a 500, config migration, and chat save/load
 round-tripped through two separate processes).
 
+`node --test test/basic-streaming.mjs` covers `basic.mjs` itself (the rewrite gate, plan mode and the
+saved plan file, auto-compaction, Ctrl+C, line endings), and `node --test test/copilot-agents.mjs`
+validates the `.github/agents/` files: frontmatter, the tool allowlists that keep the read-only phases
+read-only, the handoff chain, and that the blocks they document round-trip through `basic.mjs`'s
+extractors.
+
 `docs/late-cli-analysis.md` covers where delegation, the command gate and `.llmignore` came from and
-which of the reference project's ideas were deliberately left out.
+which of the reference project's ideas were deliberately left out. `docs/copilot-agents.md` maps the
+`.github/agents/` pipeline onto `basic.mjs`'s three modes.

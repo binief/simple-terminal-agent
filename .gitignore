@@ -1,0 +1,7 @@
+# Plan files written by the Copilot agents in .github/agents (plan -> implement).
+#
+# basic.mjs keeps its plan directory outside the workspace, so plans and refined
+# prompts are never part of the project. A Copilot agent can only write inside
+# the repository, so the same rule is kept with a git-ignored directory: the
+# plan file is a working note the implement phase can resume from, not source.
+.copilot/plans/
