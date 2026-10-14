@@ -1,11 +1,22 @@
 #!/usr/bin/env node
 /**
- * basic.mjs — tiny two-mode coding agent.
+ * basic.mjs — tiny three-mode coding agent.
  *
  *   node basic.mjs              interactive
- *   node basic.mjs --once "…"   one shot (plan then implement)
+ *   node basic.mjs --once "…"   one shot (rewrite if enabled, then plan, then implement)
  *
  * Modes
+ *   rewrite   — prompt-shaping only, and opt-in. The model rewrites the user's
+ *               raw request into a well-formed prompt (role, goal, grounded
+ *               context, scope, constraints, acceptance criteria), inspecting
+ *               the project with the same READ-ONLY tools as plan mode so it
+ *               names files and commands that actually exist. It ends with a
+ *               REFINED PROMPT block. Interactively that block is NOT used
+ *               until the user confirms it (blank line or /accept; any other
+ *               text revises it, /use-raw plans the original, /cancel drops
+ *               it); in --once mode it continues automatically. Turn it on
+ *               with config rewrite: true, BASIC_REWRITE=1, --rewrite, or
+ *               /rewrite on; /rewrite <task> runs it once even when it is off.
  *   plan      — analysis only. The project is READ-ONLY: write_file/edit_file
  *               refuse any path outside the plan directory and run_command
  *               only accepts read-only commands. The agent asks questions if
@@ -14,7 +25,10 @@
  *               outside the workspace (a planDir inside it is moved out), so
  *               plan files are never part of the project. Plans outlive the
  *               console: the last one is picked up on start, /plans lists them
- *               and /implement <n> runs one, so work can be resumed.
+ *               and /implement <n> runs one, so work can be resumed. When the
+ *               plan came from a confirmed rewrite, the plan file opens with
+ *               that refined prompt (and the original request), so the brief
+ *               IMPLEMENT mode runs from carries both.
  *   implement — the only mode that changes project files. Its user prompt is
  *               the saved plan file; there is no extra system prompt.
  *
@@ -66,7 +80,7 @@
  * Config (optional JSON, --config path or BASIC_CONFIG):
  *   { openai: { baseURL, apiKey, model }, maxTokens: 4096, contextSize: 64000,
  *     workspace, planDir: "<os tmp>/basic-plans", planAllowCommands: ["make"],
- *     shell: "bash", autoCompact: true, lineEndings: "auto",
+ *     rewrite: false, shell: "bash", autoCompact: true, lineEndings: "auto",
  *     mcp: { servers: {
  *       name: { command, args?, env? }           // stdio
  *       name: { type: "http", url, headers? }    // HTTP
@@ -80,7 +94,7 @@ import readline from 'node:readline';
 import { spawn } from 'node:child_process';
 import { calibrateTokens, classifyApiError, estimatePromptTokens, isContextLengthError, serverErrorSummary, smallerReplyTokenLimit, TOOL_CALL_PARSE_ERROR } from './lib/llm.js';
 import { createIgnoreMatcher } from './lib/ignore.js';
-import { extractImplementPrompt, isReadOnlyCommand, platformFamily, readOnlyCommandExamples, shellCommandFamily } from './lib/plan.js';
+import { extractImplementPrompt, extractRefinedPrompt, isReadOnlyCommand, platformFamily, readOnlyCommandExamples, shellCommandFamily } from './lib/plan.js';
 import { applyEol, detectEol, eolName, normalizeEol, resolveEol, resolveShell } from './lib/tools.js';
 import { fmtDuration, s, spinner } from './lib/ui.js';
 
@@ -114,8 +128,21 @@ let compactMode = false;
 let workspace = process.cwd();
 let mcp = emptyMcp();
 
-/** 'plan' (read-only analysis) or 'implement' (the only mode that writes). */
+/**
+ * 'rewrite' (read-only prompt-shaping), 'plan' (read-only analysis) or
+ * 'implement' (the only mode that writes).
+ */
 let mode = 'plan';
+/** Modes in which the project is read-only and only planDir may be written. */
+const isReadOnlyMode = () => mode === 'plan' || mode === 'rewrite';
+/** "PLAN" or "REWRITE" — for refusals that must name the mode that issued them. */
+const readOnlyModeName = () => (mode === 'rewrite' ? 'REWRITE' : 'PLAN');
+/**
+ * Whether every new task is rewritten before it is planned (config rewrite,
+ * BASIC_REWRITE=1, --rewrite, /rewrite on). Default off: /rewrite <task>
+ * runs the phase once without switching it on.
+ */
+let rewriteEnabled = /^(1|true|yes|on)$/i.test(process.env.BASIC_REWRITE || '');
 /** Where PLAN mode is allowed to write: the saved plans and any working notes. */
 let planDir = path.join(os.tmpdir(), 'basic-plans');
 /** Extra commands PLAN mode may run (config planAllowCommands). */
@@ -305,23 +332,25 @@ function separatePlanDir() {
   planDir = outside;
 }
 
-/* PLAN mode is enforced here, not just asked for in the prompt: a tool that
- * would change the project refuses before touching the disk, and the refusal
- * comes back as a tool result the model can read and act on. The only
- * writable place is planDir, so the plan (and any working notes) can still be
- * persisted. */
-const PLAN_READ_ONLY = 'PLAN mode is read-only';
+/* The read-only modes (PLAN and REWRITE) are enforced here, not just asked
+ * for in the prompt: a tool that would change the project refuses before
+ * touching the disk, and the refusal comes back as a tool result the model
+ * can read and act on. The only writable place is planDir, so plans, refined
+ * prompts and working notes can still be persisted. */
+const READ_ONLY_MARKER = 'mode is read-only';
+const readOnlyRefusal = () => `${readOnlyModeName()} ${READ_ONLY_MARKER}`;
 
 function guardWrite(abs) {
-  if (mode !== 'plan' || isInside(planDir, abs)) return;
+  if (!isReadOnlyMode() || isInside(planDir, abs)) return;
+  const block = mode === 'rewrite' ? 'REFINED PROMPT' : 'IMPLEMENT PROMPT';
   throw new Error(
-    `${PLAN_READ_ONLY}: ${abs} was not written. Project files change only in IMPLEMENT mode. ` +
-    `Keep plans and working notes under ${planDir}, and finish with the IMPLEMENT PROMPT block.`
+    `${readOnlyRefusal()}: ${abs} was not written. Project files change only in IMPLEMENT mode. ` +
+    `Keep plans and working notes under ${planDir}, and finish with the ${block} block.`
   );
 }
 
 function guardCommand(command) {
-  if (mode !== 'plan') return;
+  if (!isReadOnlyMode()) return;
   // OS-aware: `ls` is read-only but does not exist in cmd.exe, so the refusal
   // names the command this machine has instead of letting the shell fail.
   const { family } = shellInfo();
@@ -332,8 +361,8 @@ function guardCommand(command) {
   });
   if (verdict.ok) return;
   throw new Error(
-    `${PLAN_READ_ONLY}: \`${String(command ?? '').trim()}\` was not run (${verdict.reason}). ` +
-    `Only read-only commands run in PLAN mode (${readOnlyCommandExamples(family)}, …), ` +
+    `${readOnlyRefusal()}: \`${String(command ?? '').trim()}\` was not run (${verdict.reason}). ` +
+    `Only read-only commands run in ${readOnlyModeName()} mode (${readOnlyCommandExamples(family)}, …), ` +
     `and only ones this OS has (commands run through ${shellVia()}); anything that changes the project waits for IMPLEMENT mode.`
   );
 }
@@ -647,6 +676,11 @@ const MODE_NOTES = {
     write_file: () => ` PLAN mode: only paths under ${planDir} may be written (plans, working notes). Project files are read-only until IMPLEMENT mode.`,
     edit_file: () => ` PLAN mode: only files under ${planDir} may be edited. Project files are read-only until IMPLEMENT mode.`,
     run_command: () => ` PLAN mode: read-only commands only (${readOnlyCommandExamples(shellPlatform())}, …), and only ones that exist on this OS (commands run through ${shellVia()}); builds, installs and anything writing files are refused.`,
+  },
+  rewrite: {
+    write_file: () => ` REWRITE mode: only paths under ${planDir} may be written (working notes). Project files are read-only until IMPLEMENT mode.`,
+    edit_file: () => ` REWRITE mode: only files under ${planDir} may be edited. Project files are read-only until IMPLEMENT mode.`,
+    run_command: () => ` REWRITE mode: read-only commands only (${readOnlyCommandExamples(shellPlatform())}, …), and only ones that exist on this OS (commands run through ${shellVia()}); builds, installs and anything writing files are refused.`,
   },
   implement: {},
 };
@@ -1296,6 +1330,36 @@ async function runTool(name, args) {
   throw new Error(`unknown tool ${name}`);
 }
 
+const rewriteSystem = () => `You are in REWRITE mode. You rewrite the user's raw request into a good prompt; you do not plan the implementation in detail and you do not implement anything.
+Two directories, and they are never the same one:
+- WORKSPACE (the project, what you are reading): ${workspace}
+  Every relative path resolves against it (never against some other directory), results
+  come back relative to it, and paths outside it are refused.
+- PLAN DIRECTORY (where plans, refined prompts and working notes are stored): ${planDir}
+  It is outside the workspace on purpose. Do not look for plan files in the workspace.
+The project is READ-ONLY in this mode and the tools enforce it:
+- write_file and edit_file refuse every path outside ${planDir}. Use that directory for working notes if you need them.
+- run_command only runs read-only commands (${readOnlyCommandExamples(shellPlatform())}, …), and only
+  ones this machine has: commands run through ${shellVia()}, so a command from the other OS is
+  refused (on Windows use dir/type/findstr, on Linux/macOS use ls/cat/grep).
+  Builds, installs and anything that writes files are refused.
+Your job is to make the request precise enough that a planning agent cannot misread it:
+- Preserve the user's intent, names, numbers, paths and wording where they carry meaning. Never invent a requirement the user did not imply, and never drop a constraint they did state.
+- Inspect the workspace only where it makes the prompt more accurate, spending as few tokens as you can: search_files to find where something lives, list_files to see what is here, read_file with start_line/max_lines for the region you need. Refer to files, commands and tests that actually exist; when you could not verify one, say it is unverified rather than presenting a guess as a fact.
+- Give the prompt a role suited to the task, and structure what remains as applicable: goal, context grounded in what you found, scope (and explicit non-goals), requirements, constraints, relevant files, edge cases to consider, and acceptance criteria with how the result will be verified.
+- Ambiguity you cannot resolve from the workspace goes in an "Assumptions / open questions" line of the refined prompt — do not stop to ask, and do not silently pick a meaning the user may not intend.
+- Write the refined prompt so it stands on its own: the reader gets only that prompt, not this conversation and not the user's original wording.
+Do not write the implementation plan and do not write code — the ordered steps are the next phase's job.
+When you have enough, output ONLY the refined prompt, wrapped exactly like this:
+
+REFINED PROMPT
+---
+<the full refined prompt>
+---
+
+End the reply with that block: the user reviews it, and only the confirmed text goes on to PLAN mode. Nothing may follow the closing "---" — no summary, no questions, no offer to continue.
+No other work.`;
+
 const planSystem = () => `You are in PLAN mode. You analyse and plan; you do not implement anything.
 Two directories, and they are never the same one:
 - WORKSPACE (the project, what you are reading): ${workspace}
@@ -1338,7 +1402,7 @@ function turnSummary(stats, startedAt) {
     const detail = [];
     if (stats.writes) detail.push(`${stats.writes} file write${stats.writes === 1 ? '' : 's'}`);
     if (stats.commands) detail.push(`${stats.commands} command${stats.commands === 1 ? '' : 's'}`);
-    if (stats.blocked) detail.push(`${stats.blocked} blocked by PLAN mode`);
+    if (stats.blocked) detail.push(`${stats.blocked} blocked by ${stats.blockedBy || 'PLAN'} mode`);
     if (stats.failed) detail.push(`${stats.failed} failed`);
     bits.push(`${stats.calls} tool call${stats.calls === 1 ? '' : 's'}${detail.length ? ` (${detail.join(', ')})` : ''}`);
   }
@@ -1349,7 +1413,7 @@ function turnSummary(stats, startedAt) {
 async function loop(messages, { tools = true } = {}) {
   let replyLimit = maxTokens;
   const startedAt = Date.now();
-  const stats = { steps: 0, calls: 0, writes: 0, commands: 0, blocked: 0, failed: 0 };
+  const stats = { steps: 0, calls: 0, writes: 0, commands: 0, blocked: 0, failed: 0, blockedBy: readOnlyModeName() };
   // The turn registers itself, so Ctrl+C can abort its request and kill any
   // command a tool starts; endExecution() retires the handle either way.
   const execution = beginExecution();
@@ -1427,7 +1491,7 @@ async function loop(messages, { tools = true } = {}) {
         // Header: what is about to run, how far along the turn is, compact arguments.
         console.log(
           `\n${paint('⚙')} ${tag(READ_TOOLS.has(name) ? 'read' : 'tool', paint)} ${s.bold(name)} ` +
-          `${s.dim(`· step ${step} · call ${k + 1}/${calls.length}${mode === 'plan' && mutating ? ' · plan mode: project read-only' : ''}`)}\n` +
+          `${s.dim(`· step ${step} · call ${k + 1}/${calls.length}${isReadOnlyMode() && mutating ? ` · ${mode} mode: project read-only` : ''}`)}\n` +
           `  ${s.dim(summarizeArgs(c.function.arguments))}`
         );
         const running = spinner(`running ${name}…`);
@@ -1444,7 +1508,7 @@ async function loop(messages, { tools = true } = {}) {
         const full = String(result);
         const content = full.slice(0, 20000);
         const failed = content.startsWith('error:');
-        const blocked = failed && content.includes(PLAN_READ_ONLY);
+        const blocked = failed && content.includes(READ_ONLY_MARKER);
         stats.calls++;
         if (blocked) stats.blocked++;
         else if (failed) stats.failed++;
@@ -1570,12 +1634,24 @@ async function compactHistory(history) {
  * PROMPT goes to a timestamped file under planDir, and IMPLEMENT mode reads
  * its brief from that file. The project itself is untouched until then. */
 
-function savePlan(prompt) {
+/**
+ * Save the IMPLEMENT PROMPT as a plan file. When the plan grew out of a
+ * confirmed rewrite, the file opens with that refined prompt (and the raw
+ * request it came from, marked as superseded), so the brief IMPLEMENT mode
+ * runs from carries the shaped task as well as the plan written for it —
+ * no separate refined-prompt file to keep in step with the plan.
+ */
+function savePlan(prompt, { refined = '', original = '' } = {}) {
   fs.mkdirSync(planDir, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   let file = path.join(planDir, `plan-${stamp}.md`);
   for (let n = 2; fs.existsSync(file); n++) file = path.join(planDir, `plan-${stamp}-${n}.md`);
-  fs.writeFileSync(file, applyEol(`${String(prompt).trim()}\n`, eolFor(null)), 'utf8');
+  const head = String(refined || '').trim()
+    ? `# Refined prompt\n\n${String(refined).trim()}\n\n` +
+      (String(original || '').trim() ? `# Original request (superseded by the refined prompt above)\n\n${String(original).trim()}\n\n` : '') +
+      `# Implement prompt\n\n`
+    : '';
+  fs.writeFileSync(file, applyEol(`${head}${String(prompt).trim()}\n`, eolFor(null)), 'utf8');
   rememberPlan(file);
   return file;
 }
@@ -1610,7 +1686,9 @@ function listPlans() {
         const text = fs.readFileSync(file, 'utf8');
         const all = normalizeEol(text).split('\n').filter((l) => l.trim());
         lines = all.length;
-        first = (all[0] || '').trim();
+        // A plan saved from a rewrite opens with a "# Refined prompt" section
+        // heading; the listing should preview the prompt itself, not the heading.
+        first = (all.find((l) => !/^#\s+(refined prompt|original request\b.*|implement prompt)\s*$/i.test(l.trim())) || all[0] || '').trim();
       } catch { /* unreadable plan: listed with what we have */ }
       return { file, name, mtime, lines, first };
     })
@@ -1660,15 +1738,37 @@ function implementPrompt(file) {
     readPlan(file);
 }
 
-async function planTurn(history, userText) {
+async function planTurn(history, userText, rewriteContext = null) {
   mode = 'plan';
   history.push({ role: 'user', content: userText });
   const { text, texts } = await loop(history, { tools: true });
   // Look at the whole turn, not just its last reply: a plan written before
   // another tool call, or before Ctrl+C stopped the turn, still counts.
   const prompt = extractImplementPrompt(texts.length ? texts : [text]);
-  const planFile = prompt ? savePlan(prompt) : null;
+  const planFile = prompt ? savePlan(prompt, rewriteContext || {}) : null;
   return { text, prompt, planFile, interrupted }; // interrupted: Ctrl+C stopped the turn
+}
+
+/**
+ * One REWRITE turn over its own throwaway history: the raw request (plus any
+ * revision feedback the confirmation gate collected) goes in, the REFINED
+ * PROMPT block comes out. The history is returned with the result so the
+ * gate can ask for a revision in context; it is never merged into the plan
+ * history — only the confirmed refined text crosses over.
+ */
+async function rewriteTurn(rawText, existingHistory = null) {
+  mode = 'rewrite';
+  const history = existingHistory || [
+    { role: 'system', content: rewriteSystem() },
+    { role: 'user', content: String(rawText ?? '') },
+  ];
+  try {
+    const { text, texts } = await loop(history, { tools: true });
+    const refined = extractRefinedPrompt(texts.length ? texts : [text]);
+    return { text, refined, history, interrupted }; // interrupted: Ctrl+C stopped the turn
+  } finally {
+    mode = 'plan';
+  }
 }
 
 async function implementTurn(planFile) {
@@ -1717,6 +1817,10 @@ function loadConfig(p) {
     if (typeof cfg.autoCompact !== 'boolean') throw new Error('config autoCompact must be true or false');
     autoCompact = cfg.autoCompact;
   }
+  if (cfg.rewrite !== undefined) {
+    if (typeof cfg.rewrite !== 'boolean') throw new Error('config rewrite must be true or false');
+    rewriteEnabled = cfg.rewrite;
+  }
   if (cfg.lineEndings !== undefined) {
     if (typeof cfg.lineEndings !== 'string' || !cfg.lineEndings.trim()) throw new Error('config lineEndings must be a non-empty string');
     lineEndings = LINE_ENDING_ALIASES[cfg.lineEndings.trim().toLowerCase()] || 'auto'; // unknown styles fall back to auto
@@ -1725,23 +1829,33 @@ function loadConfig(p) {
 }
 
 function parseArgs(argv) {
-  const o = { once: null, config: process.env.BASIC_CONFIG || null, dir: null, help: false };
+  const o = { once: null, config: process.env.BASIC_CONFIG || null, dir: null, help: false, rewrite: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--once') o.once = argv[++i];
     else if (a === '--config' || a === '-c') o.config = argv[++i];
     else if (a === '--dir' || a === '-d') o.dir = argv[++i];
+    else if (a === '--rewrite') o.rewrite = true;
+    else if (a === '--no-rewrite') o.rewrite = false;
     else if (a === '--help' || a === '-h') o.help = true;
   }
   return o;
 }
 
-const HELP = `basic.mjs — plan then implement.
+const HELP = `basic.mjs — rewrite (if enabled), then plan, then implement.
 
-  node basic.mjs [--config file] [--dir path]
+  node basic.mjs [--config file] [--dir path] [--rewrite|--no-rewrite]
   node basic.mjs --once "task"
 
-  /plan [text]        plan mode (default). extra text is context.
+  /rewrite [task]     rewrite mode: shape a raw request into a good prompt before
+                      planning. With a task: run it once now (even when rewrite is
+                      off). With on/off: switch it on or off for this session.
+                      With nothing: show whether it is on. While a refined prompt
+                      waits for confirmation: blank line, y or /accept plans with
+                      it, /use-raw plans the original, /cancel drops it, and any
+                      other text is revision feedback that rewrites it again.
+  /plan [text]        plan mode (default). extra text is context. When rewrite is
+                      on, the text is rewritten and confirmed first.
   /implement [target] run a plan. No target: the last plan of this session, or the
                       one the previous session left behind (plans survive a restart).
                       A number: that entry from /plans. A path: that plan file.
@@ -1761,7 +1875,20 @@ within two seconds, or while the agent is idle, exits.
 pointer is forgotten; the saved plan file stays on disk), so the next request
 starts from an empty context.
 
-Everything goes through plan, then implement.
+Everything goes through plan, then implement — through rewrite first when it
+is switched on. REWRITE mode is opt-in and read-only exactly like PLAN: config
+rewrite: true (BASIC_REWRITE=1, --rewrite, /rewrite on; --no-rewrite and
+/rewrite off switch it back off) makes every new task be rewritten before it
+is planned, and /rewrite <task> runs the phase once when it is off. The model
+may inspect the project with the read-only tools so the refined prompt names
+real files and commands, ends with a REFINED PROMPT block (also read
+tolerantly), and — interactively — that text waits for you: a blank line, y or
+/accept sends it to PLAN mode, any other text rewrites it again with that as
+feedback, /use-raw plans your original words instead, and /cancel drops it.
+--once cannot ask, so a rewritten --once task continues on its own. A plan
+that came from a confirmed rewrite saves its plan file with the refined
+prompt as the opening section (the original request follows, marked
+superseded), so /prompt and IMPLEMENT mode both see what was actually asked.
 PLAN mode is analysis only — the project is read-only. write_file/edit_file
 refuse every project path (only the plan directory is writable, and nothing
 outside the workspace is touched at all) and run_command only runs read-only
@@ -1813,6 +1940,7 @@ async function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.help) { console.log(HELP); return; }
   const cfg = loadConfig(opts.config);
+  if (opts.rewrite !== null) rewriteEnabled = opts.rewrite; // --rewrite/--no-rewrite beats the config
   if (opts.dir) workspace = path.resolve(opts.dir);
   separatePlanDir(); // plans live outside the project, or the two get confused
   mcp = await connectMcp(cfg?.mcp?.servers);
@@ -1845,16 +1973,107 @@ async function main() {
     s.cyan('/implement <instructions>') + s.dim(' to hand the work over directly')
   );
   /** After a plan turn: remember the plan file, or say why there is none. */
-  const finishPlanTurn = async (history, userText) => {
-    const { planFile } = await planTurn(history, userText);
+  const finishPlanTurn = async (history, userText, rewriteContext = null) => {
+    const { planFile } = await planTurn(history, userText, rewriteContext);
     if (!planFile) { noPlanNote(); return null; }
     lastPlanFile = planFile;
     console.log(savedNote(planFile));
     return planFile;
   };
 
+  /* A refined prompt waiting at the confirmation gate, or null. Holds the
+   * rewrite history so revision feedback can be applied in context; only the
+   * confirmed text (or, with /use-raw, the original) reaches planHistory. */
+  let pendingRewrite = null;
+
+  const showRefined = (pending) => {
+    console.log(`\n${tag('refined', s.cyan)} ${s.dim('this — and only this — is what PLAN mode receives if you confirm it')}`);
+    console.log(pending.refined);
+    console.log(s.dim('  blank line, y or /accept: plan with it · type feedback: rewrite it again · /use-raw: plan the original · n or /cancel: drop it'));
+  };
+
+  /** Run REWRITE mode for `rawText` and park the result at the confirmation gate. */
+  const startRewriteTask = async (rawText) => {
+    console.log(`${tag('rewrite', s.cyan)} ${s.dim('project read-only · refining the request before planning')}`);
+    const result = await rewriteTurn(rawText);
+    if (result.interrupted) {
+      console.log(s.dim('rewrite stopped — nothing is waiting for confirmation'));
+      return null;
+    }
+    if (!result.refined) {
+      console.log(
+        s.dim('no REFINED PROMPT block in that reply — nothing was planned. Run ') +
+        s.cyan('/rewrite <task>') + s.dim(' again, or plan the words as written with rewrite off')
+      );
+      return null;
+    }
+    pendingRewrite = { original: String(rawText), refined: result.refined, history: result.history };
+    showRefined(pendingRewrite);
+    return pendingRewrite;
+  };
+
+  /** Leave the gate: plan with the refined text, or with the original on /use-raw. */
+  const acceptRewrite = async (pending, { useRaw = false } = {}) => {
+    pendingRewrite = null;
+    if (useRaw) {
+      console.log(`${tag('plan', s.magenta)} ${s.dim('planning your original words — the refined prompt was set aside')}`);
+      await finishPlanTurn(planHistory, pending.original);
+      return;
+    }
+    console.log(`${tag('plan', s.magenta)} ${s.dim('planning the confirmed refined prompt')}`);
+    await finishPlanTurn(planHistory, pending.refined, { refined: pending.refined, original: pending.original });
+  };
+
+  /** Feedback at the gate is a revision request, not a new task. */
+  const reviseRewrite = async (pending, feedback) => {
+    console.log(`${tag('rewrite', s.cyan)} ${s.dim('revising the refined prompt with your feedback')}`);
+    pending.history.push({
+      role: 'user',
+      content: `The user has not confirmed the refined prompt yet. Revise it using this feedback, keeping everything they did not object to:\n\n${feedback}\n\nOutput only the updated REFINED PROMPT block.`,
+    });
+    const result = await rewriteTurn('', pending.history);
+    if (result.interrupted) {
+      console.log(s.dim('revision stopped — the previous refined prompt is still waiting'));
+      showRefined(pending);
+      return;
+    }
+    if (!result.refined) {
+      console.log(s.dim('that revision produced no REFINED PROMPT block — the previous refined prompt is still waiting'));
+      showRefined(pending);
+      return;
+    }
+    pending.refined = result.refined;
+    pending.history = result.history;
+    showRefined(pending);
+  };
+
   async function handle(line) {
     const t = line.trim();
+    // The confirmation gate owns the keyboard until the refined prompt is
+    // accepted, revised, replaced by the original, or dropped — planning
+    // never starts from text the user has not seen.
+    if (pendingRewrite) {
+      if (t === '' || t === '/accept' || t === '/plan' || /^(y|yes)$/i.test(t)) {
+        await acceptRewrite(pendingRewrite);
+        return;
+      }
+      if (t === '/cancel' || t === '/reject' || /^(cancel|reject|n|no)$/i.test(t)) {
+        pendingRewrite = null;
+        console.log(`${tag('rewrite', s.yellow)} ${s.dim('refined prompt dropped — nothing was planned')}`);
+        return;
+      }
+      if (t === '/use-raw') {
+        await acceptRewrite(pendingRewrite, { useRaw: true });
+        return;
+      }
+      if (t === '/quit' || t === '/exit') process.exit(0);
+      if (t.startsWith('/')) {
+        console.log(s.dim('a refined prompt is waiting for confirmation — blank line, y or /accept plans with it, /use-raw plans the original, /cancel drops it, and plain text (no slash) revises it'));
+        return;
+      }
+      await reviseRewrite(pendingRewrite, t);
+      return;
+    }
     if (!t) return;
     if (t === '/quit' || t === '/exit') process.exit(0);
     if (t === '/help') { console.log(HELP); return; }
@@ -1894,17 +2113,46 @@ async function main() {
       contextWarned = false; // the new history decides whether compact mode is on
       compactMode = false;
       lastPlanFile = null;
+      pendingRewrite = null; // a refined prompt from the old context goes with it
       console.log(
         `${tag('reset', s.cyan)} conversation cleared — ${dropped} message${dropped === 1 ? '' : 's'} dropped. ` +
         `${s.dim('The next request starts fresh.')}`
       );
       return;
     }
+    if (t === '/rewrite' || t.startsWith('/rewrite ')) {
+      const rest = t.slice(8).trim();
+      if (!rest) {
+        console.log(
+          `${tag('rewrite', s.cyan)} rewrite is ${s.bold(rewriteEnabled ? 'on' : 'off')} ` +
+          s.dim(rewriteEnabled
+            ? '— every new task is refined and confirmed before planning. /rewrite off switches it off; /rewrite <task> refines one task now.'
+            : '— /rewrite <task> refines one task now; /rewrite on (or config rewrite: true) refines every task before planning.')
+        );
+        return;
+      }
+      if (/^(on|true|yes)$/i.test(rest)) {
+        rewriteEnabled = true;
+        console.log(`${tag('rewrite', s.cyan)} ${s.dim('on — new tasks are refined and confirmed before planning')}`);
+        return;
+      }
+      if (/^(off|false|no)$/i.test(rest)) {
+        rewriteEnabled = false;
+        console.log(`${tag('rewrite', s.cyan)} ${s.dim('off — new tasks go straight to planning')}`);
+        return;
+      }
+      await startRewriteTask(rest);
+      return;
+    }
     if (t === '/plan' || t.startsWith('/plan ')) {
       mode = 'plan';
       const rest = t.slice(5).trim();
+      if (!rest) {
+        console.log(`${tag('plan', s.magenta)} ${s.dim(`project read-only · plans go to ${planDir}`)}`);
+        return;
+      }
+      if (rewriteEnabled) { await startRewriteTask(rest); return; }
       console.log(`${tag('plan', s.magenta)} ${s.dim(`project read-only · plans go to ${planDir}`)}`);
-      if (!rest) return;
       await finishPlanTurn(planHistory, rest);
       return;
     }
@@ -1943,11 +2191,39 @@ async function main() {
       console.log(`${tag('plan', s.magenta)} ${s.dim('back to plan — project read-only again')}`);
       return;
     }
-    if (mode === 'plan') await finishPlanTurn(planHistory, t);
+    if (mode === 'plan') {
+      if (rewriteEnabled) { await startRewriteTask(t); return; }
+      await finishPlanTurn(planHistory, t);
+    }
   }
 
   if (opts.once) {
-    const { planFile, interrupted: stopped } = await planTurn(planHistory, opts.once);
+    // --once has no keyboard to confirm at, so a switched-on rewrite runs and
+    // the refined prompt it produced (printed here, and embedded in the plan
+    // file) is what planning receives.
+    let taskText = opts.once;
+    let rewriteContext = null;
+    if (rewriteEnabled) {
+      console.log(`${tag('rewrite', s.cyan)} ${s.dim('project read-only · refining the request before planning')}`);
+      const rewritten = await rewriteTurn(opts.once);
+      if (rewritten.interrupted) {
+        console.error(s.dim('interrupted'));
+        mcp.closeAll();
+        process.exitCode = 130;
+        return;
+      }
+      if (!rewritten.refined) {
+        console.error(s.red('rewrite did not produce REFINED PROMPT'));
+        console.error(s.dim('the reply held no REFINED PROMPT block — raise config maxTokens if it was cut off, or run again with --no-rewrite'));
+        process.exitCode = 1;
+        mcp.closeAll();
+        return;
+      }
+      taskText = rewritten.refined;
+      rewriteContext = { refined: rewritten.refined, original: opts.once };
+      console.log(`\n${tag('refined', s.cyan)} ${s.dim('--once cannot ask for confirmation, so planning uses this refined prompt:')}\n${taskText}`);
+    }
+    const { planFile, interrupted: stopped } = await planTurn(planHistory, taskText, rewriteContext);
     if (stopped) { // Ctrl+C: there is no plan to implement, so just leave
       console.error(s.dim('interrupted'));
       mcp.closeAll();
@@ -1972,16 +2248,19 @@ async function main() {
 
   // Workspace and plan directory are named separately and never overlap: the
   // project is what gets changed, the plan directory is where plans are kept.
-  console.log(`${s.bold('basic.mjs')}  ${s.dim(`model=${OPENAI.model}  mode=plan`)}`);
+  console.log(`${s.bold('basic.mjs')}  ${s.dim(`model=${OPENAI.model}  mode=plan  rewrite=${rewriteEnabled ? 'on' : 'off'}`)}`);
   console.log(`${s.dim('workspace  (the project, read-only until /implement):')} ${workspace}`);
   console.log(`${s.dim('plans      (outside the workspace):')} ${planDir}${s.dim(`  ·  context ${fmtTokens(contextSize)} tokens`)}`);
+  console.log(`${s.dim('rewrite    (before planning):')} ${rewriteEnabled ? 'on — tasks are refined, confirmed, then planned' : `off — ${s.cyan('/rewrite <task>')} refines one task`}`);
   if (lastPlanFile) {
     console.log(`${s.dim('last plan:')} ${lastPlanFile} ${s.dim(`— /implement to run it, /plans to list them`)}`);
   }
-  console.log(`${s.dim('describe the task. agent plans, then')} ${s.cyan('/implement')}${s.dim('.')}`);
+  console.log(rewriteEnabled
+    ? `${s.dim('describe the task. agent refines it, you confirm, it plans, then')} ${s.cyan('/implement')}${s.dim('.')}`
+    : `${s.dim('describe the task. agent plans, then')} ${s.cyan('/implement')}${s.dim('.')}`);
   console.log(`${s.dim('Ctrl+C stops the running turn (press twice to quit);')} ${s.cyan('/reset')} ${s.dim('clears the context.')}\n`);
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const ask = () => rl.question(`${s.cyan(`${mode}>`)} `, async (line) => {
+  const ask = () => rl.question(`${s.cyan(`${pendingRewrite ? 'confirm' : mode}>`)} `, async (line) => {
     try { await handle(line); }
     catch (e) { console.error(s.red(e.message)); }
     ask();

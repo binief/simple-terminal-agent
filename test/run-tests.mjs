@@ -704,6 +704,7 @@ async function main() {
     isReadOnlyCommand,
     readOnlyCommandExamples,
     extractImplementPrompt,
+    extractRefinedPrompt,
     createPlanState,
     normalizePlan,
     formatPlan,
@@ -813,6 +814,20 @@ async function main() {
   check('the newest block wins', block('IMPLEMENT PROMPT\n---\nfirst\n---\n\nIMPLEMENT PROMPT\n---\nsecond\n---') === 'second', block('IMPLEMENT PROMPT\n---\nfirst\n---\n\nIMPLEMENT PROMPT\n---\nsecond\n---'));
   check('an empty block is no plan', block('IMPLEMENT PROMPT\n---\n---') === null, block('IMPLEMENT PROMPT\n---\n---'));
   check('talking about the block is not the block', block('see the IMPLEMENT PROMPT above') === null && block('I will write the plan now') === null, 'prose was read as a plan');
+
+  /* The REFINED PROMPT block is the rewrite hand-off and is read with the
+   * same tolerance — and never confused with the block it precedes. */
+  const refined = (text) => extractRefinedPrompt(text);
+  check('the plain refined block is read', refined('REFINED PROMPT\n---\nGoal: x\n---') === 'Goal: x', refined('REFINED PROMPT\n---\nGoal: x\n---'));
+  check('a decorated refined marker is still the marker', [
+    '**REFINED PROMPT**\n---\nGoal: x\n---',
+    '### Rewritten prompt:\n---\nGoal: x\n---',
+    'REWRITE PROMPT\nGoal: x',
+  ].every((t) => refined(t) === 'Goal: x'), 'a heading or bold refined marker was missed');
+  check('a refined block written in an earlier reply is found', refined(['checking the workspace…', 'REFINED PROMPT\n---\nearlier\n---']) === 'earlier', 'an earlier refined block was lost');
+  check('the newest refined block wins', refined('REFINED PROMPT\n---\nfirst\n---\n\nREFINED PROMPT\n---\nsecond\n---') === 'second', 'an older refined block won');
+  check('an IMPLEMENT PROMPT is not a refined prompt (and vice versa)', refined('IMPLEMENT PROMPT\n---\nGoal: x\n---') === null && block('REFINED PROMPT\n---\nGoal: x\n---') === null, 'the two blocks were confused');
+  check('an empty refined block is no refined prompt', refined('REFINED PROMPT\n---\n---') === null && refined('I will refine that now') === null, 'prose or an empty block was read as a refined prompt');
 
   // --- the plan object ---
   check('normalizePlan keeps the steps in order', normalizePlan({ title: 't', steps: ['one', 'two'] }).steps.join('|') === 'one|two', 'reordered');

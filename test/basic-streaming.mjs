@@ -1203,6 +1203,155 @@ test('CRLF and LF files keep their own line endings through reads, searches, edi
   assert.match(result.stdout, /EOL-DONE/);
 });
 
+test('/rewrite refines before planning, waits for confirmation, revises on feedback, and embeds the refined prompt in the plan file', async () => {
+  const refinedV1 = 'Role: careful coding agent.\nGoal: inspect fixture.txt and report the greeting.';
+  const refinedV2 = 'Role: careful coding agent.\nGoal: inspect fixture.txt and report the greeting.\nVerify: quote the exact line you read.';
+  let planDirForTest;
+  const live = await interactive(({ res, body, plans }) => {
+    planDirForTest = plans;
+    startSse(res);
+    const system = body.messages[0]?.content || '';
+    const last = body.messages.at(-1)?.content || '';
+    if (system.includes('You are in REWRITE mode')) {
+      const tools = Object.fromEntries((body.tools || []).map((t) => [t.function.name, t.function.description]));
+      assert.match(tools.write_file, /REWRITE mode: only paths under \S+ may be written/);
+      if (last.includes('Revise it using this feedback')) {
+        assert.match(last, /make verification explicit/);
+        assert.ok(JSON.stringify(body.messages).includes('report the greeting.'), 'the revision kept the first refined prompt in context');
+        res.end(frame({ content: `REFINED PROMPT\n---\n${refinedV2}\n---` }, 'stop'));
+      } else {
+        assert.equal(last, 'fix the greeting thing');
+        res.end(frame({ content: `REFINED PROMPT\n---\n${refinedV1}\n---` }, 'stop'));
+      }
+      return;
+    }
+    if (system.includes('You are in PLAN mode')) {
+      // Planning received exactly the confirmed (revised) text, never the raw words.
+      assert.equal(last, refinedV2);
+      res.end(frame({ content: 'IMPLEMENT PROMPT\n---\nGoal: report the greeting in fixture.txt.\n---' }, 'stop'));
+      return;
+    }
+    // IMPLEMENT mode: the plan file it runs from opens with the refined prompt.
+    assert.match(body.messages[0].content, /^IMPLEMENT mode\./);
+    assert.ok(body.messages[0].content.includes(`# Refined prompt\n\n${refinedV2}`), body.messages[0].content);
+    assert.ok(body.messages[0].content.includes('Goal: report the greeting in fixture.txt.'), body.messages[0].content);
+    res.end(frame({ content: 'REFINED-IMPLEMENTED' }, 'stop'));
+  });
+
+  let result = null;
+  try {
+    live.send('/rewrite fix the greeting thing');
+    await live.waitNew('[refined]');
+    live.send('/implement'); // a command cannot jump the confirmation gate
+    await live.waitNew('a refined prompt is waiting for confirmation');
+    live.send('make verification explicit');
+    await live.waitNew('revising the refined prompt');
+    await live.waitNew('[refined]');
+    live.send(''); // blank line confirms
+    await live.waitNew('saved plan');
+    // The plan file itself opens with the refined prompt (no separate file).
+    const saved = fs.readdirSync(planDirForTest).filter((n) => /^plan-.*\.md$/.test(n));
+    assert.equal(saved.length, 1, saved.join(','));
+    const planText = fs.readFileSync(path.join(planDirForTest, saved[0]), 'utf8');
+    assert.ok(planText.startsWith(`# Refined prompt\n\n${refinedV2}`), planText);
+    assert.ok(planText.includes('# Original request (superseded by the refined prompt above)\n\nfix the greeting thing'), planText);
+    assert.ok(planText.includes('# Implement prompt\n\nGoal: report the greeting in fixture.txt.'), planText);
+    live.send('/implement');
+    await live.waitNew('REFINED-IMPLEMENTED');
+    result = await live.finish();
+  } finally {
+    if (!result) await live.finish().catch(() => {}); // a failed assertion must not leak the CLI
+  }
+  assert.equal(result.code, 0, result.stdout);
+  assert.equal(result.requests.length, 4, 'rewrite, revision, plan, implement');
+  assert.match(result.stdout, /\[rewrite\] project read-only/);
+  assert.match(result.stdout, /planning the confirmed refined prompt/);
+});
+
+test('config rewrite:true rewrites a --once task first, with the same read-only enforcement, and embeds it in the plan', async () => {
+  const refined = 'Role: careful coding agent.\nGoal: inspect the fixture.\nVerify: read fixture.txt.';
+  const result = await session(({ res, step, body, dir }) => {
+    startSse(res);
+    if (step === 1) {
+      assert.match(body.messages[0].content, /You are in REWRITE mode/);
+      assert.equal(body.messages.at(-1).content, 'inspect');
+      res.end(frame({ tool_calls: [
+        call('w', 'write_file', { path: 'component.ts', content: 'export const changed = true;' }, 0),
+        call('r', 'read_file', { path: 'fixture.txt' }, 1),
+      ] }, 'tool_calls'));
+    } else if (step === 2) {
+      const results = Object.fromEntries(body.messages.filter((m) => m.role === 'tool').map((m) => [m.tool_call_id, m.content]));
+      assert.match(results.w, /^error: REWRITE mode is read-only: .*component\.ts was not written/);
+      assert.match(results.r, /^file fixture\.txt/);
+      assert.equal(fs.existsSync(path.join(dir, 'component.ts')), false, 'rewrite mode must not create project files');
+      res.end(frame({ content: `REFINED PROMPT\n---\n${refined}\n---` }, 'stop'));
+    } else if (step === 3) {
+      assert.match(body.messages[0].content, /You are in PLAN mode/);
+      assert.equal(body.messages.at(-1).content, refined, 'planning received the refined prompt, not the raw task');
+      res.end(frame({ content: 'IMPLEMENT PROMPT\n---\nGoal: inspect the fixture.\n---' }, 'stop'));
+    } else {
+      assert.equal(step, 4);
+      assert.match(body.messages[0].content, /^IMPLEMENT mode\./);
+      assert.ok(body.messages[0].content.includes(`# Refined prompt\n\n${refined}`), body.messages[0].content);
+      assert.ok(body.messages[0].content.includes('# Original request (superseded by the refined prompt above)\n\ninspect'), body.messages[0].content);
+      res.end(frame({ content: 'REWRITE-ONCE-DONE' }, 'stop'));
+    }
+  }, { rewrite: true });
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.requests.length, 4, 'rewrite (2 steps), plan, implement');
+  assert.match(result.stdout, /--once cannot ask for confirmation, so planning uses this refined prompt/);
+  assert.match(result.stdout, /blocked by REWRITE mode/);
+  assert.match(result.stdout, /REWRITE-ONCE-DONE/);
+});
+
+test('/rewrite on and off switch the phase per session, and /cancel drops a refined prompt unplanned', async () => {
+  const live = await interactive(({ res, body }) => {
+    startSse(res);
+    const system = body.messages[0]?.content || '';
+    if (system.includes('You are in REWRITE mode')) {
+      res.end(frame({ content: 'REFINED PROMPT\n---\nGoal: a refined task.\n---' }, 'stop'));
+      return;
+    }
+    assert.match(system, /You are in PLAN mode/, 'with rewrite off the task goes straight to planning');
+    res.end(frame({ content: 'IMPLEMENT PROMPT\n---\nGoal: direct task.\n---' }, 'stop'));
+  });
+
+  let result = null;
+  try {
+    live.send('/rewrite');
+    await live.waitNew('rewrite is off');
+    live.send('/rewrite on');
+    await live.waitNew('on — new tasks are refined and confirmed before planning');
+    live.send('a vague task');
+    await live.waitNew('[refined]');
+    live.send('/cancel');
+    await live.waitNew('refined prompt dropped — nothing was planned');
+    live.send('/rewrite off');
+    await live.waitNew('off — new tasks go straight to planning');
+    live.send('a direct task');
+    await live.waitNew('saved plan');
+    result = await live.finish();
+  } finally {
+    if (!result) await live.finish().catch(() => {}); // a failed assertion must not leak the CLI
+  }
+  assert.equal(result.code, 0, result.stdout);
+  assert.equal(result.requests.length, 2, 'one rewrite (cancelled) and one direct plan; /rewrite on/off/cancel call no model');
+});
+
+test('--help documents the rewrite phase and its config switch', () => {
+  const r = spawnSync(process.execPath, [basic, '--help'], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /\/rewrite \[task\]/);
+  assert.match(r.stdout, /config\s+rewrite: true/);
+  assert.match(r.stdout, /--rewrite\|--no-rewrite|--rewrite/);
+});
+
+test('config rewrite must be a boolean', async () => {
+  const result = await session(({ res }) => res.end('{}'), { rewrite: 'yes' });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /config rewrite must be true or false/);
+});
+
 test('config lineEndings forces the style new files are written with', async () => {
   const result = await session(({ res, step, body, dir }) => {
     startSse(res);
