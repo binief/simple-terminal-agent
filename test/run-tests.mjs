@@ -1647,6 +1647,7 @@ async function main() {
     isContextLengthError,
     serverErrorSummary,
     oversizedToolCallNudge,
+    sanitizeAssistantToolCalls,
     smallerReplyTokenLimit,
     TOOL_CALL_PARSE_ERROR,
     CONTEXT_LENGTH_ERROR,
@@ -1681,6 +1682,24 @@ async function main() {
   check('isContextLengthError agrees with the classifier', fullWindow.every((text) => isContextLengthError(400, text)), 'disagreed');
   check('an ordinary error is not a context error', !isContextLengthError(400, 'invalid api key') && classifyApiError(400, 'upstream connect error') === null, 'false positive');
   check('a context error is not an oversized tool call', classifyApiError(400, 'maximum context length exceeded') !== TOOL_CALL_PARSE_ERROR, 'misclassified');
+  // a strict server (OpenAI-compatible) that refuses a request carrying a
+  // tool call with incomplete JSON answers 400 with this body: the harness
+  // must classify it as the oversized-retry path, not a transient failure
+  check('a 400 "invalid_tool_call_format" is classified as an oversized tool call', classifyApiError(400, '{"error":{"message":"Invalid JSON format in tool call arguments","code":"invalid_tool_call_format"}}') === TOOL_CALL_PARSE_ERROR, 'misclassified');
+
+  // transcript hygiene: a tool call whose arguments are not complete JSON must
+  // never be sent back to the server (it 400s the whole request), so the reply
+  // is repaired before it enters the history
+  const cleanMsg = { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read_file', arguments: '{"path":"a.js"}' } }] };
+  check('a clean reply is left alone by the sanitizer', sanitizeAssistantToolCalls(cleanMsg).size === 0 && cleanMsg.tool_calls[0].function.arguments === '{"path":"a.js"}', JSON.stringify(cleanMsg));
+  const cutMsg = { role: 'assistant', content: 'writing…', tool_calls: [{ id: 'c2', type: 'function', function: { name: 'write_file', arguments: '{"path":"big.txt","content":"abc' } }] };
+  const brokenCalls = sanitizeAssistantToolCalls(cutMsg);
+  check('a cut-off call takes a placeholder for the arguments', cutMsg.tool_calls[0].function.arguments === '{}', cutMsg.tool_calls[0].function.arguments);
+  check('the broken call is reported by id with its parse error', brokenCalls.has('c2') && brokenCalls.get('c2').length > 0, JSON.stringify([...brokenCalls]));
+  check('the clean parts of the reply survive the repair', cutMsg.content === 'writing…' && cutMsg.tool_calls[0].function.name === 'write_file' && cutMsg.tool_calls[0].id === 'c2', JSON.stringify(cutMsg));
+  const emptyArgs = { role: 'assistant', content: null, tool_calls: [{ id: 'c3', type: 'function', function: { name: 'list_dir', arguments: '' } }] };
+  check('an empty argument body becomes {} without being flagged', sanitizeAssistantToolCalls(emptyArgs).size === 0 && emptyArgs.tool_calls[0].function.arguments === '{}', JSON.stringify(emptyArgs));
+  check('a message without tool calls is a no-op', sanitizeAssistantToolCalls({ role: 'assistant', content: 'hi' }).size === 0 && sanitizeAssistantToolCalls(null).size === 0, 'not a no-op');
 
   const summary = serverErrorSummary(llamaBody);
   check('the error summary keeps the useful sentence', summary.startsWith('Failed to parse tool call arguments as JSON'), summary);
