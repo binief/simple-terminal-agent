@@ -687,9 +687,18 @@ when that text is already in the file. Three replies in a row of nothing but rep
 loop: the model gives its final answer with no tools offered. Separately, three steps before
 `maxSteps` the model is told to wrap up.
 
+While a turn runs, a spinner marks the background work — `thinking…` until the reply starts,
+`running <tool>…` while a tool executes, one dim line per phase when output is piped. Ctrl+C stops
+the turn on the spot and nothing keeps running behind your back: the in-flight request is cancelled,
+a command `run_command` started is killed (process tree included), and any tool calls of the same
+reply that have not run yet are answered as interrupted instead of executing after you got the
+prompt back. The conversation stays valid and can continue. A second Ctrl+C, or one while idle,
+exits.
+
 `node --test test/agentic.mjs` covers agent loading/switching, the read-only enforcement, the config
-alias, the repeat guard and loop stop, compaction that keeps tool calls with their results, and MCP
-end to end against a mock server that rejects invalid chat histories, as strict servers do.
+alias, the repeat guard and loop stop, compaction that keeps tool calls with their results, Ctrl+C
+interruption (killed commands, skipped queued calls, valid history), and MCP end to end against a
+mock server that rejects invalid chat histories, as strict servers do.
 
 ## GitHub Copilot custom agents
 

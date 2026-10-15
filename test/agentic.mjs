@@ -29,6 +29,8 @@ const agentic = path.join(repo, 'agentic.mjs');
 
 /** An insertion: new_text wraps old_text, so applying it twice duplicates the line. */
 const INSERT_B = { path: 'app.js', old_text: 'const a = 1;', new_text: 'const a = 1;\nconst b = 2;' };
+/** A command that only an interrupt (or a very patient timeout) stops — OS-neutral. */
+const SLOW_COMMAND = `${JSON.stringify(process.execPath)} -e "setTimeout(() => {}, 30000)"`;
 
 /**
  * What a strict server (OpenAI) enforces: every tool message answers a
@@ -95,6 +97,19 @@ function decide(body) {
     if (!toolMsgs.length) return { tool: { name: 'mcp_fake_add', arguments: JSON.stringify({ a: 2, b: 40 }) } };
     return { text: `MOCK-DONE add=${toolMsgs.at(-1).content}` };
   }
+  // interrupt checks: a slow command first, then a write that must never run
+  // after Ctrl+C — the second call proves queued calls are not executed.
+  if (user.includes('INTERRUPT-THEN-WRITE')) {
+    if (!toolMsgs.length) {
+      return {
+        tools: [
+          { name: 'run_command', arguments: JSON.stringify({ command: SLOW_COMMAND, timeout: 120 }) },
+          { name: 'write_file', arguments: JSON.stringify({ path: 'never-written.txt', content: 'x' }) },
+        ],
+      };
+    }
+    return { text: 'MOCK-DONE' };
+  }
   if (!toolMsgs.length) return { tool: { name: 'write_file', arguments: JSON.stringify({ path: 'hello-agentic.txt', content: 'agentic-ok' }) } };
   return { text: `MOCK-DONE wrote=${/Wrote hello-agentic\.txt/.test(toolMsgs.at(-1).content)}` };
 }
@@ -113,11 +128,16 @@ before(async () => {
         return;
       }
       const d = decide(body);
-      const msg = d.tool
-        ? { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: d.tool.name, arguments: d.tool.arguments } }] }
+      const calls = d.tools || (d.tool ? [d.tool] : null);
+      const msg = calls
+        ? {
+            role: 'assistant',
+            content: null,
+            tool_calls: calls.map((tool, i) => ({ id: `call_${i + 1}`, type: 'function', function: { name: tool.name, arguments: tool.arguments } })),
+          }
         : { role: 'assistant', content: d.text };
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ choices: [{ message: msg, finish_reason: d.tool ? 'tool_calls' : 'stop' }], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } }));
+      res.end(JSON.stringify({ choices: [{ message: msg, finish_reason: calls ? 'tool_calls' : 'stop' }], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } }));
     });
   });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -279,7 +299,7 @@ test('repeat guard: after a compaction reads may repeat but edits may not; an ap
 test('compaction never splits a tool call from its results, so the summary request and the history stay valid', async () => {
   const config = normalizeConfig({ openai: { baseURL: `http://127.0.0.1:${port}/v1`, apiKey: 'k', model: 'mock' }, streaming: false });
   const builtins = { cwd: os.tmpdir(), listTools: () => [], execute: async () => 'ok' };
-  const session = createSession({ config, builtins, mcp: null, log: () => {} });
+  const session = createSession({ config, builtins, mcp: null, log: () => {}, indicator: null });
   const call = (id, name) => ({ id, type: 'function', function: { name, arguments: '{}' } });
   session.history.push(
     { role: 'user', content: 'task' },
@@ -392,4 +412,107 @@ test('three steps before maxSteps the model is told to wrap up', async (t) => {
   const r = await run(t, ['--config', cfgPath, '--dir', ws, '--agent', 'coder', '--once', 'NEVER-DONE']);
   assert.equal(r.code, 0, r.err + r.out);
   assert.match(r.out, /MOCK-DONE wrapped-up after=7/); // maxSteps 10 in the fixture
+});
+
+/* ------------------------- interrupt (Ctrl+C) ------------------------- */
+
+test('run_command is killed when the turn signal aborts — nothing carries on in the background', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-abort-'));
+  try {
+    const tools = createTools({ workspace: dir, commandTimeout: 120 });
+    const controller = new AbortController();
+    const t0 = Date.now();
+    const running = tools.execute('run_command', { command: SLOW_COMMAND, timeout: 120 }, { signal: controller.signal });
+    setTimeout(() => controller.abort(), 400);
+    const out = await running;
+    assert.match(out, /killed \(interrupted by the user\)/, out);
+    assert.ok(Date.now() - t0 < 5000, `the command kept running for ${Date.now() - t0}ms after the abort (it sleeps 30s)`);
+    // an already-aborted signal kills the command on the spot too
+    const again = await tools.execute('run_command', { command: SLOW_COMMAND, timeout: 120 }, { signal: controller.signal });
+    assert.match(again, /interrupted/, again);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('cancel(): the running command is killed, queued tool calls of the same reply do not run, history stays valid', async (t) => {
+  const { ws, agentsDir } = fixture(t);
+  const config = normalizeConfig({
+    openai: { baseURL: `http://127.0.0.1:${port}/v1`, apiKey: 'k', model: 'mock' },
+    streaming: false,
+    workspace: ws,
+    commandTimeout: 120,
+  });
+  const builtins = createTools(config);
+  const { agents } = loadAgents(agentsDir);
+  const session = createSession({ config, builtins, mcp: null, agents, agent: agents[0], log: () => {}, indicator: null });
+
+  const t0 = Date.now();
+  const turning = session.turn('INTERRUPT-THEN-WRITE');
+  await new Promise((r) => setTimeout(r, 800)); // let the slow command start
+  assert.equal(session.busy, true);
+  session.cancel();
+  const out = await turning;
+
+  assert.ok(Date.now() - t0 < 10000, `the turn took ${Date.now() - t0}ms to stop (the command sleeps 30s)`);
+  assert.equal(out.interrupted, true);
+  assert.equal(session.busy, false);
+  assert.ok(!fs.existsSync(path.join(ws, 'never-written.txt')), 'the queued write_file ran after Ctrl+C');
+  // every call of the interrupted reply got an answer, so the history is valid chat
+  assert.equal(historyError(session.history), null);
+  const results = session.history.filter((m) => m.role === 'tool');
+  assert.equal(results.length, 2);
+  assert.match(results[0].content, /interrupted/);
+  assert.match(results[1].content, /interrupted by Ctrl\+C/);
+  // and the session keeps working: the next prompt proves the history is a valid request
+  const next = await session.turn('PROBE-TOOLS');
+  assert.match(next.text, /MOCK-DONE tools=/);
+});
+
+test('--once + Ctrl+C: the turn stops, its command dies with it, exit code is 130', async (t) => {
+  const { ws, cfgPath } = fixture(t);
+  const t0 = Date.now();
+  const child = spawn(process.execPath, [agentic, '--config', cfgPath, '--dir', ws, '--agent', 'coder', '--once', 'INTERRUPT-THEN-WRITE'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let out = '';
+  let err = '';
+  child.stdout.on('data', (d) => (out += d));
+  child.stderr.on('data', (d) => (err += d));
+  // wait until the tool call is underway, then interrupt
+  for (let i = 0; i < 100 && !out.includes('⚙'); i++) await new Promise((r) => setTimeout(r, 100));
+  assert.ok(out.includes('⚙'), `the turn never started a tool call:\n${out}\n${err}`);
+  child.kill('SIGINT');
+  const code = await new Promise((resolve) => child.on('close', resolve));
+  t.after(() => child.kill('SIGKILL'));
+  assert.ok(Date.now() - t0 < 15000, `kept running for ${Date.now() - t0}ms after SIGINT`);
+  assert.equal(code, 130, out + err);
+  assert.match(out + err, /interrupted/);
+  assert.ok(!fs.existsSync(path.join(ws, 'never-written.txt')), 'the queued write_file ran after Ctrl+C');
+});
+
+test('interactive Ctrl+C returns to the prompt with no work left running — and the next task runs', async (t) => {
+  const { ws, cfgPath } = fixture(t);
+  const t0 = Date.now();
+  const child = spawn(process.execPath, [agentic, '--config', cfgPath, '--dir', ws, '--agent', 'coder'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let out = '';
+  let err = '';
+  child.stdout.on('data', (d) => (out += d));
+  child.stderr.on('data', (d) => (err += d));
+  t.after(() => child.kill('SIGKILL'));
+  child.stdin.write('INTERRUPT-THEN-WRITE\n');
+  for (let i = 0; i < 100 && !out.includes('⚙'); i++) await new Promise((r) => setTimeout(r, 100));
+  assert.ok(out.includes('⚙'), `the turn never started a tool call:\n${out}\n${err}`);
+  child.kill('SIGINT');
+  for (let i = 0; i < 100 && !out.includes('turn interrupted'); i++) await new Promise((r) => setTimeout(r, 100));
+  assert.ok(out.includes('turn interrupted'), `no interrupt note:\n${out}\n${err}`);
+  assert.ok(Date.now() - t0 < 15000, `still busy ${Date.now() - t0}ms after SIGINT`);
+  assert.ok(!fs.existsSync(path.join(ws, 'never-written.txt')), 'the queued write_file ran after Ctrl+C');
+  // back at the prompt: a follow-up task runs (and the history passed the mock's strict chat check)
+  child.stdin.write('PROBE-TOOLS\n/quit\n');
+  const code = await new Promise((resolve) => child.on('close', resolve));
+  assert.equal(code, 0, out + err);
+  assert.match(out + err, /MOCK-DONE tools=/);
 });
