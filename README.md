@@ -671,9 +671,25 @@ Config is one optional JSON file (`--config`, `AGENTIC_CONFIG`, `./agentic.confi
 `contextSize` (alias `maxContext`), `maxTokens`, `maxSteps`, `temperature`, `streaming`, `workspace`,
 `shell`, `lineEndings`, `searchIgnore`, `commandTimeout`, `autoCompact`, `promptStyle`,
 `instructions`, `agentsDir`, `agent`, and `mcp: { servers: { … } }` (stdio or HTTP, as below).
-History is auto-compacted at 90% of the context budget; `/compact`, `/reset`, `/tools` and `/config`
-work interactively. `node --test test/agentic.mjs` covers agent loading/switching, the read-only
-enforcement, the config alias, and MCP end to end against a mock server.
+History is auto-compacted at 90% of the context budget — the newest messages stay verbatim, and a
+tool call is never separated from its results; `/compact`, `/reset`, `/tools` and `/config` work
+interactively.
+
+A turn ends when the model replies without calling a tool, and every agent's system prompt says so.
+A model that keeps going after the work is done (re-reading the file it just edited, re-applying the
+same edit, re-running the same check) is caught by a repeat guard. A call identical to one already
+made in the turn (same tool, same arguments) is not executed again while nothing has changed since,
+so an edit is never applied twice. What counts as a change: for the file tools, the file's content;
+for everything else, any write, MCP call or state-changing command. The model gets a note saying the
+work is already done (`↺ not run again` in the log). MCP calls are never skipped, and a failed
+command gets one identical retry. An edit that only inserts text is also refused in a later turn
+when that text is already in the file. Three replies in a row of nothing but repeats stop the tool
+loop: the model gives its final answer with no tools offered. Separately, three steps before
+`maxSteps` the model is told to wrap up.
+
+`node --test test/agentic.mjs` covers agent loading/switching, the read-only enforcement, the config
+alias, the repeat guard and loop stop, compaction that keeps tool calls with their results, and MCP
+end to end against a mock server that rejects invalid chat histories, as strict servers do.
 
 ## GitHub Copilot custom agents
 
