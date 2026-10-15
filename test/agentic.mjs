@@ -93,6 +93,28 @@ function decide(body) {
     if (!toolMsgs.length) return { tool: { name: 'write_file', arguments: JSON.stringify({ path: 'nope.txt', content: 'x' }) } };
     return { text: `MOCK-DONE refused=${/not available to agent/.test(toolMsgs.at(-1).content)}` };
   }
+  // a write_file whose arguments hit the token limit mid-JSON (finish_reason
+  // "length"): it must not be executed and must not poison the history — the
+  // strict mock server refuses the next request with the real 400 otherwise
+  if (user.includes('CUT-OFF-TOOL')) {
+    if (!toolMsgs.length) {
+      return { tool: { name: 'write_file', arguments: '{"path":"cut-off.txt","content":"cut he' }, finish_reason: 'length' };
+    }
+    if (/cut off by the \d+-token reply limit/.test(lastTool)) {
+      return { tool: { name: 'write_file', arguments: JSON.stringify({ path: 'cut-off.txt', content: 'recovered' }) } };
+    }
+    return { text: 'MOCK-DONE cut-off-recovered' };
+  }
+  // a model that simply generates broken JSON (no truncation involved)
+  if (user.includes('BAD-JSON-TOOL')) {
+    if (!toolMsgs.length) {
+      return { tool: { name: 'write_file', arguments: '{"path":"bad.txt","content":"unterminated' } };
+    }
+    if (/invalid tool arguments JSON/.test(lastTool)) {
+      return { tool: { name: 'write_file', arguments: JSON.stringify({ path: 'bad.txt', content: 'recovered' }) } };
+    }
+    return { text: 'MOCK-DONE bad-json-recovered' };
+  }
   if (user.includes('ADD-MCP')) {
     if (!toolMsgs.length) return { tool: { name: 'mcp_fake_add', arguments: JSON.stringify({ a: 2, b: 40 }) } };
     return { text: `MOCK-DONE add=${toolMsgs.at(-1).content}` };
@@ -121,6 +143,20 @@ before(async () => {
     req.on('data', (d) => (raw += d));
     req.on('end', () => {
       const body = JSON.parse(raw || '{}');
+      // a strict server (OpenAI) also refuses a request whose history carries
+      // a tool call whose arguments are not complete JSON — the harness must
+      // never send one back, so it answers the way the real server does
+      for (const m of body.messages || []) {
+        if (m.role !== 'assistant' || !m.tool_calls?.length) continue;
+        for (const tc of m.tool_calls) {
+          try { JSON.parse(tc.function?.arguments ?? ''); }
+          catch {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: { message: 'Invalid JSON format in tool call arguments', code: 'invalid_tool_call_format' } }));
+            return;
+          }
+        }
+      }
       const invalid = historyError(body.messages || []);
       if (invalid) {
         res.writeHead(400, { 'content-type': 'application/json' });
@@ -137,7 +173,7 @@ before(async () => {
           }
         : { role: 'assistant', content: d.text };
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ choices: [{ message: msg, finish_reason: calls ? 'tool_calls' : 'stop' }], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } }));
+      res.end(JSON.stringify({ choices: [{ message: msg, finish_reason: d.finish_reason || (calls ? 'tool_calls' : 'stop') }], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } }));
     });
   });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -347,6 +383,30 @@ test('a read-only agent is offered no writers, and a stray write call is refused
   const attempt = await run(t, ['--config', cfgPath, '--dir', ws, '--agent', 'researcher', '--once', 'TRY-WRITE']);
   assert.match(attempt.out, /MOCK-DONE refused=true/);
   assert.ok(!fs.existsSync(path.join(ws, 'nope.txt')));
+});
+
+test('a tool call cut off by the token limit does not poison the history: the turn recovers', async (t) => {
+  const { ws, cfgPath } = fixture(t);
+  const r = await run(t, ['--config', cfgPath, '--dir', ws, '--agent', 'coder', '--once', 'CUT-OFF-TOOL please']);
+  assert.equal(r.code, 0, r.err + r.out);
+  // the cut-off is reported as a limit problem, with the smaller cap for the next reply
+  assert.match(r.out, /cut off by the 1024-token reply limit/);
+  assert.match(r.out, /capped at 512 tokens/);
+  // a request carrying the broken call would have been refused by the strict mock
+  assert.doesNotMatch(r.out, /API error|invalid_tool_call_format/);
+  // the model re-issued a complete call and the turn finished
+  assert.match(r.out, /MOCK-DONE cut-off-recovered/);
+  assert.equal(fs.readFileSync(path.join(ws, 'cut-off.txt'), 'utf8'), 'recovered');
+});
+
+test('a tool call with broken JSON (no truncation) does not poison the history either', async (t) => {
+  const { ws, cfgPath } = fixture(t);
+  const r = await run(t, ['--config', cfgPath, '--dir', ws, '--agent', 'coder', '--once', 'BAD-JSON-TOOL please']);
+  assert.equal(r.code, 0, r.err + r.out);
+  assert.match(r.out, /invalid tool arguments JSON/);
+  assert.doesNotMatch(r.out, /API error|invalid_tool_call_format/);
+  assert.match(r.out, /MOCK-DONE bad-json-recovered/);
+  assert.equal(fs.readFileSync(path.join(ws, 'bad.txt'), 'utf8'), 'recovered');
 });
 
 test('MCP servers from the config are exposed as mcp_<server>_<tool>', async (t) => {

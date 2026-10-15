@@ -379,6 +379,20 @@ const server = http.createServer((req, res) => {
       res.end('bad json');
       return;
     }
+    // A strict server (OpenAI) also refuses a request whose history carries a
+    // tool call whose arguments are not complete JSON — the harness must never
+    // send one back, so the mock enforces it the same way.
+    for (const m of body.messages || []) {
+      if (m.role !== 'assistant' || !m.tool_calls?.length) continue;
+      for (const tc of m.tool_calls) {
+        try { JSON.parse(tc.function?.arguments ?? ''); }
+        catch {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'Invalid JSON format in tool call arguments', code: 'invalid_tool_call_format' } }));
+          return;
+        }
+      }
+    }
     const userText = (body.messages || []).filter((m) => m.role === 'user').map((m) => m.content).join(' ');
     if (userText.includes('RETRY-ME') && retryArmed) {
       retryArmed = false;

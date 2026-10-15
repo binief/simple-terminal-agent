@@ -105,6 +105,7 @@ import {
   chatCompletion,
   estimatePromptTokens,
   oversizedToolCallNudge,
+  sanitizeAssistantToolCalls,
   smallerReplyTokenLimit,
   TOOL_CALL_PARSE_ERROR,
 } from './lib/llm.js';
@@ -881,6 +882,15 @@ export function createSession({ config, builtins, mcp, agents = [], agent = null
           throw e;
         }
         const msg = result.message;
+        // A tool call whose arguments are not complete JSON — cut off by the
+        // token limit, or generated broken — must never go back to the
+        // server: strict OpenAI-compatible servers refuse the whole request
+        // while the transcript carries it (HTTP 400 "invalid tool call
+        // format"), so every following step would fail the same way no
+        // matter what the model replies. Each such call is answered with an
+        // error below; in the history it keeps its id and name, with a
+        // placeholder for the arguments.
+        const brokenCalls = sanitizeAssistantToolCalls(msg);
         history.push(msg);
         steps++;
         stats.steps++;
@@ -914,17 +924,32 @@ export function createSession({ config, builtins, mcp, agents = [], agent = null
         let repeated = 0;
         for (const tc of toolCalls) {
           const name = tc.function?.name || '(unknown)';
-          let args = {};
-          let parseError = null;
-          try { args = JSON.parse(tc.function?.arguments || '{}'); }
-          catch (e) { parseError = e; }
+          // A call the sanitizer repaired above: its arguments are the
+          // placeholder now, and the recorded parse error drives the note.
+          const parseError = brokenCalls.get(tc.id) || null;
+          const args = JSON.parse(tc.function?.arguments || '{}');
           log(`\n${s.dim('──')} ${s.cyan('⚙ ' + name)} ${s.dim(JSON.stringify(args).slice(0, 160))}`);
           let output;
           let skipped = '';
           if (parseError) {
-            output = truncated
-              ? 'Error: this tool call was cut off by the model token limit before its arguments were complete. Re-issue the complete tool call.'
-              : `Error: invalid tool arguments JSON: ${parseError.message}`;
+            if (truncated) {
+              // The reply hit the token limit mid-JSON: re-issuing the call
+              // as it was hits the same wall. Lower the cap for the rest of
+              // the turn (as the server-reject path does) and tell the model
+              // to split the work instead of re-issuing the whole call.
+              const limit = replyLimit;
+              const smaller = smallerReplyTokenLimit(limit);
+              replyLimit = Math.min(limit, smaller);
+              output =
+                `Error: this tool call was cut off by the ${limit}-token reply limit before its arguments were complete — nothing ran. ` +
+                (smaller < limit
+                  ? `Do not re-issue it as it was: the next reply is capped at ${smaller} tokens. `
+                  : 'Do not re-issue it as it was: the reply cap is already at its minimum. ') +
+                'For a large file, write_file the first section only and append the following sections one edit_file per reply; ' +
+                'for a change to an existing file, use targeted edit_file calls.';
+            } else {
+              output = `Error: invalid tool arguments JSON: ${parseError} — nothing ran. Re-issue the tool call with valid, properly escaped JSON arguments.`;
+            }
           } else if (controller.signal.aborted) {
             // Ctrl+C mid-batch: the turn is already over. The call still gets a
             // result — an unanswered tool call would make the history an invalid
