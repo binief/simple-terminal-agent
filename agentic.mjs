@@ -84,8 +84,13 @@
  *   stop the tool loop, and the model gives its final answer with no tools
  *   offered. Three steps before maxSteps it is told to wrap up.
  *
- * Ctrl+C interrupts the running turn (request + running commands' agent
- * loop) and returns to the prompt; a second press, or one while idle, exits.
+ * Ctrl+C stops the running turn and returns to the prompt at once: the
+ * in-flight request is cancelled, a command run_command started is killed
+ * (process tree included), and any tool calls of the same reply that have not
+ * run yet are answered as interrupted instead of running after the interrupt.
+ * A second press in quick succession, or one while idle, exits. While the
+ * model is thinking or a tool is running, a spinner shows the work (one dim
+ * line per phase when output is piped).
  */
 
 import crypto from 'node:crypto';
@@ -107,7 +112,7 @@ import { connectMcpServers } from './lib/mcp.js';
 import { isReadOnlyCommand } from './lib/plan.js';
 import { buildSystemPrompt, gitInfo } from './lib/prompt.js';
 import { createTools, expandHome, normalizeEol, shellInfo, TOOL_LIMITS } from './lib/tools.js';
-import { fmtDuration, fmtTokens, s } from './lib/ui.js';
+import { fmtDuration, fmtTokens, s, spinner } from './lib/ui.js';
 
 /* ------------------------------- defaults -------------------------------- */
 
@@ -151,6 +156,11 @@ const WRAP_UP_LEFT = 3;
 /** Replies in a row made of nothing but repeated calls before the tool loop is stopped. */
 const REPEAT_STREAK_LIMIT = 3;
 const TOOL_RESULT_CAP = TOOL_LIMITS.toolResultCap;
+/** Tool result for a call the user interrupted before it ran (Ctrl+C mid-batch). */
+const INTERRUPTED_TOOL_NOTE =
+  'Error: interrupted by Ctrl+C — the turn was stopped before this call could run.';
+/** A progress indicator that does nothing (sessions with indicators turned off). */
+const NO_INDICATOR = () => ({ stop() {}, update() {}, elapsedMs: () => 0 });
 
 /* --------------------------- frontmatter parsing -------------------------- */
 
@@ -688,8 +698,13 @@ export function compactionCut(history, keep = COMPACT_KEEP) {
  * Switching replaces the system prompt in place and notes the switch in the
  * history, so one conversation can be researched by one agent and built by
  * another — the .md files are the only difference between them.
+ *
+ * `indicator(label)` builds the progress display shown while the model or a
+ * tool is working (default: the ui spinner; pass `indicator: null` for none —
+ * tests and quiet embedders are not forced to watch it).
  */
-export function createSession({ config, builtins, mcp, agents = [], agent = null, log = console.log }) {
+export function createSession({ config, builtins, mcp, agents = [], agent = null, log = console.log, indicator = spinner }) {
+  const progress = indicator || NO_INDICATOR;
   const history = [];
   let current = agent || agents[0] || null;
   let activeController = null;
@@ -721,7 +736,9 @@ export function createSession({ config, builtins, mcp, agents = [], agent = null
     if (current && BUILTIN_TOOL_NAMES.includes(name) && !current.tools.builtins.includes(name)) {
       return `Error: the ${name} tool is not available to agent "${current.name}" (tools: ${current.tools.builtins.join(', ') || 'none'})`;
     }
-    return builtins.execute(name, args, { readOnly: current?.tools.readOnly === true });
+    // The turn's signal goes down with the call: run_command kills the
+    // command tree on Ctrl+C instead of letting it run on in the background.
+    return builtins.execute(name, args, { readOnly: current?.tools.readOnly === true, signal: activeController?.signal });
   }
 
   function reset() {
@@ -753,7 +770,13 @@ export function createSession({ config, builtins, mcp, agents = [], agent = null
     if (!middle.length) return false;
     const head = history[0];
     const request = [head, ...middle, { role: 'user', content: COMPACT_PROMPT }];
-    const result = await chatCompletion({ config: llmConfig(), messages: request, tools: [], maxTokens: 1500, signal });
+    const compacting = progress('compacting conversation…');
+    let result;
+    try {
+      result = await chatCompletion({ config: llmConfig(), messages: request, tools: [], maxTokens: 1500, signal });
+    } finally {
+      compacting.stop();
+    }
     const summary = String(result.message?.content || '').trim();
     if (!summary) return false;
     const rebuilt = [head, { role: 'user', content: `${COMPACT_SUMMARY_PREFIX}\n${summary}` }, ...history.slice(cut)];
@@ -787,11 +810,18 @@ export function createSession({ config, builtins, mcp, agents = [], agent = null
     let finishing = false; // the tool loop was stopped: one last reply, without tools
     let wrapUpSent = false;
     const started = Date.now();
+    /** Every way out of an interrupted turn says the same thing, once. */
+    const interrupted = () => {
+      log(s.yellow('  · turn interrupted — the conversation is intact; refine the task or say "continue"'));
+      return { text: '', steps, interrupted: true };
+    };
     try {
       // While finishing, the loop may go one request past maxSteps: the final
       // answer is what the user is waiting for, and a reply requested without
       // tools always ends the turn.
       while (steps < st.maxSteps || finishing) {
+        // Ctrl+C between steps: do not start another request — and no compacting either.
+        if (controller.signal.aborted) return interrupted();
         // Context budget: compact before the request no longer fits.
         if (config.autoCompact && estimatePromptTokens(history) >= COMPACT_AT * (config.contextSize - replyLimit)) {
           try {
@@ -813,14 +843,21 @@ export function createSession({ config, builtins, mcp, agents = [], agent = null
         let result;
         try {
           let streamed = '';
-          result = await chatCompletion({
-            config: llmConfig(),
-            messages: history,
-            tools: finishing ? [] : offeredTools(),
-            maxTokens: replyLimit,
-            signal: controller.signal,
-            onDelta: onText ? (t) => { streamed += t; onText(t); } : undefined,
-          });
+          // Up until the first token (or the reply, non-streaming), so a slow
+          // model reads as work in progress, not a hung prompt.
+          const waiting = progress('thinking…');
+          try {
+            result = await chatCompletion({
+              config: llmConfig(),
+              messages: history,
+              tools: finishing ? [] : offeredTools(),
+              maxTokens: replyLimit,
+              signal: controller.signal,
+              onDelta: onText ? (t) => { streamed += t; waiting.stop(); onText(t); } : undefined,
+            });
+          } finally {
+            waiting.stop();
+          }
           if (result.usage) {
             calibrateTokens(history, result.usage.prompt_tokens);
             stats.promptTokens += Number(result.usage.prompt_tokens) || 0;
@@ -828,7 +865,7 @@ export function createSession({ config, builtins, mcp, agents = [], agent = null
           }
           stats.calls++;
         } catch (e) {
-          if (controller.signal.aborted || e?.name === 'AbortError') return { text: '', steps, interrupted: true };
+          if (controller.signal.aborted || e?.name === 'AbortError') return interrupted();
           if (e?.kind === TOOL_CALL_PARSE_ERROR && oversizedRetries < MAX_OVERSIZED_RETRIES) {
             oversizedRetries++;
             const smaller = smallerReplyTokenLimit(replyLimit);
@@ -888,17 +925,31 @@ export function createSession({ config, builtins, mcp, agents = [], agent = null
             output = truncated
               ? 'Error: this tool call was cut off by the model token limit before its arguments were complete. Re-issue the complete tool call.'
               : `Error: invalid tool arguments JSON: ${parseError.message}`;
+          } else if (controller.signal.aborted) {
+            // Ctrl+C mid-batch: the turn is already over. The call still gets a
+            // result — an unanswered tool call would make the history an invalid
+            // transcript — but nothing else runs after the interrupt.
+            output = INTERRUPTED_TOOL_NOTE;
+            skipped = 'not run: interrupted (Ctrl+C)';
           } else {
-            const done = await guard.run(name, args, () => executeTool(name, args), { step: steps });
-            output = done.output;
-            if (done.repeated) { repeated++; skipped = done.reason; }
+            const running = progress(`running ${name}…`);
+            try {
+              const done = await guard.run(name, args, () => executeTool(name, args), { step: steps });
+              output = done.output;
+              if (done.repeated) { repeated++; skipped = `not run again: ${done.reason}`; }
+            } finally {
+              running.stop();
+            }
           }
           if (String(output).length > TOOL_RESULT_CAP) {
             output = String(output).slice(0, TOOL_RESULT_CAP) + `\n…[truncated at ${TOOL_RESULT_CAP} chars]`;
           }
-          log(skipped ? s.yellow(`↺ not run again: ${skipped}`) : s.dim(String(output).split('\n').slice(0, 6).join('\n')));
+          log(skipped ? s.yellow(`↺ ${skipped}`) : s.dim(String(output).split('\n').slice(0, 6).join('\n')));
           history.push({ role: 'tool', tool_call_id: tc.id, content: String(output) });
         }
+        // The interrupt landed inside this batch (the request was aborted or a
+        // command killed): the turn ends here, with every tool call answered.
+        if (controller.signal.aborted) return interrupted();
         // A reply that only repeated finished work made no progress. A few in
         // a row and the model is not going to stop by itself, notes or not:
         // take the tools away and ask for the final answer.
@@ -927,6 +978,8 @@ export function createSession({ config, builtins, mcp, agents = [], agent = null
     history,
     stats: () => ({ ...stats }),
     get agent() { return current; },
+    /** A turn is running and can still be interrupted (its request is in flight or its tools are working). */
+    get busy() { return activeController !== null; },
     cancel() { activeController?.abort(); },
   };
 }
@@ -1085,6 +1138,28 @@ async function main() {
   const mcp = await connectMcpServers(config.mcp, { onLog: (level, msg) => console.error(level === 'error' ? s.red(msg) : s.dim(msg)) });
   const session = createSession({ config, builtins, mcp, agents, agent: startAgent });
 
+  /* Ctrl+C must stop the work, not merely the waiting. The first press aborts
+   * the running turn — the in-flight request is cancelled and run_command
+   * kills the command tree — so the prompt comes right back and nothing keeps
+   * running in the background. A press while idle, or a second one close
+   * behind, exits. (On a TTY readline emits 'SIGINT'; elsewhere the signal
+   * arrives at the process — exactly one of the two routes fires per press.) */
+  let lastInterruptAt = 0;
+  const onInterrupt = () => {
+    const now = Date.now();
+    const second = now - lastInterruptAt < 2000;
+    lastInterruptAt = now;
+    if (second) { mcp.closeAll(); process.exit(130); }
+    if (session.busy) {
+      console.log(`\n${s.yellow('^C')} ${s.dim('stopping the current turn — the request and any command it started (Ctrl+C again to quit)')}`);
+      session.cancel();
+      return;
+    }
+    mcp.closeAll();
+    process.exit(0);
+  };
+  process.on('SIGINT', onInterrupt);
+
   let prompt = opts.once || '';
   if (opts.promptFile) {
     const file = path.resolve(cwd, expandHome(opts.promptFile));
@@ -1117,19 +1192,10 @@ async function main() {
   if (configPath) console.log(`${s.dim('config:')}    ${configPath}`);
   console.log(s.dim('type a task, /agents to list agents, /help for commands. Ctrl+C stops a turn.\n'));
 
-  let lastInterruptAt = 0;
+  // readline reports terminal Ctrl+C as 'SIGINT' itself; piped stdin reaches
+  // the process handler registered above — both fire the same onInterrupt.
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const onInterrupt = () => {
-    const now = Date.now();
-    const second = now - lastInterruptAt < 2000;
-    lastInterruptAt = now;
-    // A turn is running if a controller exists; session.cancel() is a no-op otherwise.
-    session.cancel();
-    if (second) { mcp.closeAll(); process.exit(0); }
-    if (!process.stdin.isTTY) { /* piped input: one Ctrl+C from the process is a quit */ }
-  };
   rl.on('SIGINT', onInterrupt);
-  process.on('SIGINT', () => { if (!process.stdin.isTTY) { session.cancel(); mcp.closeAll(); process.exit(130); } });
 
   // 'line' events (not rl.question recursion) so piped stdin is processed
   // line by line too: each line is chained behind the previous turn, and the
