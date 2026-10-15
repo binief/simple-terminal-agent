@@ -69,14 +69,26 @@
  * Context
  *   History is measured before every request against contextSize/maxContext.
  *   At >= 90% it is compacted automatically (config autoCompact): the model
- *   summarizes it and the originals are dropped; a request the server refuses
- *   for being too long is compacted and retried once. /compact does it on
- *   demand, /reset drops the conversation.
+ *   summarizes it and the originals are dropped — the newest messages are
+ *   kept verbatim, never splitting a tool call from its results; a request
+ *   the server refuses for being too long is compacted and retried once.
+ *   /compact does it on demand, /reset drops the conversation.
+ *
+ * Loops
+ *   A turn ends when the model replies without calling a tool. A call that is
+ *   identical to one already made in the turn — same tool, same arguments —
+ *   is not executed again while nothing has changed since (the file's content
+ *   for the file tools; no write, MCP call or state-changing command for the
+ *   rest): the model is told the work is already done instead, so an edit is
+ *   never applied twice. Three replies in a row of nothing but such repeats
+ *   stop the tool loop, and the model gives its final answer with no tools
+ *   offered. Three steps before maxSteps it is told to wrap up.
  *
  * Ctrl+C interrupts the running turn (request + running commands' agent
  * loop) and returns to the prompt; a second press, or one while idle, exits.
  */
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -92,8 +104,9 @@ import {
   TOOL_CALL_PARSE_ERROR,
 } from './lib/llm.js';
 import { connectMcpServers } from './lib/mcp.js';
+import { isReadOnlyCommand } from './lib/plan.js';
 import { buildSystemPrompt, gitInfo } from './lib/prompt.js';
-import { createTools, expandHome, shellInfo, TOOL_LIMITS } from './lib/tools.js';
+import { createTools, expandHome, normalizeEol, shellInfo, TOOL_LIMITS } from './lib/tools.js';
 import { fmtDuration, fmtTokens, s } from './lib/ui.js';
 
 /* ------------------------------- defaults -------------------------------- */
@@ -119,10 +132,24 @@ export const DEFAULT_CONFIG = {
 };
 
 const COMPACT_AT = 0.9;
+/** Trailing messages a compaction keeps verbatim (more when that would split a tool call from its results). */
+const COMPACT_KEEP = 4;
 export const COMPACT_TAG = '[agentic compaction request]';
+const COMPACT_PROMPT =
+  `${COMPACT_TAG}\nSummarize this session so work can continue without the earlier messages. ` +
+  'Include the current request, files inspected/changed, commands and results, decisions and anything pending. ' +
+  'Say plainly which changes are already applied and verified, so they are not redone. ' +
+  'Concise bullet points, no preamble. Do not call tools.';
+const COMPACT_SUMMARY_PREFIX =
+  'Earlier in this session (compacted summary — the raw messages were dropped to free context; ' +
+  'work it lists as done is already applied, do not redo it):';
 const CONTINUE_TAG = '[continue]';
 const MAX_CONTINUATIONS = 6;
 const MAX_OVERSIZED_RETRIES = 3;
+/** Steps before maxSteps at which the model is told to wrap the task up (as in lib/agent.js). */
+const WRAP_UP_LEFT = 3;
+/** Replies in a row made of nothing but repeated calls before the tool loop is stopped. */
+const REPEAT_STREAK_LIMIT = 3;
 const TOOL_RESULT_CAP = TOOL_LIMITS.toolResultCap;
 
 /* --------------------------- frontmatter parsing -------------------------- */
@@ -370,10 +397,24 @@ function resolveInstructions(instructions, cwd) {
 }
 
 /**
+ * How a turn ends. These are facts about this harness, not agent persona, so
+ * every agent gets them — `promptMode: replace` included, like the env block:
+ * a model that does not know the loop only ends on a reply without tool calls
+ * keeps "verifying" finished work until maxSteps.
+ */
+export const TURN_RULES = [
+  '# Ending the turn',
+  '- The turn ends when you reply without calling a tool. Once the request is done and verified, stop calling tools and give your final summary.',
+  '- A successful tool result is the confirmation: do not re-read, re-apply or re-run work that already succeeded. ' +
+    'An identical call made again with nothing changed since is not executed — you get a note instead, and repeating anyway ends the tool loop.',
+].join('\n');
+
+/**
  * The system prompt for an agent: the shared coding-harness prompt (env,
- * tool discipline, definition of done) with the agent file's body appended —
- * last, so the agent wins on conflict — unless the agent asks for
- * `promptMode: replace`, in which case its body IS the prompt (plus env).
+ * tool discipline, definition of done) and the turn rules, with the agent
+ * file's body appended — last, so the agent wins on conflict — unless the
+ * agent asks for `promptMode: replace`, in which case its body IS the prompt
+ * (plus env and the turn rules).
  */
 export function buildAgentSystemPrompt({ config, agent, cwd }) {
   const body = String(agent?.body || '').trim();
@@ -388,7 +429,7 @@ export function buildAgentSystemPrompt({ config, agent, cwd }) {
     const git = gitInfo(cwd);
     if (git) env.push(`- Git: ${git}`);
     const extra = resolveInstructions(config.instructions, cwd);
-    return [body, env.join('\n'), extra ? `# User instructions\n${extra}` : ''].filter(Boolean).join('\n\n');
+    return [body, env.join('\n'), TURN_RULES, extra ? `# User instructions\n${extra}` : ''].filter(Boolean).join('\n\n');
   }
   return buildSystemPrompt({
     cwd,
@@ -396,7 +437,7 @@ export function buildAgentSystemPrompt({ config, agent, cwd }) {
     git: gitInfo(cwd),
     style: config.promptStyle,
     instructions: resolveInstructions(config.instructions, cwd),
-    blocks: [[header, body].filter(Boolean).join('\n\n')],
+    blocks: [TURN_RULES, [header, body].filter(Boolean).join('\n\n')],
   });
 }
 
@@ -410,6 +451,234 @@ export function effectiveSettings(config, agent) {
     maxTokens: Math.max(256, Math.floor(num(d.maxTokens, config.maxTokens))),
     maxSteps: Math.min(1000, Math.floor(num(d.maxSteps, config.maxSteps))),
   };
+}
+
+/* ------------------------------ repeat guard ------------------------------ */
+
+/*
+ * A model that has finished does not always stop. It re-reads the file it
+ * just edited, applies the same edit again, re-runs the same check — and the
+ * loop only ends at maxSteps. That is not only wasted steps: an edit whose
+ * new_text contains its old_text (an insertion) applies cleanly every time,
+ * so each round duplicates the change in the file.
+ *
+ * The guard sits between the model and the tools. A call identical to one
+ * already made in this turn — same tool, same arguments — is not executed
+ * again while nothing has changed since: its result would be the same, or,
+ * for a write, the work is already in place. The model gets a note saying so
+ * instead. "Nothing has changed" is measured on the file itself for the file
+ * tools (a hash of its content, so an unrelated `npm test` in between does
+ * not re-arm an edit), and with a change counter for the rest: it moves on
+ * every write that changed a file, every MCP call and every command that ran
+ * and is not read-only. MCP calls are never refused — their side effects are
+ * unknown, so repeating one may be the point — and a command that ran and
+ * failed gets one identical retry, because failures can be transient.
+ */
+
+/** Opens every note the guard sends back, and the nudge that ends a stuck loop. */
+export const REPEAT_TAG = '[repeated call]';
+
+const stopRepeatingNudge = (n) =>
+  `[system] ${REPEAT_TAG} Stopping the tool loop: your last ${n} replies only repeated tool calls that had already run, ` +
+  'with nothing changed in between — that work is already done. No tools are available for the rest of this turn. ' +
+  'Reply now with your final answer: what was changed, how it was verified, and anything still left to do.';
+const STOPPED_REPEATING =
+  '(stopped: the model kept repeating tool calls that had already run — the work above is already in place)';
+
+const FILE_TOOLS = new Set(['read_file', 'write_file', 'edit_file']);
+const WRITE_TOOLS = new Set(['write_file', 'edit_file']);
+const NEXT_STEP =
+  'Do not repeat it: take the next, different step — or, if the task is done, stop calling tools and reply with your final summary.';
+
+/** JSON with sorted keys, so the order the model wrote the arguments in does not matter. */
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+/** What a file looks like right now: a hash of its bytes, or why there is none. */
+function fileState(abs) {
+  let st;
+  try { st = fs.statSync(abs); } catch { return 'missing'; }
+  if (st.isDirectory()) return 'directory';
+  if (st.size > TOOL_LIMITS.maxReadBytes) return `large:${st.size}:${st.mtimeMs}`;
+  try { return crypto.createHash('sha1').update(fs.readFileSync(abs)).digest('hex'); }
+  catch { return `unreadable:${st.mtimeMs}`; }
+}
+
+function readText(abs) {
+  try { return normalizeEol(fs.readFileSync(abs, 'utf8')); } catch { return null; }
+}
+
+/** Non-overlapping occurrences, the way edit_file counts its matches. */
+function countOccurrences(text, needle) {
+  let count = 0;
+  for (let at = text.indexOf(needle); needle && at >= 0; at = text.indexOf(needle, at + needle.length)) count++;
+  return count;
+}
+
+function firstLine(text, max = 160) {
+  const line = String(text ?? '').split('\n').map((l) => l.trim()).find(Boolean) || '';
+  return line.length > max ? `${line.slice(0, max)}…` : line;
+}
+
+/**
+ * Every tool says "Error: …" when it fails; run_command also reports an exit
+ * code. The first "exit code:" line is the harness's own — it comes before the
+ * command's stdout, which could print one too.
+ */
+function callFailed(name, output) {
+  if (/^\s*error\b/i.test(output)) return true;
+  const exit = name === 'run_command' ? output.match(/^exit code: (.*)$/m) : null;
+  return Boolean(exit) && exit[1].trim() !== '0';
+}
+
+function repeatNote(name, file, prev) {
+  if (!prev.ok) {
+    return `${REPEAT_TAG} Not run again: this exact ${name} call already failed at step ${prev.step} (${prev.brief}) and nothing has changed since, ` +
+      'so it would fail the same way. Change the arguments or the approach, or report the blocker in your final reply.';
+  }
+  switch (name) {
+    case 'edit_file':
+      return `${REPEAT_TAG} Not applied again: this exact edit was already applied to ${file} at step ${prev.step}, and the file has not changed since — ` +
+        `applying it again would duplicate the change or fail. The edit is done. ${NEXT_STEP}`;
+    case 'write_file':
+      return `${REPEAT_TAG} Not written again: ${file} already has exactly this content (written at step ${prev.step}). ${NEXT_STEP}`;
+    case 'read_file':
+      return `${REPEAT_TAG} Not read again: you already read this exact part of ${file} at step ${prev.step}, and the file has not changed since — ` +
+        `its content is in the conversation above. ${NEXT_STEP}`;
+    case 'run_command':
+      return `${REPEAT_TAG} Not run again: this exact command already ran at step ${prev.step} (${prev.brief}) and nothing has changed since, ` +
+        `so it would give the same result — its output is above. ${NEXT_STEP}`;
+    default:
+      return `${REPEAT_TAG} Not run again: this exact ${name} call already ran at step ${prev.step} and nothing has changed since — its result is above. ${NEXT_STEP}`;
+  }
+}
+
+/**
+ * One guard per turn. `run(name, args, execute, { step })` either executes the
+ * call through `execute()` or, for a repeat, answers without running anything:
+ * `{ output, repeated, reason }`. `forgetReads()` is for after a compaction:
+ * the results the model could look back at are gone, so fetching them again
+ * is legitimate — what the file tools wrote is still on disk, so the write
+ * records stay.
+ */
+export function createRepeatGuard({ cwd = process.cwd() } = {}) {
+  const root = () => (typeof cwd === 'function' ? cwd() : cwd);
+  const resolve = (p) => path.resolve(root(), expandHome(p) || '.');
+  const records = new Map(); // call signature -> { step, state, ok, failures, retryable, brief, write }
+  let changes = 0;
+  let skipped = 0;
+
+  const keyOf = (name, args) => {
+    const a = typeof args.path === 'string' ? { ...args, path: resolve(args.path) } : args; // app.js === ./app.js
+    return `${name}\u0000${stableStringify(a)}`;
+  };
+  /** null = never a repeat: MCP and unknown tools, whose side effects are unknown. */
+  const stateOf = (name, args) => {
+    if (FILE_TOOLS.has(name)) return fileState(resolve(args.path));
+    return BUILTIN_TOOL_NAMES.includes(name) ? `changes:${changes}` : null;
+  };
+
+  /**
+   * An insertion (new_text wraps old_text) that is already applied everywhere
+   * it could apply: every occurrence of old_text in the file sits inside a
+   * copy of new_text. Applying it would only duplicate the insertion. When
+   * old_text also occurs on its own, there is a real target — the edit runs,
+   * and edit_file itself reports an ambiguous match.
+   */
+  const insertionPresent = (args) => {
+    const oldText = normalizeEol(String(args.old_text ?? ''));
+    const newText = normalizeEol(String(args.new_text ?? ''));
+    if (!oldText || newText === oldText || !newText.includes(oldText)) return false;
+    const text = readText(resolve(args.path));
+    const copies = text === null ? 0 : countOccurrences(text, newText);
+    return copies > 0 && countOccurrences(text, oldText) === copies * countOccurrences(newText, oldText);
+  };
+
+  function skip(output, reason) {
+    skipped++;
+    return { output, repeated: true, reason };
+  }
+
+  async function run(name, rawArgs, execute, { step = 0 } = {}) {
+    // Arguments that are not an object (a model can send any JSON) still key
+    // the call by their value; the state checks only need the object form.
+    const isObject = rawArgs !== null && typeof rawArgs === 'object' && !Array.isArray(rawArgs);
+    const args = isObject ? rawArgs : {};
+    const file = typeof args.path === 'string' ? args.path : '';
+    const key = keyOf(name, isObject ? rawArgs : { value: rawArgs });
+    const before = stateOf(name, args);
+    const prev = records.get(key);
+    if (before !== null && prev && prev.state === before && !(prev.retryable && prev.failures < 2)) {
+      return skip(repeatNote(name, file, prev), `identical to the call at step ${prev.step}, nothing changed since`);
+    }
+    // The way "start the task over" corrupts a file when the identical-call
+    // record cannot help — a new turn, or the same edit with the whitespace
+    // of the arguments changed: an insertion whose result is already there
+    // would be added a second time.
+    if (name === 'edit_file' && insertionPresent(args)) {
+      return skip(
+        `${REPEAT_TAG} Not applied: ${file} already contains new_text. This edit only adds text around old_text, and that text is already there — ` +
+          `applying it again would duplicate it. The change is already in place. ${NEXT_STEP} ` +
+          '(If a second copy is really intended, include more surrounding context in old_text.)',
+        'new_text is already in the file'
+      );
+    }
+
+    let output = String(await execute());
+    const ok = !callFailed(name, output);
+    const ran = /^exit code: /m.test(output);
+    if (before === null) changes++; // MCP: assume it did something
+    else if (name === 'run_command' && ran && !isReadOnlyCommand(args.command, [], { ignoreOs: true }).ok) changes++;
+    const after = stateOf(name, args);
+    if (WRITE_TOOLS.has(name) && after !== before) changes++;
+    // A failed edit whose new_text is already in the file was most likely
+    // applied earlier — say so, or the model keeps varying old_text.
+    if (name === 'edit_file' && !ok && /old_text not found/.test(output)) {
+      const newText = normalizeEol(String(args.new_text ?? '')).trim();
+      if (/[A-Za-z0-9]/.test(newText) && readText(resolve(args.path))?.includes(newText)) {
+        output += `\nNote: new_text already appears in ${file} — if this edit was meant to put it there, the change is already applied: do not retry it.`;
+      }
+    }
+    if (after !== null) {
+      records.set(key, {
+        step,
+        state: after,
+        ok,
+        failures: ok ? 0 : prev && !prev.ok && prev.state === before ? prev.failures + 1 : 1,
+        retryable: !ok && name === 'run_command' && ran,
+        brief: name === 'run_command' && ran ? firstLine(output.match(/^exit code: .*$/m)[0]) : firstLine(output),
+        write: WRITE_TOOLS.has(name),
+      });
+    }
+    return { output, repeated: false, reason: '' };
+  }
+
+  return {
+    run,
+    forgetReads() {
+      for (const [key, rec] of records) if (!rec.write) records.delete(key);
+    },
+    get skipped() { return skipped; },
+  };
+}
+
+/**
+ * Where a compaction's verbatim tail starts: about `keep` messages from the
+ * end, moved back so it never opens on a tool result. A tool message is only
+ * valid right after the assistant message that called it; cutting between
+ * them sends the summarizer an unanswered tool call (strict servers reject
+ * the request) and keeps results whose calls were summarized away — the model
+ * then looks at outcomes of work it no longer remembers doing, and redoes it.
+ */
+export function compactionCut(history, keep = COMPACT_KEEP) {
+  let cut = Math.max(1, history.length - keep);
+  while (cut > 1 && history[cut]?.role === 'tool') cut--;
+  return cut;
 }
 
 /* ---------------------------------- agent --------------------------------- */
@@ -477,50 +746,69 @@ export function createSession({ config, builtins, mcp, agents = [], agent = null
   }
 
   async function compact(signal) {
-    const keep = 4;
-    if (history.length <= keep + 1) return false;
-    const head = history[0];
-    const tail = history.slice(-keep);
-    const middle = history.slice(1, -keep);
+    // The cut never separates a tool call from its results (see compactionCut),
+    // so both the summary request and the rebuilt history stay valid chat.
+    const cut = compactionCut(history);
+    const middle = history.slice(1, cut);
     if (!middle.length) return false;
-    const request = [
-      head,
-      ...middle,
-      {
-        role: 'user',
-        content:
-          `${COMPACT_TAG}\nSummarize this session so work can continue without the earlier messages. ` +
-          'Include the current request, files inspected/changed, commands and results, decisions and anything pending. ' +
-          'Concise bullet points, no preamble. Do not call tools.',
-      },
-    ];
+    const head = history[0];
+    const request = [head, ...middle, { role: 'user', content: COMPACT_PROMPT }];
     const result = await chatCompletion({ config: llmConfig(), messages: request, tools: [], maxTokens: 1500, signal });
     const summary = String(result.message?.content || '').trim();
     if (!summary) return false;
+    const rebuilt = [head, { role: 'user', content: `${COMPACT_SUMMARY_PREFIX}\n${summary}` }, ...history.slice(cut)];
+    // A summary no smaller than what it replaces frees nothing and costs the
+    // detail of the raw messages.
+    if (estimatePromptTokens(rebuilt) >= estimatePromptTokens(history)) return false;
     history.length = 0;
-    history.push(head, { role: 'user', content: `Earlier in this session (compacted summary):\n${summary}` }, ...tail);
+    history.push(...rebuilt);
     stats.compactions++;
     return true;
   }
 
-  /** Run one user prompt to completion (tool loop). Returns { text, steps, interrupted }. */
+  /**
+   * Run one user prompt to completion (tool loop). Returns { text, steps,
+   * interrupted, notice } — `notice` marks a text the harness wrote itself (a
+   * stop message): it was never streamed, so the caller must print it.
+   */
   async function turn(userText, { onText = null } = {}) {
     if (!current) throw new Error('no agent loaded — point --agents at a folder with .md agent files (or run --init-agents)');
     history.push({ role: 'user', content: String(userText) });
     const controller = new AbortController();
     activeController = controller;
     const st = settings();
+    const guard = createRepeatGuard({ cwd: () => builtins.cwd });
     let steps = 0;
     let continuations = 0;
     let oversizedRetries = 0;
     let replyLimit = st.maxTokens;
     let compactedAfterOverflow = false;
+    let repeatStreak = 0; // replies in a row that only repeated finished calls
+    let finishing = false; // the tool loop was stopped: one last reply, without tools
+    let wrapUpSent = false;
     const started = Date.now();
     try {
-      while (steps < st.maxSteps) {
+      // While finishing, the loop may go one request past maxSteps: the final
+      // answer is what the user is waiting for, and a reply requested without
+      // tools always ends the turn.
+      while (steps < st.maxSteps || finishing) {
         // Context budget: compact before the request no longer fits.
         if (config.autoCompact && estimatePromptTokens(history) >= COMPACT_AT * (config.contextSize - replyLimit)) {
-          try { if (await compact(controller.signal)) log(s.dim('  · context compacted')); } catch { /* trimming below still applies */ }
+          try {
+            if (await compact(controller.signal)) {
+              guard.forgetReads(); // the results it remembers were summarized away
+              log(s.dim('  · context compacted'));
+            }
+          } catch { /* a request the server refuses as too long is compacted again below */ }
+        }
+        // Approaching the step limit: ask for a finish instead of being cut off mid-task.
+        if (!finishing && !wrapUpSent && steps > 0 && st.maxSteps - steps === WRAP_UP_LEFT) {
+          wrapUpSent = true;
+          history.push({
+            role: 'user',
+            content: `[system] ${WRAP_UP_LEFT} steps left in this turn — finish the task now, or state clearly what remains to be done.`,
+          });
+          log(s.dim(`  · ${WRAP_UP_LEFT} steps left — telling the model to wrap up`));
         }
         let result;
         try {
@@ -528,7 +816,7 @@ export function createSession({ config, builtins, mcp, agents = [], agent = null
           result = await chatCompletion({
             config: llmConfig(),
             messages: history,
-            tools: offeredTools(),
+            tools: finishing ? [] : offeredTools(),
             maxTokens: replyLimit,
             signal: controller.signal,
             onDelta: onText ? (t) => { streamed += t; onText(t); } : undefined,
@@ -550,6 +838,7 @@ export function createSession({ config, builtins, mcp, agents = [], agent = null
           }
           if (!compactedAfterOverflow && /context|too many tokens|too long/i.test(e?.message || '') && (await compact(controller.signal).catch(() => false))) {
             compactedAfterOverflow = true;
+            guard.forgetReads();
             continue;
           }
           throw e;
@@ -559,6 +848,18 @@ export function createSession({ config, builtins, mcp, agents = [], agent = null
         steps++;
         stats.steps++;
         const truncated = ['length', 'max_tokens', 'max_token', 'model_length', 'token_limit'].includes(String(result.finishReason || '').toLowerCase());
+        // No tools were offered for the final answer, so a call in it could
+        // never be answered — and an unanswered tool_calls message would make
+        // the next request invalid. Only its text counts; a reply that was
+        // nothing but calls (cut off or not) ends the turn with the notice,
+        // which also keeps the history free of an empty assistant message.
+        if (finishing && msg.tool_calls) {
+          delete msg.tool_calls;
+          if (!String(msg.content ?? '').trim()) {
+            msg.content = STOPPED_REPEATING;
+            return { text: STOPPED_REPEATING, steps, interrupted: false, notice: true };
+          }
+        }
         const toolCalls = msg.tool_calls || [];
         if (!toolCalls.length) {
           if (truncated && continuations < MAX_CONTINUATIONS) {
@@ -566,9 +867,14 @@ export function createSession({ config, builtins, mcp, agents = [], agent = null
             history.push({ role: 'user', content: `${CONTINUE_TAG} Your previous message was cut off by the token limit. Continue exactly where you left off.` });
             continue;
           }
+          if (finishing && !String(msg.content || '').trim()) {
+            msg.content = STOPPED_REPEATING;
+            return { text: STOPPED_REPEATING, steps, interrupted: false, notice: true };
+          }
           return { text: String(msg.content || ''), steps, interrupted: false };
         }
         continuations = 0;
+        let repeated = 0;
         for (const tc of toolCalls) {
           const name = tc.function?.name || '(unknown)';
           let args = {};
@@ -577,24 +883,37 @@ export function createSession({ config, builtins, mcp, agents = [], agent = null
           catch (e) { parseError = e; }
           log(`\n${s.dim('──')} ${s.cyan('⚙ ' + name)} ${s.dim(JSON.stringify(args).slice(0, 160))}`);
           let output;
+          let skipped = '';
           if (parseError) {
             output = truncated
               ? 'Error: this tool call was cut off by the model token limit before its arguments were complete. Re-issue the complete tool call.'
               : `Error: invalid tool arguments JSON: ${parseError.message}`;
           } else {
-            output = await executeTool(name, args);
+            const done = await guard.run(name, args, () => executeTool(name, args), { step: steps });
+            output = done.output;
+            if (done.repeated) { repeated++; skipped = done.reason; }
           }
           if (String(output).length > TOOL_RESULT_CAP) {
             output = String(output).slice(0, TOOL_RESULT_CAP) + `\n…[truncated at ${TOOL_RESULT_CAP} chars]`;
           }
-          log(s.dim(String(output).split('\n').slice(0, 6).join('\n')));
+          log(skipped ? s.yellow(`↺ not run again: ${skipped}`) : s.dim(String(output).split('\n').slice(0, 6).join('\n')));
           history.push({ role: 'tool', tool_call_id: tc.id, content: String(output) });
         }
+        // A reply that only repeated finished work made no progress. A few in
+        // a row and the model is not going to stop by itself, notes or not:
+        // take the tools away and ask for the final answer.
+        repeatStreak = repeated === toolCalls.length ? repeatStreak + 1 : 0;
+        if (repeatStreak >= REPEAT_STREAK_LIMIT) {
+          finishing = true;
+          history.push({ role: 'user', content: stopRepeatingNudge(repeatStreak) });
+          log(s.yellow(`  · ${repeatStreak} replies in a row only repeated work that was already done — stopping the tool loop and asking for the final answer`));
+        }
       }
-      return { text: `(stopped: reached the ${st.maxSteps}-step limit — say "continue" or raise maxSteps)`, steps, interrupted: false };
+      return { text: `(stopped: reached the ${st.maxSteps}-step limit — say "continue" or raise maxSteps)`, steps, interrupted: false, notice: true };
     } finally {
       if (activeController === controller) activeController = null;
-      log(s.dim(`\n[done] agent=${current?.name} steps=${steps} elapsed=${fmtDuration(Date.now() - started)} context≈${fmtTokens(estimatePromptTokens(history))}/${fmtTokens(config.contextSize)} tokens`));
+      const repeats = guard.skipped ? ` repeats-skipped=${guard.skipped}` : '';
+      log(s.dim(`\n[done] agent=${current?.name} steps=${steps}${repeats} elapsed=${fmtDuration(Date.now() - started)} context≈${fmtTokens(estimatePromptTokens(history))}/${fmtTokens(config.contextSize)} tokens`));
     }
   }
 
@@ -777,7 +1096,9 @@ async function main() {
     let streamed = false;
     const out = await session.turn(text, { onText: config.streaming ? (t) => { streamed = true; process.stdout.write(t); } : null });
     if (streamed) process.stdout.write('\n');
-    else if (out.text) console.log(out.text);
+    // A stop notice is the harness's own text and was never streamed: print it
+    // even when the model's earlier replies were.
+    if (out.text && (!streamed || out.notice)) console.log(out.text);
     return out;
   };
 
