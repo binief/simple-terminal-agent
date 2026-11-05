@@ -999,6 +999,16 @@ export function createSession({ config, builtins, mcp, agents = [], agent = null
     reset,
     compact: () => compact(activeController?.signal),
     switchAgent,
+    /** Replace live config/tool/agent dependencies without discarding the conversation. */
+    updateRuntime(next) {
+      config = next.config;
+      builtins = next.builtins;
+      mcp = next.mcp;
+      agents = next.agents;
+      current = next.agent || agents[0] || null;
+      if (history.length && history[0].role === 'system') history[0].content = systemPrompt();
+      else reset();
+    },
     offeredTools,
     history,
     stats: () => ({ ...stats }),
@@ -1094,6 +1104,7 @@ Interactive commands
   /agent [name]       show or switch the current agent (conversation is kept)
   /tools              list the tools the current agent may use
   /config             show the effective config (API key masked)
+  /reload-config      reload config, agents and MCP servers (conversation kept)
   /compact            summarize the conversation to free context
   /reset              drop the conversation (same agent, fresh context)
   /help, /quit
@@ -1120,7 +1131,7 @@ async function main() {
     if (!opts.once) return;
   }
 
-  const { config, path: configPath } = loadAgenticConfig(opts.config, { cwd });
+  let { config, path: configPath } = loadAgenticConfig(opts.config, { cwd });
   if (opts.dir) config.workspace = path.resolve(cwd, expandHome(opts.dir));
   if (opts.model) config.openai.model = opts.model;
   if (opts.maxContext) config.contextSize = Math.max(2000, Math.floor(opts.maxContext));
@@ -1128,8 +1139,8 @@ async function main() {
   if (opts.agentsDir) config.agentsDir = path.resolve(cwd, expandHome(opts.agentsDir));
 
   const workspace = config.workspace || cwd;
-  const agentsDir = resolveAgentsDir(config.agentsDir, workspace === cwd ? cwd : cwd);
-  const { agents, errors } = loadAgents(agentsDir);
+  let agentsDir = resolveAgentsDir(config.agentsDir, cwd);
+  let { agents, errors } = loadAgents(agentsDir);
   for (const e of errors) console.error(s.yellow(`agent: ${e}`));
   if (opts.agentFile) {
     const one = loadAgentFile(path.resolve(cwd, expandHome(opts.agentFile)));
@@ -1159,9 +1170,48 @@ async function main() {
     return;
   }
 
-  const builtins = createTools({ ...config, workspace });
-  const mcp = await connectMcpServers(config.mcp, { onLog: (level, msg) => console.error(level === 'error' ? s.red(msg) : s.dim(msg)) });
+  let builtins = createTools({ ...config, workspace });
+  let mcp = await connectMcpServers(config.mcp, { onLog: (level, msg) => console.error(level === 'error' ? s.red(msg) : s.dim(msg)) });
   const session = createSession({ config, builtins, mcp, agents, agent: startAgent });
+
+  /** Reload the config, tools, agents and MCP connections while keeping chat history. */
+  const reloadConfig = async () => {
+    const loaded = loadAgenticConfig(opts.config, { cwd });
+    const nextConfig = loaded.config;
+    if (opts.dir) nextConfig.workspace = path.resolve(cwd, expandHome(opts.dir));
+    if (opts.model) nextConfig.openai.model = opts.model;
+    if (opts.maxContext) nextConfig.contextSize = Math.max(2000, Math.floor(opts.maxContext));
+    if (opts.noStream) nextConfig.streaming = false;
+    if (opts.agentsDir) nextConfig.agentsDir = path.resolve(cwd, expandHome(opts.agentsDir));
+
+    const nextWorkspace = nextConfig.workspace || cwd;
+    const nextAgentsDir = resolveAgentsDir(nextConfig.agentsDir, cwd);
+    const loadedAgents = loadAgents(nextAgentsDir);
+    for (const e of loadedAgents.errors) console.error(s.yellow(`agent: ${e}`));
+    if (opts.agentFile) {
+      const one = loadAgentFile(path.resolve(cwd, expandHome(opts.agentFile)));
+      if (!loadedAgents.agents.some((a) => a.name === one.name)) loadedAgents.agents.push(one);
+    }
+    if (!loadedAgents.agents.length) throw new Error(`no agents found in ${nextAgentsDir}`);
+    const wantedAgent = opts.agent || nextConfig.agent || session.agent?.name;
+    const nextAgent = pickAgent(loadedAgents.agents, wantedAgent);
+    if (wantedAgent && nextAgent.name.toLowerCase() !== String(wantedAgent).toLowerCase()) {
+      throw new Error(`agent "${wantedAgent}" not found in ${nextAgentsDir} — available: ${loadedAgents.agents.map((a) => a.name).join(', ')}`);
+    }
+
+    const nextBuiltins = createTools({ ...nextConfig, workspace: nextWorkspace });
+    const nextMcp = await connectMcpServers(nextConfig.mcp, { onLog: (level, msg) => console.error(level === 'error' ? s.red(msg) : s.dim(msg)) });
+    const oldMcp = mcp;
+    config = nextConfig;
+    configPath = loaded.path;
+    agentsDir = nextAgentsDir;
+    agents = loadedAgents.agents;
+    builtins = nextBuiltins;
+    mcp = nextMcp;
+    session.updateRuntime({ config, builtins, mcp, agents, agent: nextAgent });
+    oldMcp.closeAll();
+    console.log(s.dim(`config reloaded${configPath ? `: ${configPath}` : ''} (model=${config.openai.model}, agent=${session.agent.name})`));
+  };
 
   /* Ctrl+C must stop the work, not merely the waiting. The first press aborts
    * the running turn — the in-flight request is cancelled and run_command
@@ -1244,7 +1294,8 @@ async function main() {
       else if (t === '/config') {
         const masked = { ...config, openai: { ...config.openai, apiKey: config.openai.apiKey ? '(set)' : '(empty)' }, agentsDir, agent: session.agent.name, workspace: builtins.cwd };
         console.log(JSON.stringify(masked, null, 2));
-      } else if (t === '/reset') { session.reset(); console.log(s.dim('conversation cleared')); }
+      } else if (t === '/reload-config') await reloadConfig();
+      else if (t === '/reset') { session.reset(); console.log(s.dim('conversation cleared')); }
       else if (t === '/compact') console.log(s.dim((await session.compact().catch((e) => { console.error(s.red(e.message)); return false; })) ? 'compacted' : 'nothing to compact'));
       else if (t) await runTurn(t);
     } catch (e) {

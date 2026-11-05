@@ -53,6 +53,7 @@ function historyError(messages) {
 }
 
 /* ------------------------------ mock server ------------------------------ */
+let seenAuthorization = '';
 function decide(body) {
   const msgs = body.messages || [];
   const user = msgs.filter((m) => m.role === 'user').map((m) => m.content || '').join(' ');
@@ -63,7 +64,7 @@ function decide(body) {
   if (user.includes(COMPACT_TAG)) return { text: 'SUMMARY: app.js already has const b = 2.' };
   // first, so it also answers a follow-up prompt in a session that ran another scenario
   if (user.includes('PROBE-TOOLS')) {
-    return { text: `MOCK-DONE tools=${tools.join(',')} coder=${system.includes('# Coder')} researcher=${system.includes('# Researcher')}` };
+    return { text: `MOCK-DONE tools=${tools.join(',')} coder=${system.includes('# Coder')} researcher=${system.includes('# Researcher')} model=${body.model} key=${seenAuthorization || ''}` };
   }
   // never stops by itself: read -> insert -> list, forever, whatever it is told
   // (IGNORES-STOP: it keeps calling tools even once none are offered)
@@ -139,6 +140,7 @@ let server;
 let port;
 before(async () => {
   server = http.createServer((req, res) => {
+    seenAuthorization = req.headers.authorization || '';
     let raw = '';
     req.on('data', (d) => (raw += d));
     req.on('end', () => {
@@ -431,6 +433,36 @@ test('--list-agents and interactive /agent switching work without extra config',
   assert.match(repl.out, /agent: researcher/);
   assert.match(repl.out, /MOCK-DONE tools=[^\n]*read_file/);
   assert.doesNotMatch(repl.out, /MOCK-DONE tools=[^\n]*write_file/);
+});
+
+test('/reload-config picks up a changed model and API key without losing the interactive session', async (t) => {
+  const { ws, cfgPath } = fixture(t);
+  const child = spawn(process.execPath, [agentic, '--config', cfgPath, '--dir', ws], { stdio: ['pipe', 'pipe', 'pipe'] });
+  let out = '';
+  let err = '';
+  child.stdout.on('data', (d) => { out += d; });
+  child.stderr.on('data', (d) => { err += d; });
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timed out waiting for prompt: ${out} ${err}`)), 5000);
+    const check = () => {
+      if (out.includes('coder>')) { clearTimeout(timer); resolve(); }
+      else setTimeout(check, 10).unref();
+    };
+    check();
+  });
+  const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+  cfg.openai.apiKey = 'reloaded-key';
+  cfg.openai.model = 'reloaded-model';
+  fs.writeFileSync(cfgPath, JSON.stringify(cfg));
+  child.stdin.write('/reload-config\nPROBE-TOOLS\n/quit\n');
+  const code = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error(`timed out: ${out} ${err}`)); }, 10000);
+    child.on('error', reject);
+    child.on('close', (status) => { clearTimeout(timer); resolve(status); });
+  });
+  assert.equal(code, 0, err + out);
+  assert.match(out, /config reloaded.*model=reloaded-model/);
+  assert.match(out, /MOCK-DONE tools=.*model=reloaded-model key=Bearer reloaded-key/);
 });
 
 test('a model that keeps redoing finished work is stopped: the edit lands once and it answers well before maxSteps', async (t) => {
