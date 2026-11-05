@@ -114,6 +114,7 @@ import { buildUserContent } from './lib/images.js';
 import { isReadOnlyCommand } from './lib/plan.js';
 import { buildSystemPrompt, gitInfo } from './lib/prompt.js';
 import { createTools, expandHome, normalizeEol, readRegularFileSync, shellInfo, TOOL_LIMITS } from './lib/tools.js';
+import { buildSession, loadSession as loadChatSession, resolveLoadPath, saveSession, sessionDir, sessionTitle, slugify } from './lib/session.js';
 import { fmtDuration, fmtTokens, s, spinner } from './lib/ui.js';
 
 /* ------------------------------- defaults -------------------------------- */
@@ -365,7 +366,12 @@ export function normalizeConfig(raw = {}, { cwd = process.cwd() } = {}) {
   cfg.autoCompact = cfg.autoCompact !== false;
   cfg.searchIgnore = cleanList(cfg.searchIgnore);
   cfg.promptStyle = String(cfg.promptStyle || 'full').toLowerCase() === 'compact' ? 'compact' : 'full';
-  cfg.instructions = cfg.instructions == null || String(cfg.instructions).trim() === '' ? null : String(cfg.instructions);
+  if (Array.isArray(cfg.instructions)) {
+    const files = cfg.instructions.map((x) => String(x ?? '').trim()).filter(Boolean);
+    cfg.instructions = files.length ? files : null;
+  } else {
+    cfg.instructions = cfg.instructions == null || String(cfg.instructions).trim() === '' ? null : String(cfg.instructions);
+  }
   cfg.agentsDir = cfg.agentsDir ? path.resolve(cwd, expandHome(String(cfg.agentsDir))) : null;
   cfg.agent = cfg.agent ? String(cfg.agent) : null;
   if (cfg.workspace) cfg.workspace = path.resolve(cwd, expandHome(String(cfg.workspace)));
@@ -395,15 +401,28 @@ export function loadAgenticConfig(explicitPath, { cwd = process.cwd() } = {}) {
 
 /* ------------------------------- system prompt ---------------------------- */
 
-/** config.instructions: literal text, or a single-line path to a file (as in lib/agent.js). */
+/** Resolve literal instructions, Markdown files, arrays of either, or directories of Markdown files. */
 function resolveInstructions(instructions, cwd) {
+  if (Array.isArray(instructions)) return instructions.map((x) => resolveInstructions(x, cwd)).filter(Boolean).join('\n\n');
   const text = String(instructions ?? '').trim();
   if (!text) return '';
   if (!text.includes('\n')) {
     try {
       const file = path.resolve(cwd, expandHome(text));
-      if (fs.statSync(file).isFile()) return fs.readFileSync(file, 'utf8').trim();
-    } catch { /* literal text */ }
+      const st = fs.statSync(file);
+      if (st.isFile()) return fs.readFileSync(file, 'utf8').trim();
+      if (st.isDirectory()) {
+        return fs.readdirSync(file).sort()
+          .filter((name) => /\.md$/i.test(name))
+          .map((name) => {
+            const child = path.join(file, name);
+            try { return fs.statSync(child).isFile() ? fs.readFileSync(child, 'utf8').trim() : ''; }
+            catch { return ''; }
+          })
+          .filter(Boolean)
+          .join('\n\n');
+      }
+    } catch { /* not a readable file/directory — treat it as literal text */ }
   }
   return text;
 }
@@ -526,6 +545,19 @@ function fileState(abs) {
   }
 }
 
+function readFileState(abs) {
+  try {
+    // read_file only needs a stable identity to suppress identical page reads;
+    // hashing the entire file here just before reading it again doubled I/O.
+    const st = fs.statSync(abs, { bigint: true });
+    if (st.isDirectory()) return 'directory';
+    if (!st.isFile()) return `special:${st.mode}:${st.mtimeNs}`;
+    return `file:${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+  } catch {
+    return 'missing';
+  }
+}
+
 function readText(abs) {
   try { return normalizeEol(readRegularFileSync(abs, TOOL_LIMITS.maxReadBytes).toString('utf8')); } catch { return null; }
 }
@@ -596,6 +628,7 @@ export function createRepeatGuard({ cwd = process.cwd() } = {}) {
   };
   /** null = never a repeat: MCP and unknown tools, whose side effects are unknown. */
   const stateOf = (name, args) => {
+    if (name === 'read_file') return readFileState(resolve(args.path));
     if (FILE_TOOLS.has(name)) return fileState(resolve(args.path));
     return BUILTIN_TOOL_NAMES.includes(name) ? `changes:${changes}` : null;
   };
@@ -745,7 +778,15 @@ export function createSession({ config, builtins, mcp, agents = [], agent = null
     }
     // The turn's signal goes down with the call: run_command kills the
     // command tree on Ctrl+C instead of letting it run on in the background.
-    return builtins.execute(name, args, { readOnly: current?.tools.readOnly === true, signal: activeController?.signal });
+    // Give read_file a budget based on this conversation's remaining context,
+    // while retaining the shared hard result cap as the upper bound.
+    const remainingTokens = Math.max(0, config.contextSize - estimatePromptTokens(history) - settings().maxTokens);
+    const maxResultChars = Math.max(1024, Math.min(TOOL_RESULT_CAP, Math.floor(remainingTokens * 3)));
+    return builtins.execute(name, args, {
+      readOnly: current?.tools.readOnly === true,
+      signal: activeController?.signal,
+      maxResultChars,
+    });
   }
 
   function reset() {
@@ -1003,6 +1044,15 @@ export function createSession({ config, builtins, mcp, agents = [], agent = null
   return {
     turn,
     reset,
+    restore(conversation, savedStats = null) {
+      if (!Array.isArray(conversation)) throw new Error('chat conversation must be an array');
+      history.length = 0;
+      history.push({ role: 'system', content: systemPrompt() }, ...conversation);
+      for (const key of Object.keys(stats)) {
+        if (Number.isFinite(Number(savedStats?.[key])) && Number(savedStats[key]) >= 0) stats[key] = Math.floor(Number(savedStats[key]));
+      }
+      return history.length;
+    },
     compact: () => compact(activeController?.signal),
     switchAgent,
     /** Replace live config/tool/agent dependencies without discarding the conversation. */
@@ -1051,7 +1101,7 @@ export function writeExampleAgents(dir) {
 
 function parseArgs(argv) {
   const o = {
-    once: null, promptFile: null, config: null, agentsDir: null, agent: null, agentFile: null,
+    once: null, promptFile: null, config: null, agentsDir: null, agent: null, agentFiles: [], instructionFiles: [],
     dir: null, model: null, maxContext: null, help: false, listAgents: false, init: false,
     initAgents: null, noStream: false, positional: [],
   };
@@ -1063,7 +1113,8 @@ function parseArgs(argv) {
     else if (a === '--config' || a === '-c') o.config = next();
     else if (a === '--agents' || a === '--agents-dir') o.agentsDir = next();
     else if (a === '--agent') o.agent = next();
-    else if (a === '--agent-file') o.agentFile = next();
+    else if (a === '--agent-file') o.agentFiles.push(next());
+    else if (a === '--instructions' || a === '--instruction') o.instructionFiles.push(next());
     else if (a === '--dir' || a === '-d') o.dir = next();
     else if (a === '--model') o.model = next();
     else if (a === '--max-context' || a === '--context-size') o.maxContext = Number(next());
@@ -1092,7 +1143,8 @@ Flags
   --once/--task/-p/--prompt <text>  run one task and exit
   --prompt-file <path>              read the task from a file (with --once text: appended)
   --agent <name>                    agent to start with (default: config agent, else first)
-  --agent-file <path>               load this one .md file as the agent
+  --agent-file <path>               load an extra agent .md file (repeatable)
+  --instructions <file|dir>          append instruction .md file(s) (repeatable; dirs load top-level *.md)
   --agents/--agents-dir <dir>       folder of agent .md files
   --config/-c <path>                JSON config (default: ./agentic.config.json,
                                     else ~/.agentic/config.json, else defaults + env)
@@ -1115,6 +1167,8 @@ Interactive commands
   /tools              list the tools the current agent may use
   /config             show the effective config (API key masked)
   /reload-config      reload config, agents and MCP servers (conversation kept)
+  /export <folder>   export the conversation as a JSON file in a folder
+  /load <file>       replace the conversation from a JSON chat export
   /compact            summarize the conversation to free context
   /reset              drop the conversation (same agent, fresh context)
   /help, /quit
@@ -1147,15 +1201,16 @@ async function main() {
   if (opts.maxContext) config.contextSize = Math.max(2000, Math.floor(opts.maxContext));
   if (opts.noStream) config.streaming = false;
   if (opts.agentsDir) config.agentsDir = path.resolve(cwd, expandHome(opts.agentsDir));
+  if (opts.instructionFiles.length) config.instructions = [...(Array.isArray(config.instructions) ? config.instructions : config.instructions ? [config.instructions] : []), ...opts.instructionFiles.map((file) => path.resolve(cwd, expandHome(file)))];
 
   const workspace = config.workspace || cwd;
   let agentsDir = resolveAgentsDir(config.agentsDir, cwd);
   let { agents, errors } = loadAgents(agentsDir);
   for (const e of errors) console.error(s.yellow(`agent: ${e}`));
-  if (opts.agentFile) {
-    const one = loadAgentFile(path.resolve(cwd, expandHome(opts.agentFile)));
+  for (const [index, agentFile] of opts.agentFiles.entries()) {
+    const one = loadAgentFile(path.resolve(cwd, expandHome(agentFile)));
     if (!agents.some((a) => a.name === one.name)) agents.push(one);
-    opts.agent = one.name;
+    if (index === 0 && !opts.agent) opts.agent = one.name;
   }
   if (opts.listAgents) {
     if (!agents.length) { console.log(`no agents in ${agentsDir} — create one (a .md file) or run: node agentic.mjs --init-agents ${path.relative(cwd, agentsDir) || 'agents'}`); return; }
@@ -1193,13 +1248,14 @@ async function main() {
     if (opts.maxContext) nextConfig.contextSize = Math.max(2000, Math.floor(opts.maxContext));
     if (opts.noStream) nextConfig.streaming = false;
     if (opts.agentsDir) nextConfig.agentsDir = path.resolve(cwd, expandHome(opts.agentsDir));
+    if (opts.instructionFiles.length) nextConfig.instructions = [...(Array.isArray(nextConfig.instructions) ? nextConfig.instructions : nextConfig.instructions ? [nextConfig.instructions] : []), ...opts.instructionFiles.map((file) => path.resolve(cwd, expandHome(file)))];
 
     const nextWorkspace = nextConfig.workspace || cwd;
     const nextAgentsDir = resolveAgentsDir(nextConfig.agentsDir, cwd);
     const loadedAgents = loadAgents(nextAgentsDir);
     for (const e of loadedAgents.errors) console.error(s.yellow(`agent: ${e}`));
-    if (opts.agentFile) {
-      const one = loadAgentFile(path.resolve(cwd, expandHome(opts.agentFile)));
+    for (const agentFile of opts.agentFiles) {
+      const one = loadAgentFile(path.resolve(cwd, expandHome(agentFile)));
       if (!loadedAgents.agents.some((a) => a.name === one.name)) loadedAgents.agents.push(one);
     }
     if (!loadedAgents.agents.length) throw new Error(`no agents found in ${nextAgentsDir}`);
@@ -1305,7 +1361,27 @@ async function main() {
         const masked = { ...config, openai: { ...config.openai, apiKey: config.openai.apiKey ? '(set)' : '(empty)' }, agentsDir, agent: session.agent.name, workspace: builtins.cwd };
         console.log(JSON.stringify(masked, null, 2));
       } else if (t === '/reload-config') await reloadConfig();
-      else if (t === '/reset') { session.reset(); console.log(s.dim('conversation cleared')); }
+      else if (t === '/export' || t.startsWith('/export ')) {
+        const folderArg = t.slice('/export'.length).trim().replace(/^['\"]|['\"]$/g, '');
+        if (!folderArg) console.log(s.yellow('usage: /export <folder-path>'));
+        else if (session.history.length <= 1) console.log(s.yellow('nothing to export yet — say something first'));
+        else {
+          const folder = path.resolve(builtins.cwd, expandHome(folderArg));
+          const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+          const file = path.join(folder, `${slugify(sessionTitle(session.history))}-${stamp}.json`);
+          saveSession(file, buildSession({ messages: session.history, promptStyle: config.promptStyle, model: config.openai.model, workspace: builtins.cwd, stats: session.stats() }));
+          console.log(s.dim(`chat exported to ${file}`));
+        }
+      } else if (t === '/load' || t.startsWith('/load ')) {
+        const fileArg = t.slice('/load'.length).trim();
+        if (!fileArg) console.log(s.yellow('usage: /load <file-path>'));
+        else {
+          const target = resolveLoadPath(fileArg, { cwd: builtins.cwd, dir: sessionDir() });
+          const saved = loadChatSession(target);
+          session.restore(saved.conversation, saved.stats);
+          console.log(s.dim(`chat loaded from ${target.file} (${saved.conversation.length} message(s); current system prompt rebuilt)`));
+        }
+      } else if (t === '/reset') { session.reset(); console.log(s.dim('conversation cleared')); }
       else if (t === '/compact') console.log(s.dim((await session.compact().catch((e) => { console.error(s.red(e.message)); return false; })) ? 'compacted' : 'nothing to compact'));
       else if (t) await runTurn(t);
     } catch (e) {

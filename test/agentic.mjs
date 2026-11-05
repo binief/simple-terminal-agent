@@ -288,6 +288,21 @@ test('agents load from a folder, sorted, README skipped, tools resolved read-onl
   assert.deepEqual(resolveAgentTools({ data: {} }).builtins.length, 6);
 });
 
+test('instruction arrays and Markdown directories are loaded in sorted order', (t) => {
+  const { ws } = fixture(t);
+  const rules = path.join(ws, 'rules');
+  fs.mkdirSync(rules);
+  fs.writeFileSync(path.join(rules, '02-second.md'), 'SECOND RULE');
+  fs.writeFileSync(path.join(rules, '01-first.md'), 'FIRST RULE');
+  fs.writeFileSync(path.join(rules, 'README.md'), 'README INSTRUCTION');
+  const config = normalizeConfig({ instructions: [path.join(rules, '02-second.md'), rules] }, { cwd: ws });
+  assert.ok(Array.isArray(config.instructions));
+  const prompt = buildAgentSystemPrompt({ config, agent: null, cwd: ws });
+  assert.ok(prompt.indexOf('SECOND RULE') < prompt.indexOf('FIRST RULE'));
+  assert.equal((prompt.match(/FIRST RULE/g) || []).length, 1);
+  assert.match(prompt, /README INSTRUCTION/);
+});
+
 test('config: maxContext alias, env-style values and defaults normalize', () => {
   const cfg = normalizeConfig({ openai: { apiKey: 'k', model: 'm' }, maxContext: 12345 });
   assert.equal(cfg.contextSize, 12345);
@@ -483,6 +498,43 @@ test('--list-agents and interactive /agent switching work without extra config',
   assert.match(repl.out, /agent: researcher/);
   assert.match(repl.out, /MOCK-DONE tools=[^\n]*read_file/);
   assert.doesNotMatch(repl.out, /MOCK-DONE tools=[^\n]*write_file/);
+});
+
+test('repeated --agent-file flags add multiple Markdown agents', async (t) => {
+  const { agentsDir } = fixture(t);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-extra-agents-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const one = path.join(dir, 'one.md');
+  const two = path.join(dir, 'two.md');
+  fs.writeFileSync(one, '---\nname: extra-one\ntools: [read]\n---\nOne.\n');
+  fs.writeFileSync(two, '---\nname: extra-two\ntools: [search]\n---\nTwo.\n');
+  const result = await run(t, ['--agents', agentsDir, '--agent-file', one, '--agent-file', two, '--list-agents']);
+  assert.equal(result.code, 0, result.err + result.out);
+  assert.match(result.out, /extra-one/);
+  assert.match(result.out, /extra-two/);
+});
+
+test('interactive /export writes a chat to a folder and /load restores it', async (t) => {
+  const { ws, cfgPath } = fixture(t);
+  const folder = path.join(ws, 'chat exports');
+  const exported = await run(t, ['--config', cfgPath, '--dir', ws], {
+    input: `PROBE-TOOLS\n/export ${folder}\n/quit\n`,
+  });
+  assert.equal(exported.code, 0, exported.err + exported.out);
+  assert.match(exported.out, /chat exported to/);
+  const names = fs.readdirSync(folder).filter((name) => name.endsWith('.json'));
+  assert.equal(names.length, 1);
+  const chatFile = path.join(folder, names[0]);
+  const chat = JSON.parse(fs.readFileSync(chatFile, 'utf8'));
+  assert.equal(chat.format, 'coding-harness-chat');
+  assert.ok(chat.messages.some((message) => message.role === 'user' && message.content === 'PROBE-TOOLS'));
+
+  const loaded = await run(t, ['--config', cfgPath, '--dir', ws], {
+    input: `/load "${chatFile}"\nPROBE-TOOLS\n/quit\n`,
+  });
+  assert.equal(loaded.code, 0, loaded.err + loaded.out);
+  assert.match(loaded.out, /chat loaded from/);
+  assert.match(loaded.out, /MOCK-DONE tools=.*coder=true/);
 });
 
 test('an image path in the prompt is sent as image content to the model', async (t) => {
