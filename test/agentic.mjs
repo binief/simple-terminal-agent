@@ -1,13 +1,13 @@
 /* agentic.mjs tests: agent .md loading/switching, config, tools, MCP-less loop.
  * Run: node --test test/agentic.mjs  (no API credentials — local mock server) */
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { test, before, after } from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
   buildAgentSystemPrompt,
@@ -249,6 +249,32 @@ test('inline image references build multimodal content, including quoted paths w
     `data:image/webp;base64,${webp.toString('base64')}`,
   ]);
   assert.ok(parts.some((part) => part.type === 'text' && part.text.includes('sample.png')));
+});
+
+test('file tools reject FIFOs promptly instead of blocking on read or write', (t) => {
+  if (process.platform === 'win32') { t.skip('named-pipe fixture uses mkfifo'); return; }
+  const { ws } = fixture(t);
+  const fifo = path.join(ws, 'pipe');
+  execFileSync('mkfifo', [fifo]);
+  const toolsModule = path.join(repo, 'lib', 'tools.js');
+  const script = `
+    const { createTools } = await import(${JSON.stringify(pathToFileURL(toolsModule).href)});
+    const { createRepeatGuard } = await import(${JSON.stringify(pathToFileURL(agentic).href)});
+    const tools = createTools({ workspace: process.argv[1] });
+    const guard = createRepeatGuard({ cwd: process.argv[1] });
+    for (const [name, args] of [
+      ['read_file', { path: 'pipe' }],
+      ['edit_file', { path: 'pipe', old_text: 'x', new_text: 'y' }],
+      ['write_file', { path: 'pipe', content: 'x' }],
+    ]) {
+      const result = await guard.run(name, args, () => tools.execute(name, args));
+      console.log(result.output);
+    }
+  `;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', script, ws], { encoding: 'utf8', timeout: 3000 });
+  assert.notEqual(result.error?.code, 'ETIMEDOUT', 'file tool hung on a FIFO');
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal((result.stdout.match(/not a regular file/g) || []).length, 3, result.stdout);
 });
 
 test('agents load from a folder, sorted, README skipped, tools resolved read-only', (t) => {
