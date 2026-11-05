@@ -113,7 +113,7 @@ import { connectMcpServers } from './lib/mcp.js';
 import { buildUserContent } from './lib/images.js';
 import { isReadOnlyCommand } from './lib/plan.js';
 import { buildSystemPrompt, gitInfo } from './lib/prompt.js';
-import { createTools, expandHome, normalizeEol, shellInfo, TOOL_LIMITS } from './lib/tools.js';
+import { createTools, expandHome, normalizeEol, readRegularFileSync, shellInfo, TOOL_LIMITS } from './lib/tools.js';
 import { fmtDuration, fmtTokens, s, spinner } from './lib/ui.js';
 
 /* ------------------------------- defaults -------------------------------- */
@@ -516,13 +516,18 @@ function fileState(abs) {
   let st;
   try { st = fs.statSync(abs); } catch { return 'missing'; }
   if (st.isDirectory()) return 'directory';
+  if (!st.isFile()) return `special:${st.mode}:${st.mtimeMs}`;
   if (st.size > TOOL_LIMITS.maxReadBytes) return `large:${st.size}:${st.mtimeMs}`;
-  try { return crypto.createHash('sha1').update(fs.readFileSync(abs)).digest('hex'); }
-  catch { return `unreadable:${st.mtimeMs}`; }
+  try {
+    const bytes = readRegularFileSync(abs, TOOL_LIMITS.maxReadBytes);
+    return crypto.createHash('sha1').update(bytes).digest('hex');
+  } catch {
+    return `unreadable:${st.mtimeMs}`;
+  }
 }
 
 function readText(abs) {
-  try { return normalizeEol(fs.readFileSync(abs, 'utf8')); } catch { return null; }
+  try { return normalizeEol(readRegularFileSync(abs, TOOL_LIMITS.maxReadBytes).toString('utf8')); } catch { return null; }
 }
 
 /** Non-overlapping occurrences, the way edit_file counts its matches. */
