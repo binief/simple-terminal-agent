@@ -110,6 +110,7 @@ import {
   TOOL_CALL_PARSE_ERROR,
 } from './lib/llm.js';
 import { connectMcpServers } from './lib/mcp.js';
+import { buildUserContent } from './lib/images.js';
 import { isReadOnlyCommand } from './lib/plan.js';
 import { buildSystemPrompt, gitInfo } from './lib/prompt.js';
 import { createTools, expandHome, normalizeEol, shellInfo, TOOL_LIMITS } from './lib/tools.js';
@@ -797,7 +798,7 @@ export function createSession({ config, builtins, mcp, agents = [], agent = null
    */
   async function turn(userText, { onText = null } = {}) {
     if (!current) throw new Error('no agent loaded — point --agents at a folder with .md agent files (or run --init-agents)');
-    history.push({ role: 'user', content: String(userText) });
+    history.push({ role: 'user', content: buildUserContent(userText, { cwd: builtins.cwd }) });
     const controller = new AbortController();
     activeController = controller;
     const st = settings();
@@ -1098,6 +1099,10 @@ Flags
   --init                            write an example config (--config path, default ./agentic.config.json)
   --init-agents [dir]               write example agents (coder, researcher, reviewer)
   --help
+
+Image attachments
+  Include @path/to/image.png in a prompt (or @"path with spaces.jpg").
+  PNG, JPEG, GIF and WebP are supported, up to 20 MiB each; the model must support vision.
 
 Interactive commands
   /agents             list agents (* = current)

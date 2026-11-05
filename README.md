@@ -117,8 +117,9 @@ them by default:
   `build`, `out`, `target`, `coverage`), framework/dev-server caches (`.next`, `.nuxt`, `.angular`,
   `.cache`, `.turbo`, `.parcel-cache`, …), Python and other toolchains (`__pycache__`, `.venv`, `.tox`,
   `.dart_tool`, `Pods`, `.terraform`, …) and every version-control directory such as `.git` — at any depth.
-- **Files** — images, media, archives, executables, fonts, databases and other binaries are never read,
-  and generated noise (`.min.js`, `.min.css`, `*.map`, `*.log`) is skipped.
+- **Files** — images, media, archives, executables, fonts, databases and other binaries are never read
+  by the search/read tools, and generated noise (`.min.js`, `.min.css`, `*.map`, `*.log`) is skipped.
+  To send an image to a vision-capable model, attach it explicitly in a prompt with `@path/to/image.png`.
 - **Your `.gitignore`** — the project's own rules apply while walking, nested files included, with the
   usual git semantics (`!` negation, `/` anchoring, `**` globs, `dir/` for directories only) plus
   `.git/info/exclude`. Searching *inside* a skipped directory explicitly (`path: ".angular/cache"`)
@@ -665,6 +666,18 @@ that becomes the system prompt. An agent with no writing tool is enforced read-o
 Switching (`--agent`, `--agent-file`, or `/agent <name>` mid-session) rebuilds the system prompt and
 keeps the conversation. The folder comes from `--agents`, config `agentsDir`, `AGENTIC_AGENTS_DIR`,
 or defaults to `./agents` (else `./.github/agents`).
+
+Attach images inline in any task prompt with an `@` path reference, for example:
+
+```text
+What is shown in @./screenshots/bug.png? Compare it with @"./screenshots/expected result.jpg".
+```
+
+Relative image paths resolve from the workspace; absolute paths and `~/` paths also work. Supported
+formats are PNG, JPEG, GIF and WebP, up to 20 MiB per image. The images are sent as multimodal content
+in the user message (not through `read_file`), so the configured API endpoint/model must support vision.
+If the reference does not exist or is too large, the prompt reports an attachment error before calling
+the model.
 
 Config is one optional JSON file (`--config`, `AGENTIC_CONFIG`, `./agentic.config.json`, or
 `~/.agentic/config.json`) in the `basic.mjs` shape: `openai: { baseURL, apiKey, model }`,
