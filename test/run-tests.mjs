@@ -121,19 +121,21 @@ async function main() {
   r = await tools.execute('read_file', { path: 'a/b.txt' });
   check('edit_file wrote through', r.includes('TWO') && !r.includes('\ntwo'), r);
 
-  // windowed reads are enforced: peek by default, hard caps per call, continuation hints
+  // The model controls explicit windows; omitted limit defaults to as much as the output budget allows.
   const big = Array.from({ length: 1200 }, (_, i) => `line-${i + 1}`).join('\n');
   await tools.execute('write_file', { path: 'big.txt', content: big });
   r = await tools.execute('read_file', { path: 'big.txt' });
-  check('read_file peeks 200 lines by default', r.includes('lines 1-200 of 1200'), r.slice(0, 200));
-  check('read_file hints at the remainder', r.includes('1000 more lines') && r.includes('search_files'), r.slice(-200));
-  r = await tools.execute('read_file', { path: 'big.txt', limit: 5000 });
+  check('read_file without a limit returns the whole file when it fits', r.includes('lines 1-1200 of 1200') && !r.includes('more lines'), r.slice(0, 200));
   const { TOOL_LIMITS: LIMITS_FOR_READ } = await import(pathToFileURL(path.join(proj, 'lib', 'tools.js')).href);
-  check(
-    `read_file clamps limit to ${LIMITS_FOR_READ.maxReadLines} lines per call`,
-    r.includes(`lines 1-${LIMITS_FOR_READ.maxReadLines} of 1200`) && r.includes(`clamped to ${LIMITS_FOR_READ.maxReadLines}`),
-    r.slice(0, 200)
-  );
+  r = await tools.execute('read_file', { path: 'big.txt', limit: 5000 });
+  check('read_file honors a model-requested limit above the old cap', r.includes('lines 1-1200 of 1200') && !r.includes('clamped'), r.slice(0, 200));
+  r = await tools.execute('read_file', { path: 'big.txt', all: true });
+  check('read_file all mode returns the whole file when it fits', r.includes('lines 1-1200 of 1200') && !r.includes('more lines'), r.slice(0, 200));
+  await tools.execute('write_file', { path: 'many-short-lines.txt', content: Array.from({ length: 6000 }, (_, i) => `x${i}`).join('\n') });
+  r = await tools.execute('read_file', { path: 'many-short-lines.txt', all: true });
+  check('read_file all mode is bounded by the tool-result budget', r.length <= LIMITS_FOR_READ.toolResultCap && r.includes('read_file offset=') && r.includes('truncated') === false, String(r.length));
+  r = await tools.execute('read_file', { path: 'many-short-lines.txt', all: true }, { maxResultChars: 1200 });
+  check('read_file adapts its window to the remaining context budget', r.length <= 1200 && r.includes('read_file offset='), String(r.length));
   r = await tools.execute('read_file', { path: 'big.txt', offset: 1101 });
   check('read_file pages with offset', r.includes('lines 1101-1200 of 1200') && !r.includes('more lines'), r.slice(0, 200));
   r = await tools.execute('read_file', { path: 'big.txt', offset: 2000 });
@@ -141,7 +143,7 @@ async function main() {
   await tools.execute('write_file', { path: 'dense.txt', content: 'x'.repeat(50_000) + '\nsecond' });
   r = await tools.execute('read_file', { path: 'dense.txt' });
   check('read_file hard-cuts an oversized line', r.includes('[line truncated'), r.slice(-300));
-  check('read_file result stays inside the char budget', r.length < 45_000, String(r.length));
+  check('read_file result stays inside the tool-result budget', r.length <= LIMITS_FOR_READ.toolResultCap, String(r.length));
   r = await tools.execute('edit_file', { path: 'a/b.txt', old_text: 'nope', new_text: 'x' });
   check('edit_file reports missing text', r.startsWith('Error:'), r);
   r = await tools.execute('search_files', { pattern: 'TWO' });
@@ -431,7 +433,7 @@ async function main() {
   check('working method: inspects the resulting diff', /inspect the resulting diff/.test(sys), sys);
   check('working method: follow the conventions of the code', /Match the code you are editing/.test(sys), sys);
   check('tools: batch independent tool calls', /tool calls in one reply run in order/.test(sys), sys);
-  check('tools: locate then window instead of whole files', /Locate, then window/.test(sys) && /never scroll a large file into context/.test(sys), sys);
+  check('tools: locate then window instead of whole files', /Locate, then window/.test(sys) && /never scroll a large file into context/i.test(sys), sys);
   check('tools: old_text copied verbatim from read_file', /Copy old_text verbatim from read_file/.test(sys), sys);
   check('tools: never rewrite an unread file', /a deliberate full rewrite of a file you have read/.test(sys), sys);
   check('tools: long writes use separate replies instead of batching', /one edit_file per section in separate replies/.test(sys) && /Never batch dependent section writes/.test(sys), sys);
@@ -490,9 +492,9 @@ async function main() {
 
   /* ---------------- 0c-bis. the prompt quotes the real tool limits ---------------- */
   const { TOOL_LIMITS } = await import(pathToFileURL(path.join(proj, 'lib', 'tools.js')).href);
-  check('the prompt quotes the real read_file caps', sys.includes(`at most ${TOOL_LIMITS.maxReadLines} lines per call (default ${TOOL_LIMITS.defaultReadLines})`), sys);
-  check('the prompt quotes the real tool-result cap', sys.includes(`~${Math.round(TOOL_LIMITS.toolResultCap / 1000)}k chars`), sys);
-  check('the read_file description quotes the real caps', createTools(promptCfg).listTools().find((t) => t.name === 'read_file').description.includes(`at most ${TOOL_LIMITS.maxReadLines} lines and ${Math.round(TOOL_LIMITS.maxReadChars / 1000)}k chars`), 'description drifted');
+  check('the prompt leaves line count to the model and fills the budget when limit is omitted', sys.includes('no fixed line-count ceiling') && sys.includes('if omitted, read as many lines as fit'), sys);
+  check('the prompt quotes the real read_file character and result caps', sys.includes(`${Math.round(TOOL_LIMITS.maxReadChars / 1000)}k of file text`) && sys.includes(`~${Math.round(TOOL_LIMITS.toolResultCap / 1000)}k response cap`), sys);
+  check('the read_file description quotes the real output budgets', createTools(promptCfg).listTools().find((t) => t.name === 'read_file').description.includes(`no fixed line-count ceiling`) && createTools(promptCfg).listTools().find((t) => t.name === 'read_file').description.includes(`${Math.round(TOOL_LIMITS.toolResultCap / 1000)}k chars`), 'description drifted');
 
   // drift guard: change the constant in a copy of lib/ — the prompt must follow it
   const driftDir = path.join(tmp, 'drift-lib');
@@ -503,14 +505,14 @@ async function main() {
     driftTools,
     fs
       .readFileSync(driftTools, 'utf8')
-      .replace(`maxReadLines: ${TOOL_LIMITS.maxReadLines}`, 'maxReadLines: 777')
+      .replace(`maxReadChars: ${String(TOOL_LIMITS.maxReadChars).replace(/^(\d+)(\d{3})$/, '$1_$2')}`, 'maxReadChars: 777_000')
       .replace(`toolResultCap: ${String(TOOL_LIMITS.toolResultCap).replace(/^(\d+)(\d{3})$/, '$1_$2')}`, 'toolResultCap: 33_000')
   );
   const driftPrompt = await import(pathToFileURL(driftTools.replace('tools.js', 'prompt.js')).href);
   const drifted = driftPrompt.buildSystemPrompt({ cwd: '/w', platform: 'p' });
   const driftedCompact = driftPrompt.buildSystemPrompt({ cwd: '/w', platform: 'p', style: 'compact' });
-  check('a changed read cap flows into the full prompt', drifted.includes('at most 777 lines per call') && !drifted.includes(`at most ${TOOL_LIMITS.maxReadLines} lines per call`), drifted.split('\n').find((l) => l.includes('Locate, then window')));
-  check('a changed read cap flows into the compact prompt', driftedCompact.includes('max 777 lines/call'), driftedCompact.split('\n').find((l) => l.includes('search_files to locate')));
+  check('a changed read character cap flows into the full prompt', drifted.includes('777k of file text'), drifted.split('\n').find((l) => l.includes('Locate, then window')));
+  check('a changed read character cap flows into the compact prompt', driftedCompact.includes('777k of text'), driftedCompact.split('\n').find((l) => l.includes('search_files to locate')));
   check('a changed result cap flows into the prompt', drifted.includes('~33k chars'), drifted.split('\n').find((l) => l.includes('Truncation is real')));
 
   /* ---------------- 0d. prompt style: full vs compact ---------------- */

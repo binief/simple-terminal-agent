@@ -70,7 +70,7 @@ subagentMaxSteps)`) so a new setting does not stay invisible just because your f
 | `searchIgnore` | Extra globs `search_files` should skip (relative to the workspace): `["vendor-cache/", "*.snap"]`. `!pattern` re-includes something the built-ins or `.gitignore` exclude. Default `[]`. |
 | `lineEndings` | Newline style for files the tools write: `auto` (default — keep the file's own style, else the OS default), `lf`, `crlf`, `cr`, `native`. |
 | `promptStyle` | System prompt variant: `full` (default, ≈2.2k tokens) or `compact` (≈790 tokens — same rules, no explanations; for small context windows and small local models). Also `--prompt <style>`, `/set prompt <style>`, `HARNESS_PROMPT_STYLE`. |
-| `instructions` | Extra rules appended to the system prompt: literal text, or the path to a text file (`~` expanded, relative paths resolve against the workspace). Re-read on every system-prompt rebuild, so edits apply mid-session. Env override: `HARNESS_INSTRUCTIONS`. |
+| `instructions` | Extra rules appended to the system prompt: literal text, or a path to a file/directory of Markdown instruction files; accepts an array of entries too (`~` expanded, relative paths resolve against the workspace). Re-read on every system-prompt rebuild, so edits apply mid-session. Env override: `HARNESS_INSTRUCTIONS`. |
 | `autoCompact` | `true` (default) = summarize the conversation automatically before the context fills up. `false` = only warn; use `/compact` yourself. |
 | `commandTimeout` | Default timeout (seconds) for `run_command`. |
 | `planMode` | `true` = start every session in plan mode (read-only research, see below). Default `false`. Also `--plan`. |
@@ -89,7 +89,7 @@ Env var overrides: `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL`,
 
 | Tool | What it does |
 | --- | --- |
-| `read_file` | Read a window of a text file (default 200 lines, ≤500 lines / 40k chars per call) |
+| `read_file` | Read a text-file window (model chooses `limit`; omitted means as many lines as fit, or `all: true` to explicitly request the whole file, bounded by output/context and the 2 MiB file cap) |
 | `write_file` | Create/overwrite a file (makes parent dirs) |
 | `edit_file` | Exact-text replacement, line-ending aware (see below) |
 | `list_dir` | List a directory (dirs first) |
@@ -664,8 +664,11 @@ frontmatter — `name`, `description`, `tools` (aliases `read`/`search`/`edit`/`
 tool names), `model`, `temperature`, `maxSteps`, `maxTokens`, `readOnly`, `promptMode` — and a body
 that becomes the system prompt. An agent with no writing tool is enforced read-only, not just asked.
 Switching (`--agent`, `--agent-file`, or `/agent <name>` mid-session) rebuilds the system prompt and
-keeps the conversation. The folder comes from `--agents`, config `agentsDir`, `AGENTIC_AGENTS_DIR`,
-or defaults to `./agents` (else `./.github/agents`).
+keeps the conversation. Repeat `--agent-file` to add multiple standalone agent Markdown files;
+`--instructions` is also repeatable and accepts Markdown files or a directory of top-level `.md`
+files (loaded in sorted order). Config `instructions` accepts either one entry or an array of entries.
+The folder comes from `--agents`, config `agentsDir`, `AGENTIC_AGENTS_DIR`, or defaults to `./agents`
+(else `./.github/agents`).
 
 Attach images inline in any task prompt with an `@` path reference, for example:
 
@@ -686,7 +689,9 @@ Config is one optional JSON file (`--config`, `AGENTIC_CONFIG`, `./agentic.confi
 `instructions`, `agentsDir`, `agent`, and `mcp: { servers: { … } }` (stdio or HTTP, as below).
 History is auto-compacted at 90% of the context budget — the newest messages stay verbatim, and a
 tool call is never separated from its results; `/compact`, `/reset`, `/tools` and `/config` work
-interactively.
+interactively. In the `agentic.mjs` REPL, `/export <folder-path>` writes the current chat as a
+JSON export in that folder, and `/load <file-path>` replaces the current conversation from an export
+while rebuilding the system prompt for the current workspace and agent.
 
 A turn ends when the model replies without calling a tool, and every agent's system prompt says so.
 A model that keeps going after the work is done (re-reading the file it just edited, re-applying the
