@@ -23,6 +23,7 @@ import {
   TURN_RULES,
 } from '../agentic.mjs';
 import { createTools } from '../lib/tools.js';
+import { buildUserContent } from '../lib/images.js';
 
 const repo = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const agentic = path.join(repo, 'agentic.mjs');
@@ -54,15 +55,23 @@ function historyError(messages) {
 
 /* ------------------------------ mock server ------------------------------ */
 let seenAuthorization = '';
+const messageText = (content) => typeof content === 'string'
+  ? content
+  : Array.isArray(content) ? content.filter((part) => part?.type === 'text').map((part) => part.text || '').join(' ')
+    : '';
 function decide(body) {
   const msgs = body.messages || [];
-  const user = msgs.filter((m) => m.role === 'user').map((m) => m.content || '').join(' ');
+  const user = msgs.filter((m) => m.role === 'user').map((m) => messageText(m.content)).join(' ');
   const system = msgs.filter((m) => m.role === 'system').map((m) => m.content || '').join(' ');
   const tools = (body.tools || []).map((t) => t.function.name);
   const toolMsgs = msgs.filter((m) => m.role === 'tool');
   const lastTool = String(toolMsgs.at(-1)?.content ?? '');
   if (user.includes(COMPACT_TAG)) return { text: 'SUMMARY: app.js already has const b = 2.' };
   // first, so it also answers a follow-up prompt in a session that ran another scenario
+  if (user.includes('IMAGE-CHECK')) {
+    const images = msgs.flatMap((m) => Array.isArray(m.content) ? m.content.filter((part) => part?.type === 'image_url') : []);
+    return { text: `MOCK-DONE images=${images.length} data=${images.map((part) => part.image_url.url).join('|')}` };
+  }
   if (user.includes('PROBE-TOOLS')) {
     return { text: `MOCK-DONE tools=${tools.join(',')} coder=${system.includes('# Coder')} researcher=${system.includes('# Researcher')} model=${body.model} key=${seenAuthorization || ''}` };
   }
@@ -225,6 +234,21 @@ test('frontmatter: Copilot-style scalars, lists and handoffs parse; body is the 
   assert.deepEqual(data.handoffs, [{ label: 'Go', agent: 'coder', send: false }]);
   assert.match(body, /^# PLAN/);
   assert.deepEqual(parseFrontmatter('# Plain\nPrompt.'), { data: {}, body: '# Plain\nPrompt.' });
+});
+
+test('inline image references build multimodal content, including quoted paths with spaces', (t) => {
+  const { ws } = fixture(t);
+  const png = Buffer.from('fake png bytes');
+  const webp = Buffer.from('fake webp bytes');
+  fs.writeFileSync(path.join(ws, 'sample.png'), png);
+  fs.writeFileSync(path.join(ws, 'sample image.webp'), webp);
+  assert.equal(buildUserContent('plain prompt', { cwd: ws }), 'plain prompt');
+  const parts = buildUserContent('Inspect @./sample.png and @"./sample image.webp" please.', { cwd: ws });
+  assert.deepEqual(parts.filter((part) => part.type === 'image_url').map((part) => part.image_url.url), [
+    `data:image/png;base64,${png.toString('base64')}`,
+    `data:image/webp;base64,${webp.toString('base64')}`,
+  ]);
+  assert.ok(parts.some((part) => part.type === 'text' && part.text.includes('sample.png')));
 });
 
 test('agents load from a folder, sorted, README skipped, tools resolved read-only', (t) => {
@@ -433,6 +457,16 @@ test('--list-agents and interactive /agent switching work without extra config',
   assert.match(repl.out, /agent: researcher/);
   assert.match(repl.out, /MOCK-DONE tools=[^\n]*read_file/);
   assert.doesNotMatch(repl.out, /MOCK-DONE tools=[^\n]*write_file/);
+});
+
+test('an image path in the prompt is sent as image content to the model', async (t) => {
+  const { ws, cfgPath } = fixture(t);
+  const bytes = Buffer.from('image bytes from fixture');
+  fs.writeFileSync(path.join(ws, 'diagram.png'), bytes);
+  const r = await run(t, ['--config', cfgPath, '--dir', ws, '--once', 'IMAGE-CHECK Please analyze @./diagram.png']);
+  assert.equal(r.code, 0, r.err + r.out);
+  assert.match(r.out, /MOCK-DONE images=1/);
+  assert.ok(r.out.includes(`data:image/png;base64,${bytes.toString('base64')}`), r.out);
 });
 
 test('/reload-config picks up a changed model and API key without losing the interactive session', async (t) => {
